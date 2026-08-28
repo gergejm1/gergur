@@ -24,4 +24,8 @@
     <Content Include="Assets\**" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="Gergur.Tests" />
+  </ItemGroup>
+
 </Project>

@@ -21,6 +21,9 @@ public sealed class MainForm : Form
     private TabLifecycleManager? _lifecycle;
     private bool _closing;
     private bool _lifecycleTickRunning;
+    private bool _isMinimized;
+    private bool _isLocked;
+    private DateTime? _backgroundSinceUtc;
 
     public TabManager? Tabs { get; private set; }
 
@@ -130,7 +133,13 @@ public sealed class MainForm : Form
         LayoutToolbar();
 
         _lifecycleTimer = new System.Windows.Forms.Timer { Interval = 30_000 };
-        _lifecycleTimer.Tick += async (_, _) => await RunLifecycleTickAsync(forceSuspend: false);
+        _lifecycleTimer.Tick += async (_, _) =>
+        {
+            // Minimized/locked long enough: force-sleep everything, active tab included.
+            bool sleepAll = _backgroundSinceUtc is { } since
+                && DateTime.UtcNow - since >= TimeSpan.FromMinutes(Math.Max(1, _settings.SleepAllWhenBackgroundedMinutes));
+            await RunLifecycleTickAsync(forceSuspend: sleepAll);
+        };
         _statusTimer = new System.Windows.Forms.Timer { Interval = 5_000 };
         _statusTimer.Tick += (_, _) => UpdateStatus();
     }
@@ -236,6 +245,7 @@ public sealed class MainForm : Form
 
             await RestoreSessionAsync();
 
+            Microsoft.Win32.SystemEvents.SessionSwitch += OnSessionSwitch;
             _lifecycleTimer.Start();
             _statusTimer.Start();
             UpdateStatus();
@@ -306,6 +316,7 @@ public sealed class MainForm : Form
     protected override void OnFormClosing(FormClosingEventArgs e)
     {
         _closing = true;
+        Microsoft.Win32.SystemEvents.SessionSwitch -= OnSessionSwitch;
         SaveSession();
         _lifecycleTimer.Stop();
         _statusTimer.Stop();
@@ -436,6 +447,47 @@ public sealed class MainForm : Form
 
     protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
         => _shortcuts.Handle(keyData) || base.ProcessCmdKey(ref msg, keyData);
+
+    // ------------------------------------------------------------------ minimize / lock
+
+    protected override void OnResize(EventArgs e)
+    {
+        base.OnResize(e);
+        bool minimized = WindowState == FormWindowState.Minimized;
+        if (minimized != _isMinimized)
+        {
+            _isMinimized = minimized;
+            UpdateBackgroundState();
+        }
+    }
+
+    private void OnSessionSwitch(object? sender, Microsoft.Win32.SessionSwitchEventArgs e)
+    {
+        if (e.Reason is Microsoft.Win32.SessionSwitchReason.SessionLock)
+            BeginInvoke(() => { _isLocked = true; UpdateBackgroundState(); });
+        else if (e.Reason is Microsoft.Win32.SessionSwitchReason.SessionUnlock)
+            BeginInvoke(() => { _isLocked = false; UpdateBackgroundState(); });
+    }
+
+    private void UpdateBackgroundState()
+    {
+        if (_closing || Tabs is null)
+            return;
+        bool backgrounded = _isMinimized || _isLocked;
+        if (backgrounded && _backgroundSinceUtc is null)
+        {
+            _backgroundSinceUtc = DateTime.UtcNow;
+            // Hide the active tab so the policy may freeze it too; audio keeps playing
+            // (audible tabs are exempt from suspension).
+            Tabs.ActiveTab?.Deactivate();
+        }
+        else if (!backgrounded && _backgroundSinceUtc is not null)
+        {
+            _backgroundSinceUtc = null;
+            if (Tabs.ActiveTab is { } active)
+                _ = ActivateTabAsync(active); // resumes a frozen page instantly
+        }
+    }
 
     // ------------------------------------------------------------------ policy + status
 

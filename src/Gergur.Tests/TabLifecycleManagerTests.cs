@@ -10,6 +10,7 @@ public sealed class TabLifecycleManagerTests
         public TabState State { get; set; } = TabState.Hidden;
         public DateTime LastActiveUtc { get; set; }
         public bool IsPlayingAudio { get; set; }
+        public bool IsCurrent { get; set; }
         public bool SuspendResult { get; set; } = true;
         public int SuspendCalls { get; private set; }
         public int DiscardCalls { get; private set; }
@@ -114,6 +115,20 @@ public sealed class TabLifecycleManagerTests
 
         await Manager().TickAsync([tab]);
         Assert.Equal(2, tab.SuspendCalls); // retried on the next tick
+    }
+
+    [Fact]
+    public async Task CurrentTabMaySuspendButIsNeverDiscarded()
+    {
+        // The selected tab while the window is minimized/locked: freezes, keeps state.
+        var tab = TabIdleFor(TimeSpan.FromHours(3));
+        tab.IsCurrent = true;
+        await Manager().TickAsync([tab], forceSuspend: true);
+        Assert.Equal(TabState.Suspended, tab.State);
+
+        await Manager().TickAsync([tab]);
+        Assert.Equal(0, tab.DiscardCalls);
+        Assert.Equal(TabState.Suspended, tab.State);
     }
 
     [Fact]

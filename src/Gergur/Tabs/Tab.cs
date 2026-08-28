@@ -45,6 +45,8 @@ public sealed class Tab : ITabHandle, IDisposable
 
     internal CoreWebView2? Core => _webView?.CoreWebView2;
 
+    public bool IsCurrent => _owner.ActiveTab == this;
+
     public bool IsPlayingAudio
     {
         get

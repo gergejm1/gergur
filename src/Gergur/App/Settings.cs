@@ -4,13 +4,17 @@ namespace Gergur.App;
 
 public sealed class Settings
 {
-    public int SuspendAfterMinutes { get; set; } = 5;
-    public int DiscardAfterMinutes { get; set; } = 30;
+    public int SuspendAfterMinutes { get; set; } = 3;
+    public int DiscardAfterMinutes { get; set; } = 15;
+    /// <summary>Minutes the window sits minimized (or the PC locked) before every tab sleeps.</summary>
+    public int SleepAllWhenBackgroundedMinutes { get; set; } = 1;
 
     // Browser-process flags. Undocumented for WebView2, so each one is a toggle;
     // changes apply only after the app (and the engine processes) fully exit.
     public bool ProcessPerSite { get; set; } = true;
     public bool DisableSiteIsolation { get; set; } = false;
+    public bool DisableSpareRenderer { get; set; } = true;   // no warm standby renderer process
+    public bool InactiveMemoryPressure { get; set; } = true; // hidden views act memory-pressured
     public int V8ScavengerMaxMb { get; set; } = 0; // 0 = engine default
     public string ExtraBrowserArguments { get; set; } = "";
 

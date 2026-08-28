@@ -1,0 +1,38 @@
+using Gergur.App;
+using Xunit;
+
+namespace Gergur.Tests;
+
+public sealed class BrowserArgumentsTests
+{
+    [Fact]
+    public void DefaultsIncludeProcessPerSiteAndMemoryFeatures()
+    {
+        var args = BrowserEnvironment.BuildBrowserArguments(new Settings());
+        Assert.Contains("--process-per-site", args);
+        Assert.Contains("--enable-features=msWebView2SimulateMemoryPressureWhenInactive", args);
+        Assert.Contains("--disable-features=SpareRendererForSitePerProcess", args);
+        Assert.DoesNotContain("--disable-site-isolation-trials", args);
+    }
+
+    [Fact]
+    public void EachFeatureSwitchAppearsAtMostOnce()
+    {
+        var args = BrowserEnvironment.BuildBrowserArguments(new Settings());
+        Assert.Single(args.Split("--enable-features=")[1..]);
+        Assert.Single(args.Split("--disable-features=")[1..]);
+    }
+
+    [Fact]
+    public void TogglesRemoveTheirFlags()
+    {
+        var settings = new Settings
+        {
+            ProcessPerSite = false,
+            DisableSpareRenderer = false,
+            InactiveMemoryPressure = false,
+        };
+        var args = BrowserEnvironment.BuildBrowserArguments(settings);
+        Assert.Equal("", args);
+    }
+}

@@ -35,12 +35,23 @@ public sealed class BrowserEnvironment
     internal static string BuildBrowserArguments(Settings settings)
     {
         var flags = new List<string>();
+        var enableFeatures = new List<string>();
+        var disableFeatures = new List<string>();
         if (settings.ProcessPerSite)
             flags.Add("--process-per-site");
         if (settings.DisableSiteIsolation)
             flags.Add("--disable-site-isolation-trials");
+        if (settings.DisableSpareRenderer)
+            disableFeatures.Add("SpareRendererForSitePerProcess");
+        if (settings.InactiveMemoryPressure)
+            enableFeatures.Add("msWebView2SimulateMemoryPressureWhenInactive");
         if (settings.V8ScavengerMaxMb > 0)
             flags.Add($"--js-flags=--scavenger_max_new_space_capacity_mb={settings.V8ScavengerMaxMb}");
+        // Chromium honors only one instance of each feature switch, so join lists.
+        if (enableFeatures.Count > 0)
+            flags.Add("--enable-features=" + string.Join(',', enableFeatures));
+        if (disableFeatures.Count > 0)
+            flags.Add("--disable-features=" + string.Join(',', disableFeatures));
         if (!string.IsNullOrWhiteSpace(settings.ExtraBrowserArguments))
             flags.Add(settings.ExtraBrowserArguments.Trim());
         return string.Join(' ', flags);

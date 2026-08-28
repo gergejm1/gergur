@@ -18,6 +18,10 @@ public interface ITabHandle
     TabState State { get; }
     DateTime LastActiveUtc { get; }
     bool IsPlayingAudio { get; }
+    /// <summary>True for the selected tab, even while it is hidden because the
+    /// window is minimized or the session is locked. It may suspend (freeze in
+    /// place) but must never be discarded, so its exact state survives.</summary>
+    bool IsCurrent { get; }
     Task<bool> TrySuspendAsync();
     void Discard();
     void SetLowMemoryTarget(bool low);
@@ -60,7 +64,7 @@ public sealed class TabLifecycleManager
                         await tab.TrySuspendAsync();  // false (DevTools open, etc.) → retry next tick
                     break;
 
-                case TabState.Suspended when idle >= DiscardAfter && !tab.IsPlayingAudio:
+                case TabState.Suspended when idle >= DiscardAfter && !tab.IsPlayingAudio && !tab.IsCurrent:
                     tab.Discard();
                     break;
             }

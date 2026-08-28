@@ -6,10 +6,16 @@ with an aggressive tab-lifecycle policy that mainstream browsers won't ship:
 
 - **Active** → the one visible tab, fully alive.
 - **Hidden** → background tab, still live.
-- **Suspended** (after 5 min idle) → page frozen via `TrySuspendAsync`, renderer
+- **Suspended** (after 3 min idle) → page frozen via `TrySuspendAsync`, renderer
   memory trimmed. Tabs playing audio are exempt (they get low-memory mode instead).
-- **Discarded** (after 30 min idle) → the WebView is destroyed entirely; the tab
+- **Discarded** (after 15 min idle) → the WebView is destroyed entirely; the tab
   keeps only its URL/title/favicon and holds **zero** engine processes until clicked.
+  The selected tab is never discarded, so its exact state always survives.
+
+When the window is minimized or the PC is locked for a minute, everything sleeps,
+active tab included; restoring the window wakes it instantly. The engine also runs
+with the spare-renderer process disabled and memory pressure simulated on hidden
+views (`DisableSpareRenderer` / `InactiveMemoryPressure` toggles in settings).
 
 Sleeping tabs show a ☾ in the tab strip. The status bar shows live engine memory,
 renderer count, tabs asleep, and blocked-request count. New tabs open the Gërgur
