@@ -49,10 +49,20 @@ public sealed class BrowserEnvironment
             flags.Add($"--js-flags=--scavenger_max_new_space_capacity_mb={settings.V8ScavengerMaxMb}");
         if (settings.VpnEnabled)
         {
-            // Route everything through the local WARP tunnel; the resolver rule
-            // forces DNS through the proxy too (no DNS leak), except localhost.
             flags.Add($"--proxy-server=socks5://127.0.0.1:{settings.VpnLocalPort}");
-            flags.Add("--host-resolver-rules=\"MAP * ~NOTFOUND , EXCLUDE 127.0.0.1\"");
+
+            // Hosts that skip the tunnel and connect directly.
+            var bypassHosts = new List<string> { "localhost", "127.0.0.1" };
+            if (!string.IsNullOrWhiteSpace(settings.VpnBypassHosts))
+                bypassHosts.AddRange(settings.VpnBypassHosts.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+            flags.Add($"--proxy-bypass-list=\"{string.Join(';', bypassHosts)}\"");
+
+            // Force DNS through the proxy (no leak) for tunneled hosts, but EXCLUDE the
+            // bypass hosts so they resolve locally and reach the direct connection.
+            var resolver = new List<string> { "MAP * ~NOTFOUND" };
+            foreach (var host in bypassHosts)
+                resolver.Add("EXCLUDE " + host.TrimStart('*', '.'));
+            flags.Add($"--host-resolver-rules=\"{string.Join(" , ", resolver)}\"");
         }
         // Chromium honors only one instance of each feature switch, so join lists.
         if (enableFeatures.Count > 0)

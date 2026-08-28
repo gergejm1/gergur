@@ -40,6 +40,18 @@ public sealed class BrowserArgumentsTests
     }
 
     [Fact]
+    public void VpnBypassHostsSkipTunnelAndResolveLocally()
+    {
+        var args = BrowserEnvironment.BuildBrowserArguments(new Settings { VpnEnabled = true });
+        // Google is in the default bypass list...
+        Assert.Contains("--proxy-bypass-list=", args);
+        Assert.Contains("*.google.com", args);
+        // ...and excluded from the DNS-blackhole rule so it resolves locally.
+        Assert.Contains("EXCLUDE google.com", args);
+        Assert.Contains("MAP * ~NOTFOUND", args);
+    }
+
+    [Fact]
     public void TogglesRemoveTheirFlags()
     {
         var settings = new Settings

@@ -27,6 +27,9 @@ public sealed class Settings
     public string PageTheme { get; set; } = "Auto";   // Auto | Light | Dark (what sites see for prefers-color-scheme)
     public bool VpnEnabled { get; set; } = false;     // route engine traffic through the local WARP tunnel
     public int VpnLocalPort { get; set; } = 24001;    // wireproxy SOCKS5 port (must match vpn\wireproxy.conf)
+    // Hosts that skip the tunnel and connect directly. Google flags VPN/datacenter
+    // IPs, which breaks Gmail's realtime channel and the account switcher; bypass fixes it.
+    public string VpnBypassHosts { get; set; } = "*.google.com;*.googleusercontent.com;*.gstatic.com;accounts.youtube.com";
     public bool AgentServerEnabled { get; set; } = true; // token-protected local API for AI-agent browsing
     public int AgentServerPort { get; set; } = 24002;
 
