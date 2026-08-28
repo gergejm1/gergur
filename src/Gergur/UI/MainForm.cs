@@ -15,6 +15,7 @@ public sealed class MainForm : Form
     private readonly ShortcutRouter _shortcuts;
     private readonly BookmarkStore _bookmarks = new();
     private readonly HistoryStore _history = new();
+    private readonly VpnTunnel _vpn = new();
 
     private BrowserEnvironment? _env;
     private RequestBlocker? _blocker;
@@ -38,6 +39,7 @@ public sealed class MainForm : Form
     private Panel _hostPanel = null!;
     private StatusStrip _statusStrip = null!;
     private ToolStripStatusLabel _messageLabel = null!;
+    private ToolStripStatusLabel _vpnLabel = null!;
     private ToolStripStatusLabel _memoryLabel = null!;
     private ToolStripStatusLabel _sleepLabel = null!;
     private ToolStripStatusLabel _blockedLabel = null!;
@@ -119,10 +121,11 @@ public sealed class MainForm : Form
             SizingGrip = false,
         };
         _messageLabel = new ToolStripStatusLabel { Spring = true, TextAlign = ContentAlignment.MiddleLeft, ForeColor = Theme.TextDim };
+        _vpnLabel = new ToolStripStatusLabel { ForeColor = Theme.Accent };
         _memoryLabel = new ToolStripStatusLabel { ForeColor = Theme.TextDim };
         _sleepLabel = new ToolStripStatusLabel { ForeColor = Theme.TextDim };
         _blockedLabel = new ToolStripStatusLabel { ForeColor = Theme.TextDim };
-        _statusStrip.Items.AddRange([_messageLabel, _sleepLabel, _blockedLabel, _memoryLabel]);
+        _statusStrip.Items.AddRange([_messageLabel, _vpnLabel, _sleepLabel, _blockedLabel, _memoryLabel]);
 
         Controls.Add(_hostPanel);
         Controls.Add(_statusStrip);
@@ -207,6 +210,13 @@ public sealed class MainForm : Form
         };
         _menu.Items.Add(blocking);
         _menu.Items.Add(new ToolStripMenuItem("Update blocklist (StevenBlack hosts)", null, async (_, _) => await UpdateBlocklistAsync(silent: false)));
+
+        var vpn = new ToolStripMenuItem($"VPN through Cloudflare WARP ({(_settings.VpnEnabled ? "on" : "off")})")
+        {
+            Checked = _settings.VpnEnabled,
+        };
+        vpn.Click += (_, _) => ToggleVpn();
+        _menu.Items.Add(vpn);
         _menu.Items.Add(new ToolStripSeparator());
 
         _menu.Items.Add(new ToolStripMenuItem("Browser task manager", null, (_, _) => Tabs?.ActiveTab?.OpenTaskManager()));
@@ -229,6 +239,18 @@ public sealed class MainForm : Form
         base.OnShown(e);
         try
         {
+            // The tunnel must be listening before the engine starts, or every
+            // request would hit a dead proxy. On failure, run without for this session.
+            if (_settings.VpnEnabled)
+            {
+                bool up = await _vpn.StartAsync(_settings.VpnLocalPort, TimeSpan.FromSeconds(12));
+                if (!up)
+                {
+                    _settings.VpnEnabled = false; // session-only; the saved intent stays
+                    ShowMessage("VPN tunnel failed to start; browsing without it.");
+                }
+            }
+
             _blocker = new RequestBlocker(_settings.BlocklistEnabled);
             _env = await BrowserEnvironment.CreateAsync(_settings);
             _env.Core.BrowserProcessExited += OnBrowserProcessExited;
@@ -321,7 +343,31 @@ public sealed class MainForm : Form
         _lifecycleTimer.Stop();
         _statusTimer.Stop();
         Tabs?.DisposeAll(); // engine processes exit promptly once the last WebView is gone
+        _vpn.Stop();
         base.OnFormClosing(e);
+    }
+
+    private void ToggleVpn()
+    {
+        if (!_settings.VpnEnabled && !VpnTunnel.IsProvisioned)
+        {
+            ShowMessage(@"VPN not set up yet: run scripts\setup-warp.ps1 from the repo first.");
+            return;
+        }
+        _settings.VpnEnabled = !_settings.VpnEnabled;
+        _settings.Save();
+        RestartForNewEngineFlags();
+    }
+
+    private void RestartForNewEngineFlags()
+    {
+        try
+        {
+            if (Environment.ProcessPath is { } exe)
+                System.Diagnostics.Process.Start(exe, $"--wait-restart {Environment.ProcessId}");
+        }
+        catch { }
+        Close();
     }
 
     private void SaveSession()
@@ -517,6 +563,7 @@ public sealed class MainForm : Form
         var snapshot = MemoryMeter.Capture(_env.Core);
         _memoryLabel.Text = $"engine {MemorySnapshot.Format(snapshot.EnginePrivateBytes)} · {snapshot.RendererCount} renderers · shell {MemorySnapshot.Format(snapshot.ShellPrivateBytes)}";
         _blockedLabel.Text = _blocker is { Enabled: true } ? $"{_blocker.BlockedCount:N0} blocked" : "blocking off";
+        _vpnLabel.Text = _settings.VpnEnabled && _vpn.IsRunning ? "WARP" : "";
         UpdateSleepLabel();
     }
 

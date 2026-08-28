@@ -24,6 +24,22 @@ public sealed class BrowserArgumentsTests
     }
 
     [Fact]
+    public void VpnAddsProxyAndDnsLeakProtection()
+    {
+        var args = BrowserEnvironment.BuildBrowserArguments(new Settings { VpnEnabled = true, VpnLocalPort = 24001 });
+        Assert.Contains("--proxy-server=socks5://127.0.0.1:24001", args);
+        Assert.Contains("--host-resolver-rules=", args);
+        Assert.Contains("EXCLUDE 127.0.0.1", args);
+    }
+
+    [Fact]
+    public void VpnOffAddsNoProxyFlags()
+    {
+        var args = BrowserEnvironment.BuildBrowserArguments(new Settings());
+        Assert.DoesNotContain("--proxy-server", args);
+    }
+
+    [Fact]
     public void TogglesRemoveTheirFlags()
     {
         var settings = new Settings

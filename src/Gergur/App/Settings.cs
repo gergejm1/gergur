@@ -24,6 +24,8 @@ public sealed class Settings
     public bool SavePasswords { get; set; } = true;   // engine-level autosave, DPAPI-encrypted in the profile
     public bool FormAutofill { get; set; } = true;
     public string PageTheme { get; set; } = "Auto";   // Auto | Light | Dark (what sites see for prefers-color-scheme)
+    public bool VpnEnabled { get; set; } = false;     // route engine traffic through the local WARP tunnel
+    public int VpnLocalPort { get; set; } = 24001;    // wireproxy SOCKS5 port (must match vpn\wireproxy.conf)
 
     public static string DataDir { get; } =
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Gergur");

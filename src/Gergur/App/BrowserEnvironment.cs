@@ -47,6 +47,13 @@ public sealed class BrowserEnvironment
             enableFeatures.Add("msWebView2SimulateMemoryPressureWhenInactive");
         if (settings.V8ScavengerMaxMb > 0)
             flags.Add($"--js-flags=--scavenger_max_new_space_capacity_mb={settings.V8ScavengerMaxMb}");
+        if (settings.VpnEnabled)
+        {
+            // Route everything through the local WARP tunnel; the resolver rule
+            // forces DNS through the proxy too (no DNS leak), except localhost.
+            flags.Add($"--proxy-server=socks5://127.0.0.1:{settings.VpnLocalPort}");
+            flags.Add("--host-resolver-rules=\"MAP * ~NOTFOUND , EXCLUDE 127.0.0.1\"");
+        }
         // Chromium honors only one instance of each feature switch, so join lists.
         if (enableFeatures.Count > 0)
             flags.Add("--enable-features=" + string.Join(',', enableFeatures));

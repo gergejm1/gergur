@@ -17,6 +17,17 @@ internal static class Program
     [STAThread]
     private static void Main(string[] args)
     {
+        var argList = args.ToList();
+        // Settings that require new engine flags restart via "exe --wait-restart <oldPid>":
+        // wait for the old instance AND its engine to die, or the flags silently no-op.
+        int waitIndex = argList.IndexOf("--wait-restart");
+        if (waitIndex >= 0 && waitIndex + 1 < argList.Count && int.TryParse(argList[waitIndex + 1], out int oldPid))
+        {
+            argList.RemoveRange(waitIndex, 2);
+            try { Process.GetProcessById(oldPid).WaitForExit(15000); } catch { }
+            Thread.Sleep(3000); // grace for the shared browser process to exit
+        }
+
         using var mutex = new Mutex(initiallyOwned: true, @"Local\Gergur.SingleInstance", out bool isFirstInstance);
         if (!isFirstInstance)
         {
@@ -29,7 +40,7 @@ internal static class Program
 #pragma warning disable WFO5001 // SetColorMode is marked experimental
         Application.SetColorMode(SystemColorMode.Dark);
 #pragma warning restore WFO5001
-        Application.Run(new MainForm(args.FirstOrDefault()));
+        Application.Run(new MainForm(argList.FirstOrDefault()));
     }
 
     private static void FocusRunningInstance()

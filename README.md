@@ -48,6 +48,15 @@ hosts-format blocklist (StevenBlack, auto-downloaded on first run) enforced via
 
 ![Browsing with a parked tab](docs/browsing.png)
 
+## Browser-only VPN
+
+`scripts/setup-warp.ps1` provisions a free Cloudflare WARP account (via wgcf)
+and a userspace WireGuard tunnel (wireproxy) exposing a local SOCKS5 proxy.
+The engine launches with `--proxy-server` plus a host-resolver rule so all
+traffic AND DNS route through the tunnel - browser only, nothing system-wide.
+Toggle from the menu; a WARP badge shows in the status bar. Verified via
+cloudflare.com/cdn-cgi/trace (`warp=on`, Cloudflare exit IP).
+
 ## Build & run
 
 ```
