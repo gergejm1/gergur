@@ -70,6 +70,9 @@ public sealed class BrowserEnvironment
             "Balanced" => CoreWebView2TrackingPreventionLevel.Balanced,
             _ => CoreWebView2TrackingPreventionLevel.Strict,
         };
+        var webSettings = webView.CoreWebView2.Settings;
+        webSettings.IsPasswordAutosaveEnabled = Settings.SavePasswords;
+        webSettings.IsGeneralAutofillEnabled = Settings.FormAutofill;
         return webView;
     }
 }
