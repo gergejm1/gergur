@@ -68,7 +68,9 @@ public sealed class BrowserEnvironment
         {
             Dock = DockStyle.Fill,
             Visible = visible,
-            DefaultBackgroundColor = Color.FromArgb(5, 4, 10), // matches home/logo background
+            // White, like every real browser: sites with transparent regions assume a
+            // white canvas; a dark one bleeds through and fakes broken dark mode.
+            DefaultBackgroundColor = Color.White,
         };
         host.Controls.Add(webView);
         _ = webView.Handle; // force HWND creation; init needs it even while the control is hidden
@@ -80,6 +82,13 @@ public sealed class BrowserEnvironment
             "Basic" => CoreWebView2TrackingPreventionLevel.Basic,
             "Balanced" => CoreWebView2TrackingPreventionLevel.Balanced,
             _ => CoreWebView2TrackingPreventionLevel.Strict,
+        };
+        // What sites see for prefers-color-scheme: Auto follows Windows, or pin it.
+        webView.CoreWebView2.Profile.PreferredColorScheme = Settings.PageTheme switch
+        {
+            "Light" => CoreWebView2PreferredColorScheme.Light,
+            "Dark" => CoreWebView2PreferredColorScheme.Dark,
+            _ => CoreWebView2PreferredColorScheme.Auto,
         };
         var webSettings = webView.CoreWebView2.Settings;
         webSettings.IsPasswordAutosaveEnabled = Settings.SavePasswords;
