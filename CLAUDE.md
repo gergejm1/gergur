@@ -42,3 +42,7 @@ personal: read what the task requires, nothing more.
   policy) apply only on a fresh engine start.
 - Debug trace: set `GERGUR_DEBUG=1` before launch, log at `%LOCALAPPDATA%\Gergur\debug.log`.
 - The user never wants em dashes anywhere: code, UI text, docs, commits.
+
+Agent actions are visualized: /click and /type animate a blue cursor to the
+target, ripple, and flash the element, so the user can watch the agent work.
+Both endpoints return after the animation and action complete (~1s).

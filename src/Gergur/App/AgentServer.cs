@@ -224,12 +224,20 @@ public sealed class AgentServer
                     (() => {
                         const el = document.querySelector({{JsonSerializer.Serialize(selector)}});
                         if (!el) return false;
-                        el.scrollIntoView({ block: 'center' });
-                        el.click();
+                        el.scrollIntoView({ block: 'center', behavior: 'instant' });
+                        {{CursorJs}}
+                        const r = el.getBoundingClientRect();
+                        __gergurCursorTo(r.left + r.width / 2, r.top + r.height / 2, () => {
+                            const prev = el.style.outline;
+                            el.style.outline = '2px solid #3D7BFA';
+                            setTimeout(() => { el.style.outline = prev; }, 600);
+                            el.click();
+                        });
                         return true;
                     })()
                     """;
                 string result = await OnUiAsync(() => tab.ExecuteScriptAsync(js));
+                await Task.Delay(900); // let the cursor glide and the click land before responding
                 return (200, "application/json", Json(new { ok = result == "true" }));
             }
 
@@ -243,18 +251,27 @@ public sealed class AgentServer
                     (() => {
                         const el = document.querySelector({{JsonSerializer.Serialize(selector)}});
                         if (!el) return false;
-                        el.focus();
-                        const proto = el instanceof HTMLTextAreaElement
-                            ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-                        const desc = Object.getOwnPropertyDescriptor(proto, 'value');
-                        if (desc && desc.set) desc.set.call(el, {{JsonSerializer.Serialize(text)}});
-                        else el.value = {{JsonSerializer.Serialize(text)}};
-                        el.dispatchEvent(new Event('input', { bubbles: true }));
-                        el.dispatchEvent(new Event('change', { bubbles: true }));
+                        el.scrollIntoView({ block: 'center', behavior: 'instant' });
+                        {{CursorJs}}
+                        const r = el.getBoundingClientRect();
+                        __gergurCursorTo(r.left + r.width / 2, r.top + r.height / 2, () => {
+                            el.focus();
+                            const prev = el.style.outline;
+                            el.style.outline = '2px solid #3D7BFA';
+                            setTimeout(() => { el.style.outline = prev; }, 600);
+                            const proto = el instanceof HTMLTextAreaElement
+                                ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+                            const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+                            if (desc && desc.set) desc.set.call(el, {{JsonSerializer.Serialize(text)}});
+                            else el.value = {{JsonSerializer.Serialize(text)}};
+                            el.dispatchEvent(new Event('input', { bubbles: true }));
+                            el.dispatchEvent(new Event('change', { bubbles: true }));
+                        });
                         return true;
                     })()
                     """;
                 string result = await OnUiAsync(() => tab.ExecuteScriptAsync(js));
+                await Task.Delay(900);
                 return (200, "application/json", Json(new { ok = result == "true" }));
             }
 
@@ -262,6 +279,42 @@ public sealed class AgentServer
                 return (404, "application/json", Json(new { error = "unknown endpoint" }));
         }
     }
+
+    /// <summary>
+    /// The visible agent cursor: a Gergur-blue dot that glides to the target,
+    /// ripples on arrival, then runs the action, so the user can watch the
+    /// agent work. Defines __gergurCursorTo(x, y, action) in the page.
+    /// </summary>
+    private const string CursorJs = """
+        if (!window.__gergurCursorTo) {
+            window.__gergurCursorTo = (x, y, action) => {
+                let c = document.getElementById('__gergur_cursor');
+                if (!c) {
+                    c = document.createElement('div');
+                    c.id = '__gergur_cursor';
+                    c.style.cssText = 'position:fixed;left:50%;top:40%;width:18px;height:18px;'
+                        + 'border-radius:50%;background:rgba(61,123,250,.85);border:2px solid #fff;'
+                        + 'box-shadow:0 1px 8px rgba(0,0,0,.55);z-index:2147483647;pointer-events:none;'
+                        + 'transition:left .5s cubic-bezier(.3,.7,.4,1),top .5s cubic-bezier(.3,.7,.4,1);';
+                    document.documentElement.appendChild(c);
+                }
+                requestAnimationFrame(() => {
+                    c.style.left = (x - 9) + 'px';
+                    c.style.top = (y - 9) + 'px';
+                });
+                setTimeout(() => {
+                    const rip = document.createElement('div');
+                    rip.style.cssText = 'position:fixed;left:' + (x - 9) + 'px;top:' + (y - 9) + 'px;'
+                        + 'width:18px;height:18px;border-radius:50%;border:3px solid rgba(61,123,250,.9);'
+                        + 'z-index:2147483646;pointer-events:none;transition:transform .45s ease-out,opacity .45s ease-out;';
+                    document.documentElement.appendChild(rip);
+                    requestAnimationFrame(() => { rip.style.transform = 'scale(3)'; rip.style.opacity = '0'; });
+                    setTimeout(() => rip.remove(), 500);
+                    action();
+                }, 550);
+            };
+        }
+        """;
 
     private async Task<string> EvalStringAsync(Tab tab, string js)
     {
