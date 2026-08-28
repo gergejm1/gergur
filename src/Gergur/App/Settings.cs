@@ -21,6 +21,7 @@ public sealed class Settings
     public string SearchUrlTemplate { get; set; } = "https://duckduckgo.com/?q={0}";
     public string TrackingPrevention { get; set; } = "Strict"; // None | Basic | Balanced | Strict
     public bool BlocklistEnabled { get; set; } = true;
+    public bool PageAdCleanup { get; set; } = true;   // cosmetic filtering + YouTube ad neutralizer (Assets\adblock.js)
     public bool SavePasswords { get; set; } = true;   // engine-level autosave, DPAPI-encrypted in the profile
     public bool FormAutofill { get; set; } = true;
     public string PageTheme { get; set; } = "Auto";   // Auto | Light | Dark (what sites see for prefers-color-scheme)

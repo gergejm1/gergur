@@ -61,4 +61,23 @@ public sealed class HostBlocklistTests
     {
         Assert.False(HostBlocklist.Empty.IsBlocked("anything.example.com"));
     }
+
+    [Fact]
+    public void EasyListExtractionTakesOnlySimpleHostRules()
+    {
+        string[] lines =
+        [
+            "[Adblock Plus 2.0]",
+            "! comment",
+            "||ads.example.com^",                    // keep
+            "||tracker.example.net^$third-party",    // option -> skip
+            "||example.org/banners/*",               // path -> skip
+            "@@||goodsite.com^",                     // exception -> skip
+            "||sub.domain.co.uk^",                   // keep
+            "##.ad-container",                       // cosmetic -> skip
+            "||no-tld^",                             // not a domain -> skip
+        ];
+        var hosts = Blocking.RequestBlocker.ExtractSimpleHostRules(lines).ToList();
+        Assert.Equal(["ads.example.com", "sub.domain.co.uk"], hosts);
+    }
 }

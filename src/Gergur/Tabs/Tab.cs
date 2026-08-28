@@ -92,6 +92,8 @@ public sealed class Tab : ITabHandle, IDisposable
         webView.KeyDown += OnWebViewKeyDown;
 
         _owner.Blocker.Attach(core);
+        if (_owner.Env.Settings.PageAdCleanup && Blocking.PageCleanup.Script is { } script)
+            await core.AddScriptToExecuteOnDocumentCreatedAsync(script);
 
         State = TabState.Hidden;
         if (navigateToStoredUrl && Url is not ("" or "about:blank"))
