@@ -12,14 +12,15 @@ Same six tabs (Wikipedia, GitHub, Hacker News, Stack Overflow, The Verge,
 example.com), clean profiles for all three browsers, measured as the sum of
 private bytes across each browser's entire process tree:
 
-| | Chrome | Edge | Gergur |
-|---|---|---|---|
-| All six tabs freshly loaded | 2,835 MB | 1,039 MB | 988 MB |
-| A few minutes later | 1,875 MB | 1,031 MB | **374 MB** |
+| | Chrome | Edge | Firefox | Gergur |
+|---|---|---|---|---|
+| All six tabs freshly loaded | 2,835 MB | 1,039 MB | 1,925 MB | 988 MB |
+| A few minutes later | 1,875 MB | 1,031 MB | 1,891 MB | **374 MB** |
 
-Chrome and Edge keep every renderer alive indefinitely. Gergur converges to a
-single live renderer: background tabs first freeze, then park to zero-process
-snapshots that reload on click.
+Chrome, Edge, and Firefox all keep every renderer alive indefinitely. Gergur
+converges to a single live renderer: background tabs first freeze, then park to
+zero-process snapshots that reload on click. Firefox (Gecko engine) settles the
+heaviest of the mainstream three; Gergur uses roughly 5x less than all of them.
 
 ## How
 
