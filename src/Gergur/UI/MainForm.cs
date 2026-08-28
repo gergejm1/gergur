@@ -20,6 +20,7 @@ public sealed class MainForm : Form
     private BrowserEnvironment? _env;
     private RequestBlocker? _blocker;
     private TabLifecycleManager? _lifecycle;
+    private AgentServer? _agent;
     private bool _closing;
     private bool _lifecycleTickRunning;
     private bool _isMinimized;
@@ -267,6 +268,19 @@ public sealed class MainForm : Form
 
             await RestoreSessionAsync();
 
+            if (_settings.AgentServerEnabled)
+            {
+                try
+                {
+                    _agent = new AgentServer(this, Tabs, _settings.AgentServerPort);
+                    _agent.Start();
+                }
+                catch
+                {
+                    _agent = null; // port taken etc.; browsing works without the agent API
+                }
+            }
+
             Microsoft.Win32.SystemEvents.SessionSwitch += OnSessionSwitch;
             _lifecycleTimer.Start();
             _statusTimer.Start();
@@ -342,6 +356,7 @@ public sealed class MainForm : Form
         SaveSession();
         _lifecycleTimer.Stop();
         _statusTimer.Stop();
+        _agent?.Stop();
         Tabs?.DisposeAll(); // engine processes exit promptly once the last WebView is gone
         _vpn.Stop();
         base.OnFormClosing(e);

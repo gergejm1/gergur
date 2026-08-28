@@ -146,6 +146,28 @@ public sealed class Tab : ITabHandle, IDisposable
         catch (ArgumentException) { /* malformed URL - leave the page as-is */ }
     }
 
+    /// <summary>Runs JS in the page (agent API). Wakes the tab if it was parked.</summary>
+    public async Task<string> ExecuteScriptAsync(string js)
+    {
+        await EnsureLiveAsync();
+        var core = Core;
+        if (core is null)
+            return "null";
+        return await core.ExecuteScriptAsync(js);
+    }
+
+    /// <summary>PNG screenshot of the rendered page (agent API). Wakes the tab if parked.</summary>
+    public async Task<byte[]> CaptureScreenshotAsync()
+    {
+        await EnsureLiveAsync();
+        var core = Core;
+        if (core is null)
+            return [];
+        using var stream = new MemoryStream();
+        await core.CapturePreviewAsync(CoreWebView2CapturePreviewImageFormat.Png, stream);
+        return stream.ToArray();
+    }
+
     public void GoBack() { try { Core?.GoBack(); } catch { } }
     public void GoForward() { try { Core?.GoForward(); } catch { } }
     public void Reload() { try { Core?.Reload(); } catch { } }

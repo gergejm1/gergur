@@ -27,6 +27,8 @@ public sealed class Settings
     public string PageTheme { get; set; } = "Auto";   // Auto | Light | Dark (what sites see for prefers-color-scheme)
     public bool VpnEnabled { get; set; } = false;     // route engine traffic through the local WARP tunnel
     public int VpnLocalPort { get; set; } = 24001;    // wireproxy SOCKS5 port (must match vpn\wireproxy.conf)
+    public bool AgentServerEnabled { get; set; } = true; // token-protected local API for AI-agent browsing
+    public int AgentServerPort { get; set; } = 24002;
 
     public static string DataDir { get; } =
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Gergur");
