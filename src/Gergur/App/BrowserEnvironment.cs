@@ -1,0 +1,75 @@
+﻿using Microsoft.Web.WebView2.Core;
+using Microsoft.Web.WebView2.WinForms;
+
+namespace Gergur.App;
+
+/// <summary>
+/// Owns the single CoreWebView2Environment shared by every tab, so all tabs share
+/// one browser/GPU process group and renderer processes are pooled per-site.
+/// </summary>
+public sealed class BrowserEnvironment
+{
+    public CoreWebView2Environment Core { get; }
+    public Settings Settings { get; }
+
+    private BrowserEnvironment(CoreWebView2Environment core, Settings settings)
+    {
+        Core = core;
+        Settings = settings;
+    }
+
+    public static async Task<BrowserEnvironment> CreateAsync(Settings settings)
+    {
+        string userDataFolder = Path.Combine(Settings.DataDir, "Profile");
+        Directory.CreateDirectory(userDataFolder);
+
+        var options = new CoreWebView2EnvironmentOptions
+        {
+            AdditionalBrowserArguments = BuildBrowserArguments(settings),
+        };
+        var core = await CoreWebView2Environment.CreateAsync(
+            browserExecutableFolder: null, userDataFolder, options);
+        return new BrowserEnvironment(core, settings);
+    }
+
+    internal static string BuildBrowserArguments(Settings settings)
+    {
+        var flags = new List<string>();
+        if (settings.ProcessPerSite)
+            flags.Add("--process-per-site");
+        if (settings.DisableSiteIsolation)
+            flags.Add("--disable-site-isolation-trials");
+        if (settings.V8ScavengerMaxMb > 0)
+            flags.Add($"--js-flags=--scavenger_max_new_space_capacity_mb={settings.V8ScavengerMaxMb}");
+        if (!string.IsNullOrWhiteSpace(settings.ExtraBrowserArguments))
+            flags.Add(settings.ExtraBrowserArguments.Trim());
+        return string.Join(' ', flags);
+    }
+
+    /// <summary>
+    /// Creates a WebView2 control parented into <paramref name="host"/> and initialized
+    /// on the shared environment. WebView2.Source must never be assigned before this
+    /// completes - that triggers implicit init against a default, non-shared environment.
+    /// </summary>
+    public async Task<WebView2> CreateWebViewAsync(Control host, bool visible)
+    {
+        var webView = new WebView2
+        {
+            Dock = DockStyle.Fill,
+            Visible = visible,
+            DefaultBackgroundColor = Color.FromArgb(5, 4, 10), // matches home/logo background
+        };
+        host.Controls.Add(webView);
+        _ = webView.Handle; // force HWND creation; init needs it even while the control is hidden
+        await webView.EnsureCoreWebView2Async(Core);
+
+        webView.CoreWebView2.Profile.PreferredTrackingPreventionLevel = Settings.TrackingPrevention switch
+        {
+            "None" => CoreWebView2TrackingPreventionLevel.None,
+            "Basic" => CoreWebView2TrackingPreventionLevel.Basic,
+            "Balanced" => CoreWebView2TrackingPreventionLevel.Balanced,
+            _ => CoreWebView2TrackingPreventionLevel.Strict,
+        };
+        return webView;
+    }
+}
