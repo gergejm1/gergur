@@ -4,6 +4,25 @@ A personal, memory-frugal browser for Windows 11. A tiny WinForms shell over
 WebView2 (the Edge engine already installed with Windows - nothing bundled),
 with an aggressive tab-lifecycle policy that mainstream browsers won't ship:
 
+![Gergur home page](docs/home.png)
+
+## Benchmark
+
+Same six tabs (Wikipedia, GitHub, Hacker News, Stack Overflow, The Verge,
+example.com), clean profiles for all three browsers, measured as the sum of
+private bytes across each browser's entire process tree:
+
+| | Chrome | Edge | Gergur |
+|---|---|---|---|
+| All six tabs freshly loaded | 2,835 MB | 1,039 MB | 988 MB |
+| A few minutes later | 1,875 MB | 1,031 MB | **374 MB** |
+
+Chrome and Edge keep every renderer alive indefinitely. Gergur converges to a
+single live renderer: background tabs first freeze, then park to zero-process
+snapshots that reload on click.
+
+## How
+
 - **Active** → the one visible tab, fully alive.
 - **Hidden** → background tab, still live.
 - **Suspended** (after 3 min idle) → page frozen via `TrySuspendAsync`, renderer
@@ -25,7 +44,9 @@ matter how many tabs you had open.
 
 Blocking is two layers: the engine's Strict tracking prevention, plus a
 hosts-format blocklist (StevenBlack, auto-downloaded on first run) enforced via
-`WebResourceRequested`.
+`WebResourceRequested` with allocation-free suffix matching on the request hot path.
+
+![Browsing with a parked tab](docs/browsing.png)
 
 ## Build & run
 
