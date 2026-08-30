@@ -80,7 +80,7 @@ public sealed class MainForm : Form
 
         _tabStrip = new TabStripControl { Dock = DockStyle.Top, Height = 36, Font = new Font("Segoe UI", 9f) };
         _tabStrip.TabClicked += async (_, tab) => { await ActivateTabAsync(tab); };
-        _tabStrip.TabCloseClicked += async (_, tab) => { if (Tabs is not null) await Tabs.CloseTabAsync(tab); };
+        _tabStrip.TabCloseClicked += async (_, tab) => { await CloseTabAsync(tab); };
         _tabStrip.NewTabClicked += (_, _) => _ = NewTabAsync();
 
         _toolbar = new Panel { Dock = DockStyle.Top, Height = 40, BackColor = Theme.ToolbarBg };
@@ -98,6 +98,7 @@ public sealed class MainForm : Form
             SearchUrlTemplate = _settings.SearchUrlTemplate,
         };
         _addressBar.Width = _toolbar.Width; // corrected after toolbar is sized
+        _addressBar.SuggestionProvider = () => _history.GetSuggestions();
         _addressBar.NavigationRequested += async (_, url) => await NavigateActiveAsync(url);
         _addressBar.Escaped += (_, _) =>
         {
@@ -415,10 +416,12 @@ public sealed class MainForm : Form
         tab.FocusPage();
     }
 
-    private void UpdateChrome()
+    private void UpdateChrome(bool forceAddressBar = false)
     {
         var active = Tabs?.ActiveTab;
-        if (!_addressBar.Focused)
+        // Skip the URL refresh only when the user is actively editing the address bar,
+        // never when a tab close incidentally parked focus here (forceAddressBar).
+        if (forceAddressBar || !_addressBar.Focused)
             _addressBar.Text = active is null || HomePage.IsHome(active.Url) ? "" : active.Url;
         _backButton.Enabled = active?.CanGoBack ?? false;
         _forwardButton.Enabled = active?.CanGoForward ?? false;
@@ -443,7 +446,25 @@ public sealed class MainForm : Form
     public async Task CloseActiveTabAsync()
     {
         if (Tabs?.ActiveTab is { } active)
-            await Tabs.CloseTabAsync(active);
+            await CloseTabAsync(active);
+    }
+
+    /// <summary>
+    /// Closes a tab, then focuses the newly-active page and re-syncs the chrome.
+    /// Disposing the closed tab's WebView bounces WinForms focus to the address bar;
+    /// without moving it back, UpdateChrome's "don't clobber what the user is typing"
+    /// guard leaves the address bar showing the closed tab's URL.
+    /// </summary>
+    private async Task CloseTabAsync(Tab tab)
+    {
+        if (Tabs is null)
+            return;
+        await Tabs.CloseTabAsync(tab);
+        if (Tabs.ActiveTab is { } now)
+        {
+            now.FocusPage();
+            UpdateChrome(forceAddressBar: true);
+        }
     }
 
     public async Task ReopenClosedTabAsync()

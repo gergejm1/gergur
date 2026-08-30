@@ -141,7 +141,7 @@ public sealed class AgentServer
             case ("POST", "/open"):
             {
                 string url = BodyString("url") ?? HomePage.Url;
-                var tab = await OnUiAsync(() => _tabs.CreateTabAsync(UrlHeuristics.ToNavigableUrl(url, "https://duckduckgo.com/?q={0}")));
+                var tab = await OnUiAsync(() => _tabs.CreateTabAsync(UrlHeuristics.ToNavigableUrl(url, _tabs.Env.Settings.SearchUrlTemplate)));
                 return (200, "application/json", Json(new { index = _tabs.Tabs.ToList().IndexOf(tab) }));
             }
 
@@ -168,7 +168,7 @@ public sealed class AgentServer
                 string url = BodyString("url") ?? "";
                 if (url.Length == 0)
                     return (400, "application/json", Json(new { error = "url required" }));
-                await OnUiAsync(async () => { await tab.NavigateAsync(UrlHeuristics.ToNavigableUrl(url, "https://duckduckgo.com/?q={0}")); return true; });
+                await OnUiAsync(async () => { await tab.NavigateAsync(UrlHeuristics.ToNavigableUrl(url, _tabs.Env.Settings.SearchUrlTemplate)); return true; });
                 return (200, "application/json", Json(new { ok = true }));
             }
 

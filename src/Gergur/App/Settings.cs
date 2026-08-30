@@ -18,7 +18,7 @@ public sealed class Settings
     public int V8ScavengerMaxMb { get; set; } = 0; // 0 = engine default
     public string ExtraBrowserArguments { get; set; } = "";
 
-    public string SearchUrlTemplate { get; set; } = "https://duckduckgo.com/?q={0}";
+    public string SearchUrlTemplate { get; set; } = "https://www.google.com/search?q={0}";
     public string TrackingPrevention { get; set; } = "Strict"; // None | Basic | Balanced | Strict
     public bool BlocklistEnabled { get; set; } = true;
     public bool PageAdCleanup { get; set; } = true;   // cosmetic filtering + YouTube ad neutralizer (Assets\adblock.js)

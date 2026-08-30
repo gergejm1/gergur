@@ -11,7 +11,12 @@ public sealed class AddressBar : TextBox
     public event EventHandler? Escaped;
 
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
-    public string SearchUrlTemplate { get; set; } = "https://duckduckgo.com/?q={0}";
+    public string SearchUrlTemplate { get; set; } = "https://www.google.com/search?q={0}";
+
+    /// <summary>Supplies address-bar suggestions (typically from browsing history),
+    /// refreshed each time the bar gains focus so newly-visited sites appear.</summary>
+    [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+    public Func<IEnumerable<string>>? SuggestionProvider { get; set; }
 
     public AddressBar()
     {
@@ -19,12 +24,32 @@ public sealed class AddressBar : TextBox
         Font = new Font("Segoe UI", 10.5f);
         BackColor = Theme.InputBg;
         ForeColor = Theme.Text;
+        AutoCompleteMode = AutoCompleteMode.SuggestAppend;
+        AutoCompleteSource = AutoCompleteSource.CustomSource;
+        AutoCompleteCustomSource = new AutoCompleteStringCollection();
     }
 
     protected override void OnEnter(EventArgs e)
     {
         base.OnEnter(e);
+        RefreshSuggestions();
         BeginInvoke(SelectAll); // after the click that focused us has been processed
+    }
+
+    private void RefreshSuggestions()
+    {
+        if (SuggestionProvider is null)
+            return;
+        try
+        {
+            var source = new AutoCompleteStringCollection();
+            source.AddRange(SuggestionProvider().ToArray());
+            AutoCompleteCustomSource = source;
+        }
+        catch
+        {
+            // Suggestions are a convenience; never let them break the address bar.
+        }
     }
 
     protected override void OnKeyDown(KeyEventArgs e)
