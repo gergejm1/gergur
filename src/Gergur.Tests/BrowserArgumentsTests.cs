@@ -12,7 +12,9 @@ public sealed class BrowserArgumentsTests
         Assert.Contains("--process-per-site", args);
         Assert.Contains("--enable-features=msWebView2SimulateMemoryPressureWhenInactive", args);
         Assert.Contains("SpareRendererForSitePerProcess", args);
-        Assert.Contains("FedCm", args); // so Google Sign-In falls back to the popup flow
+        // FedCM must stay enabled: Google requires it for Sign in with Google, and
+        // disabling it removes the API with no fallback.
+        Assert.DoesNotContain("FedCm", args);
         Assert.DoesNotContain("--disable-site-isolation-trials", args);
     }
 
@@ -60,7 +62,6 @@ public sealed class BrowserArgumentsTests
             ProcessPerSite = false,
             DisableSpareRenderer = false,
             InactiveMemoryPressure = false,
-            DisableFedCm = false,
         };
         var args = BrowserEnvironment.BuildBrowserArguments(settings);
         Assert.Equal("", args);

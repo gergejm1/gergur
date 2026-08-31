@@ -15,9 +15,10 @@ public sealed class Settings
     public bool DisableSiteIsolation { get; set; } = false;
     public bool DisableSpareRenderer { get; set; } = true;   // no warm standby renderer process
     public bool InactiveMemoryPressure { get; set; } = true; // hidden views act memory-pressured
-    // WebView2 does not surface the FedCM account chooser, so "Sign in with Google"
-    // (used by X, many sites) aborts. Disabling FedCM forces the reliable popup flow.
-    public bool DisableFedCm { get; set; } = true;
+    // Leave false. Google made FedCM mandatory for Sign in with Google in Aug 2025,
+    // and WebView2 does render the FedCM account chooser correctly (verified), so
+    // disabling it removes the API entirely and breaks Google login with no fallback.
+    public bool DisableFedCm { get; set; } = false;
     public int V8ScavengerMaxMb { get; set; } = 0; // 0 = engine default
     public string ExtraBrowserArguments { get; set; } = "";
 
