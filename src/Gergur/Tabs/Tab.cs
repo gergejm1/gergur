@@ -24,6 +24,31 @@ public sealed class Tab : ITabHandle, IDisposable
     public string Title { get; private set; } = "New tab";
     public Image? Favicon { get; private set; }
 
+    private readonly List<string> _recentErrors = new();
+    /// <summary>Page problems (JS errors, failed loads) surfaced on this tab's current page.</summary>
+    public IReadOnlyList<string> RecentErrors => _recentErrors;
+    public int ErrorCount => _recentErrors.Count;
+
+    // Injected at document creation: forwards JS errors and console.error to the host,
+    // so page problems show in the chrome instead of hiding in the console.
+    private const string ErrorReporterScript = """
+        (function () {
+            function post(m) {
+                try { if (window.chrome && window.chrome.webview)
+                    window.chrome.webview.postMessage("GERGUR_ERR:" + String(m).slice(0, 300)); } catch (e) {}
+            }
+            window.addEventListener("error", function (e) {
+                post((e.message || "Script error") + (e.filename ? " @ " + e.filename : "")); }, true);
+            window.addEventListener("unhandledrejection", function (e) {
+                post("Unhandled promise rejection: " + ((e.reason && e.reason.message) || e.reason || "")); });
+            var oe = console.error;
+            console.error = function () {
+                post(Array.prototype.slice.call(arguments).map(String).join(" "));
+                return oe.apply(this, arguments);
+            };
+        })();
+        """;
+
     /// <summary>Raised when title/favicon/url/state changed - the strip repaints off this.</summary>
     public event EventHandler? Updated;
     /// <summary>Raised on successful navigation; used for the history log.</summary>
@@ -86,14 +111,17 @@ public sealed class Tab : ITabHandle, IDisposable
         core.SourceChanged += OnSourceChanged;
         core.HistoryChanged += OnHistoryChanged;
         core.FaviconChanged += OnFaviconChanged;
+        core.NavigationStarting += OnNavigationStarting;
         core.NavigationCompleted += OnNavigationCompleted;
         core.NewWindowRequested += OnNewWindowRequested;
         core.ProcessFailed += OnProcessFailed;
+        core.WebMessageReceived += OnWebMessageReceived;
         webView.KeyDown += OnWebViewKeyDown;
 
         _owner.Blocker.Attach(core);
         if (_owner.Env.Settings.PageAdCleanup && Blocking.PageCleanup.Script is { } script)
             await core.AddScriptToExecuteOnDocumentCreatedAsync(script);
+        await core.AddScriptToExecuteOnDocumentCreatedAsync(ErrorReporterScript);
 
         State = TabState.Hidden;
         if (navigateToStoredUrl && Url is not ("" or "about:blank"))
@@ -272,10 +300,49 @@ public sealed class Tab : ITabHandle, IDisposable
         }
     }
 
+    private void OnNavigationStarting(object? sender, CoreWebView2NavigationStartingEventArgs e)
+    {
+        if (e.IsUserInitiated || !e.IsRedirected)
+            _recentErrors.Clear(); // fresh page, fresh slate for the error indicator
+    }
+
     private void OnNavigationCompleted(object? sender, CoreWebView2NavigationCompletedEventArgs e)
     {
         if (e.IsSuccess)
+        {
             PageLoaded?.Invoke(this, EventArgs.Empty);
+        }
+        else if (e.WebErrorStatus is not (CoreWebView2WebErrorStatus.OperationCanceled
+                 or CoreWebView2WebErrorStatus.ValidAuthenticationCredentialsRequired))
+        {
+            AddError($"Page failed to load: {e.WebErrorStatus}");
+        }
+        RaiseUpdated();
+    }
+
+    private void OnWebMessageReceived(object? sender, CoreWebView2WebMessageReceivedEventArgs e)
+    {
+        try
+        {
+            var message = e.TryGetWebMessageAsString();
+            if (message is not null && message.StartsWith("GERGUR_ERR:", StringComparison.Ordinal))
+                AddError(message["GERGUR_ERR:".Length..]);
+        }
+        catch
+        {
+            // Non-string web messages from the page: ignore.
+        }
+    }
+
+    private void AddError(string message)
+    {
+        if (string.IsNullOrWhiteSpace(message))
+            return;
+        if (_recentErrors.Count > 0 && _recentErrors[^1] == message)
+            return; // collapse immediate repeats
+        _recentErrors.Add(message);
+        if (_recentErrors.Count > 20)
+            _recentErrors.RemoveAt(0);
         RaiseUpdated();
     }
 

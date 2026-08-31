@@ -40,6 +40,7 @@ public sealed class MainForm : Form
     private Panel _hostPanel = null!;
     private StatusStrip _statusStrip = null!;
     private ToolStripStatusLabel _messageLabel = null!;
+    private ToolStripStatusLabel _errorLabel = null!;
     private ToolStripStatusLabel _vpnLabel = null!;
     private ToolStripStatusLabel _memoryLabel = null!;
     private ToolStripStatusLabel _sleepLabel = null!;
@@ -78,10 +79,11 @@ public sealed class MainForm : Form
 
         _hostPanel = new Panel { Dock = DockStyle.Fill, BackColor = Theme.WindowBg };
 
-        _tabStrip = new TabStripControl { Dock = DockStyle.Top, Height = 36, Font = new Font("Segoe UI", 9f) };
+        _tabStrip = new TabStripControl { Dock = DockStyle.Top, Height = 46, Font = new Font("Segoe UI", 9.5f) };
         _tabStrip.TabClicked += async (_, tab) => { await ActivateTabAsync(tab); };
         _tabStrip.TabCloseClicked += async (_, tab) => { await CloseTabAsync(tab); };
         _tabStrip.NewTabClicked += (_, _) => _ = NewTabAsync();
+        _tabStrip.TabReordered += (_, move) => Tabs?.MoveTab(move.From, move.To);
 
         _toolbar = new Panel { Dock = DockStyle.Top, Height = 40, BackColor = Theme.ToolbarBg };
         _backButton = MakeToolButton(Glyphs.Back, 8);
@@ -123,11 +125,19 @@ public sealed class MainForm : Form
             SizingGrip = false,
         };
         _messageLabel = new ToolStripStatusLabel { Spring = true, TextAlign = ContentAlignment.MiddleLeft, ForeColor = Theme.TextDim };
+        _errorLabel = new ToolStripStatusLabel
+        {
+            ForeColor = Theme.CloseHover,
+            IsLink = true,
+            LinkColor = Theme.CloseHover,
+            ToolTipText = "Click to open DevTools",
+        };
+        _errorLabel.Click += (_, _) => Tabs?.ActiveTab?.OpenDevTools();
         _vpnLabel = new ToolStripStatusLabel { ForeColor = Theme.Accent };
         _memoryLabel = new ToolStripStatusLabel { ForeColor = Theme.TextDim };
         _sleepLabel = new ToolStripStatusLabel { ForeColor = Theme.TextDim };
         _blockedLabel = new ToolStripStatusLabel { ForeColor = Theme.TextDim };
-        _statusStrip.Items.AddRange([_messageLabel, _vpnLabel, _sleepLabel, _blockedLabel, _memoryLabel]);
+        _statusStrip.Items.AddRange([_messageLabel, _errorLabel, _vpnLabel, _sleepLabel, _blockedLabel, _memoryLabel]);
 
         Controls.Add(_hostPanel);
         Controls.Add(_statusStrip);
@@ -429,6 +439,11 @@ public sealed class MainForm : Form
         _bookmarkButton.Glyph = bookmarked ? Glyphs.StarFilled : Glyphs.StarOutline;
         _bookmarkButton.GlyphColor = bookmarked ? Theme.Accent : Theme.Text;
         Text = active is null || string.IsNullOrWhiteSpace(active.Title) ? "Gergur" : $"{active.Title} - Gergur";
+
+        int errors = active?.ErrorCount ?? 0;
+        _errorLabel.Text = errors == 0 ? "" : $"⚠ {errors} issue{(errors == 1 ? "" : "s")}";
+        _errorLabel.ToolTipText = errors == 0 ? "" : string.Join("\n", active!.RecentErrors.TakeLast(6)) + "\n\nClick to open DevTools";
+
         UpdateSleepLabel();
     }
 

@@ -21,9 +21,18 @@ public sealed class TabStripControl : Control
     private bool _hoverClose;
     private bool _hoverNewTab;
 
+    // Drag-to-reorder state.
+    private int _pressIndex = -1;     // tab the left button went down on
+    private int _pressX;              // where it went down (to detect drag threshold)
+    private bool _dragging;
+    private int _dragX;               // current cursor x while dragging
+    private int _dropIndex = -1;      // where the dragged tab would land
+
     public event EventHandler<Tab>? TabClicked;
     public event EventHandler<Tab>? TabCloseClicked;
     public event EventHandler? NewTabClicked;
+    /// <summary>Raised when a tab is dragged to a new position (fromIndex, toIndex).</summary>
+    public event EventHandler<(int From, int To)>? TabReordered;
 
     public TabStripControl()
     {
@@ -73,6 +82,15 @@ public sealed class TabStripControl : Control
 
         _newTabRect = new Rectangle(x + S(2), y + (tabHeight - newTabSize) / 2, newTabSize, newTabSize);
         DrawNewTabButton(g);
+
+        // Drop indicator: a vertical accent bar at the insertion point while dragging.
+        if (_dragging && _dropIndex >= 0 && _dropIndex < _tabRects.Count)
+        {
+            var target = _tabRects[_dropIndex];
+            int barX = _dropIndex <= _pressIndex ? target.Left - S(3) : target.Right + S(1);
+            using var pen = new Pen(Theme.Accent, S(3));
+            g.DrawLine(pen, barX, y, barX, y + tabHeight);
+        }
     }
 
     private void DrawTab(Graphics g, Tab tab, Rectangle rect, int index)
@@ -182,6 +200,22 @@ public sealed class TabStripControl : Control
     protected override void OnMouseMove(MouseEventArgs e)
     {
         base.OnMouseMove(e);
+
+        // Drag-to-reorder: once the press has moved past a small threshold, track it.
+        if (e.Button == MouseButtons.Left && _pressIndex >= 0)
+        {
+            if (!_dragging && Math.Abs(e.X - _pressX) > S(6))
+                _dragging = true;
+            if (_dragging)
+            {
+                _dragX = e.X;
+                _dropIndex = DropIndexFor(e.X);
+                Cursor = Cursors.SizeAll;
+                Invalidate();
+                return;
+            }
+        }
+
         int newHover = HitTestTab(e.Location);
         bool newHoverClose = newHover >= 0 && newHover < _closeRects.Count && _closeRects[newHover].Contains(e.Location);
         bool newHoverNewTab = _newTabRect.Contains(e.Location);
@@ -224,14 +258,54 @@ public sealed class TabStripControl : Control
         if (e.Button == MouseButtons.Middle)
         {
             TabCloseClicked?.Invoke(this, tab);
+            return;
         }
-        else if (e.Button == MouseButtons.Left)
+        if (e.Button == MouseButtons.Left)
         {
+            // Close button wins immediately; otherwise arm a possible drag and
+            // decide click-vs-drag on mouse up.
             if (index < _closeRects.Count && _closeRects[index].Contains(e.Location))
+            {
                 TabCloseClicked?.Invoke(this, tab);
-            else
-                TabClicked?.Invoke(this, tab);
+                return;
+            }
+            _pressIndex = index;
+            _pressX = e.X;
         }
+    }
+
+    protected override void OnMouseUp(MouseEventArgs e)
+    {
+        base.OnMouseUp(e);
+        var tabs = _tabs?.Tabs;
+        try
+        {
+            if (e.Button != MouseButtons.Left || tabs is null || _pressIndex < 0)
+                return;
+
+            if (_dragging && _dropIndex >= 0 && _dropIndex != _pressIndex)
+                TabReordered?.Invoke(this, (_pressIndex, _dropIndex));
+            else if (_pressIndex < tabs.Count)
+                TabClicked?.Invoke(this, tabs[_pressIndex]); // it was a plain click
+        }
+        finally
+        {
+            _pressIndex = -1;
+            _dragging = false;
+            _dropIndex = -1;
+            Invalidate();
+        }
+    }
+
+    private int DropIndexFor(int x)
+    {
+        // Land before the first tab whose horizontal center is past the cursor.
+        for (int i = 0; i < _tabRects.Count; i++)
+        {
+            if (x < _tabRects[i].Left + _tabRects[i].Width / 2)
+                return i;
+        }
+        return _tabRects.Count - 1;
     }
 
     private int HitTestTab(Point location)

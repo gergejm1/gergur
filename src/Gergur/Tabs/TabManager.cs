@@ -107,6 +107,17 @@ public sealed class TabManager
             RaiseChanged();
     }
 
+    /// <summary>Reorders a tab (drag-to-reorder). Keeps the same tab active.</summary>
+    public void MoveTab(int from, int to)
+    {
+        if (from < 0 || from >= _tabs.Count || to < 0 || to >= _tabs.Count || from == to)
+            return;
+        var tab = _tabs[from];
+        _tabs.RemoveAt(from);
+        _tabs.Insert(to, tab);
+        RaiseChanged();
+    }
+
     public async Task ActivateNextAsync(int direction)
     {
         if (_tabs.Count < 2 || ActiveTab is null)

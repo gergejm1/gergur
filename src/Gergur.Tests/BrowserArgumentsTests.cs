@@ -11,7 +11,8 @@ public sealed class BrowserArgumentsTests
         var args = BrowserEnvironment.BuildBrowserArguments(new Settings());
         Assert.Contains("--process-per-site", args);
         Assert.Contains("--enable-features=msWebView2SimulateMemoryPressureWhenInactive", args);
-        Assert.Contains("--disable-features=SpareRendererForSitePerProcess", args);
+        Assert.Contains("SpareRendererForSitePerProcess", args);
+        Assert.Contains("FedCm", args); // so Google Sign-In falls back to the popup flow
         Assert.DoesNotContain("--disable-site-isolation-trials", args);
     }
 
@@ -59,6 +60,7 @@ public sealed class BrowserArgumentsTests
             ProcessPerSite = false,
             DisableSpareRenderer = false,
             InactiveMemoryPressure = false,
+            DisableFedCm = false,
         };
         var args = BrowserEnvironment.BuildBrowserArguments(settings);
         Assert.Equal("", args);

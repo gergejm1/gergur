@@ -43,6 +43,8 @@ public sealed class BrowserEnvironment
             flags.Add("--disable-site-isolation-trials");
         if (settings.DisableSpareRenderer)
             disableFeatures.Add("SpareRendererForSitePerProcess");
+        if (settings.DisableFedCm)
+            disableFeatures.Add("FedCm");
         if (settings.InactiveMemoryPressure)
             enableFeatures.Add("msWebView2SimulateMemoryPressureWhenInactive");
         if (settings.V8ScavengerMaxMb > 0)
