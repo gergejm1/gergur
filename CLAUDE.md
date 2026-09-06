@@ -81,6 +81,19 @@ personal: read what the task requires, nothing more.
   without CORS headers reports opaquely (no message, file, or line) and is labelled
   as such rather than shown as a bare "Script error".
 - The user never wants em dashes anywhere: code, UI text, docs, commits.
+- The phone drop (`DropServer`, port 24003) is the only listener beyond loopback, so
+  treat everything it reads as hostile. Its pairing key is read from the raw query,
+  not the parsed one: the iOS share sheet appends the shared item to the end of the
+  url as it is, so a shared link brings its own `&` and its own parameters, and a
+  last-wins parse lets a link decide who is paired. Same reason `SharedValue` reads
+  to the end of the query rather than splitting it.
+- `/share?k=&text=` is the share-sheet endpoint and `/setup?k=` explains how to build
+  the Shortcut. `/share` is a GET that changes state, which is deliberate: an iOS
+  Shortcut is one action for a GET, there is no ambient authority to forge, and the
+  key is the only credential.
+- The drop deletes files it thinks are unreferenced when it opens, so anything that
+  makes `Load` drop an entry can cost the user a photo. It stands down unless the
+  index parsed and every entry in it survived.
 
 Agent actions are visualized: /click and /type animate a blue cursor to the
 target, ripple, and flash the element, so the user can watch the agent work.

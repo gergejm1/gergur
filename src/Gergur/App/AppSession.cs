@@ -71,6 +71,13 @@ public sealed class AppSession
     }
 
     /// <summary>
+    /// Why the bridge is not running, or null when it is. Kept so the window can say what
+    /// went wrong: "Phone drop is not running" on its own sends you looking through
+    /// settings for a problem that is one port already in use.
+    /// </summary>
+    public string? PhoneBridgeError { get; private set; }
+
+    /// <summary>
     /// Brings up the phone bridge when it is switched on. Separate from StartAgent
     /// because this one listens beyond loopback: it stays off unless asked for.
     /// </summary>
@@ -82,10 +89,14 @@ public sealed class AppSession
         {
             PhoneBridge = new DropServer(Drop, Settings);
             PhoneBridge.Start();
+            PhoneBridgeError = null;
         }
         catch (Exception ex)
         {
             PhoneBridge = null;
+            PhoneBridgeError = ex is System.Net.Sockets.SocketException
+                ? $"Port {Settings.DropPort} is already in use. Change it in Settings."
+                : ex.Message;
             Diagnostics.DebugLog.WriteAlways($"phone bridge did not start: {ex.Message}");
         }
     }
@@ -94,6 +105,9 @@ public sealed class AppSession
     {
         PhoneBridge?.Stop();
         PhoneBridge = null;
+        // Cleared with it: otherwise turning the drop off leaves the last failure on
+        // record, and the window reports a port conflict that no longer exists.
+        PhoneBridgeError = null;
     }
 
     public void AddWindow(MainForm window) => _windows.Add(window);

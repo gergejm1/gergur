@@ -143,7 +143,10 @@ public sealed class Settings
         nameof(InactiveMemoryPressure), nameof(DisableFedCm), nameof(V8ScavengerMaxMb),
         nameof(ExtraBrowserArguments), nameof(VpnEnabled), nameof(VpnLocalPort),
         nameof(VpnBypassHosts), nameof(AgentServerEnabled), nameof(AgentServerPort),
-        nameof(DropEnabled), nameof(DropPort),
+        // DropPort only. The phone drop itself is turned on and off from the menu, which
+        // starts and stops the listener there and then, so listing it here would tell you
+        // to restart for something that already took effect.
+        nameof(DropPort),
     };
 
     private static readonly JsonSerializerOptions JsonOptions = new()

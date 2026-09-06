@@ -52,7 +52,55 @@ public sealed class DropStore
     {
         _root = root ?? Path.Combine(Settings.DataDir, "drop");
         Directory.CreateDirectory(FilesDir);
-        _items = Load();
+        _items = Load(out bool indexIntact);
+        if (indexIntact)
+            SweepOrphans();
+    }
+
+    /// <summary>
+    /// Deletes files under the drop that no entry refers to, and any half-written index
+    /// left by an interrupted save.
+    ///
+    /// Entries go away without their files in more than one way: an index that failed to
+    /// write, a save interrupted between the two, or an entry this build's stricter load
+    /// filter now drops. Those files are photos and documents from the phone sitting on
+    /// disk with nothing pointing at them and no way to reach them from either surface.
+    ///
+    /// Only from the constructor, before anything else can hold this store, so it cannot
+    /// race an upload writing into the same directory, and only when the index was really
+    /// read. An index that would not parse also produces an empty list, and sweeping on
+    /// that would delete every file the drop holds on the one occasion they cannot be
+    /// listed: the corruption case this store already goes out of its way to survive.
+    /// </summary>
+    private void SweepOrphans()
+    {
+        try
+        {
+            var referenced = _items
+                .Where(i => i.StoredName.Length > 0)
+                .Select(i => i.StoredName)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+            foreach (string path in Directory.EnumerateFiles(FilesDir))
+            {
+                if (!referenced.Contains(Path.GetFileName(path)))
+                    File.Delete(path);
+            }
+
+            // A staging file older than the index is left over from a save that finished;
+            // a newer one is a save that wrote it and did not get to the move, which makes
+            // it the more recent of the two indexes and not something to throw away.
+            string staging = IndexPath + ".tmp";
+            if (File.Exists(staging)
+                && File.GetLastWriteTimeUtc(staging) <= File.GetLastWriteTimeUtc(IndexPath))
+            {
+                File.Delete(staging);
+            }
+        }
+        catch
+        {
+            // Housekeeping. Never worth failing to open the drop over.
+        }
     }
 
     public string FilesDir => Path.Combine(_root, "files");
@@ -217,28 +265,60 @@ public sealed class DropStore
 
     /// <summary>
     /// Characters that make a name read as something it is not. A right-to-left override
-    /// turns "holiday‮fdp.exe" into "holidayexe.pdf" on screen, so the user sees a
-    /// document and launches an executable. Control characters hide text the same way.
+    /// (U+202E) turns "holiday\u202Efdp.exe" into "holidayexe.pdf" on screen, so the user
+    /// sees a document and launches an executable. Control characters hide text the same
+    /// way.
+    ///
+    /// Written as escapes rather than as the characters themselves. This is the file that
+    /// defends against that trick, and putting the raw overrides in the source means the
+    /// next person to review it reads whatever their editor chooses to render.
     /// </summary>
     private static bool IsDeceptive(char c)
         => char.IsControl(c)
-        || c is >= '‪' and <= '‮'  // bidi embeddings and overrides
-        || c is >= '⁦' and <= '⁩'  // bidi isolates
-        || c is '‎' or '‏';        // left/right to left marks
+        || c is >= '\u202A' and <= '\u202E'  // bidi embeddings and overrides
+        || c is >= '\u2066' and <= '\u2069'  // bidi isolates
+        || c is '\u200E' or '\u200F';        // left and right to left marks
 
     /// <summary>
-    /// The extension a stored file is allowed to carry. An executable one becomes ".bin",
-    /// so a double-click in Explorer cannot run it either.
+    /// The extension a stored file is allowed to carry on disk. Anything not on the list
+    /// becomes ".bin", so a double-click in Explorer opens nothing that runs.
     ///
-    /// Refusing only at the click in our own window left the deny list load-bearing: miss
-    /// one extension and the file is still sitting there, runnable. Renaming at the point
-    /// the bytes land makes an incomplete list harmless instead.
+    /// This was a deny list, and the comment claimed that renaming made an incomplete
+    /// list harmless. It did not: the rename consulted the same list, so a type missing
+    /// from it was still stored runnable, and .msix, .appx, .wsc, .sct and .mst all were.
+    /// A deny list of what Windows will execute cannot be finished by hand. An allow list
+    /// can, because what this feature actually moves between two of your own devices is
+    /// pictures, video, documents and archives.
+    ///
+    /// The cost is that an unusual but harmless type is stored as .bin and will not open
+    /// on a double-click. The name you sent is kept for display and for the download back
+    /// to the phone, so nothing is lost but the association.
     /// </summary>
     internal static string StorableExtension(string originalName)
     {
         string extension = SafeExtension(originalName);
-        return extension.Length > 0 && IsExecutable(extension) ? ".bin" : extension;
+        return extension.Length > 0 && Storable.Contains(extension) ? extension : ".bin";
     }
+
+    /// <summary>
+    /// Extensions kept as they are on disk. Nothing here is executed by Explorer on a
+    /// double-click, which is the whole test for being on this list.
+    /// </summary>
+    private static readonly HashSet<string> Storable = new(StringComparer.OrdinalIgnoreCase)
+    {
+        // pictures
+        ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".heic", ".heif", ".tif", ".tiff",
+        ".avif", ".ico", ".psd", ".raw", ".dng",
+        // video and audio
+        ".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm", ".mpg", ".mpeg", ".3gp",
+        ".mp3", ".m4a", ".aac", ".wav", ".flac", ".ogg", ".opus", ".aiff", ".caf",
+        // documents
+        ".pdf", ".txt", ".md", ".rtf", ".csv", ".tsv", ".log", ".json", ".xml", ".yaml", ".yml",
+        ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".odt", ".ods", ".odp",
+        ".pages", ".numbers", ".key", ".epub", ".mobi", ".ics", ".vcf",
+        // archives and data
+        ".zip", ".7z", ".rar", ".gz", ".tar", ".bz2", ".xz", ".bin", ".dat",
+    };
 
     /// <summary>
     /// Extensions Windows will execute. This feature moves files between your devices;
@@ -300,8 +380,16 @@ public sealed class DropStore
 
     private static string NewId() => Guid.NewGuid().ToString("N")[..16];
 
-    private List<DropItem> Load()
+    /// <param name="indexIntact">
+    /// Whether the index was read and every entry in it survived. False means the list in
+    /// memory is not a complete account of what the drop holds, so it cannot be used to
+    /// decide that a file on disk is unreferenced. Anything else risks deleting the user's
+    /// photos on the one launch where they could not be listed: an unreadable file, or a
+    /// future build's index read by this one, where a renamed field nulls every entry.
+    /// </param>
+    private List<DropItem> Load(out bool indexIntact)
     {
+        indexIntact = false;
         try
         {
             if (!File.Exists(IndexPath))
@@ -312,11 +400,21 @@ public sealed class DropStore
 
             // Locking the list closed one source of nulls; this is the other. A hand
             // edited or truncated index can deserialize entries that are null, or whose
-            // Text is, and those throw on the UI thread when the window renders them,
+            // strings are, and those throw on the UI thread when the window renders them,
             // which is the crash the lock was meant to end.
-            return loaded
-                .Where(i => i is not null && i.Id is not null && i.Text is not null && i.Kind is not null)
-                .ToList();
+            //
+            // Every string is checked, not the three that were obviously used: an entry
+            // with a null StoredName passed the old filter and then threw inside PathFor,
+            // reached from opening a file in the drop window, which takes the browser
+            // down with every tab. Listing fields by hand is what left the gap, so this
+            // asks the record for all of them.
+            var kept = loaded.Where(IsUsable).ToList();
+
+            // Only a list that lost nothing can say what is unreferenced. Every entry
+            // dropped here is one whose file is still on disk and would otherwise be
+            // swept, and the reason it was dropped is that we could not read it properly.
+            indexIntact = kept.Count == loaded.Count;
+            return kept;
         }
         catch
         {
@@ -324,6 +422,16 @@ public sealed class DropStore
         }
         return [];
     }
+
+    /// <summary>
+    /// Whether an entry read back from the index can be used without throwing. Nothing on
+    /// <see cref="DropItem"/> is nullable, so anything null here came from a file that was
+    /// edited or truncated outside the browser.
+    /// </summary>
+    internal static bool IsUsable(DropItem? item)
+        => item is not null
+        && item.Id is not null && item.Kind is not null && item.Text is not null
+        && item.StoredName is not null && item.From is not null;
 
     /// <summary>Serializes the index. Callers must already hold <see cref="_gate"/>.</summary>
     private void SaveLocked()

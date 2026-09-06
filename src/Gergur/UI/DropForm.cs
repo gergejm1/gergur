@@ -169,7 +169,13 @@ public sealed class DropForm : Form
 
     private void Reload()
     {
-        int selected = _list.SelectedIndices.Count > 0 ? _list.SelectedIndices[0] : -1;
+        // Remember what was selected, not where it was. The list is newest first and the
+        // phone can add a row at any moment, so restoring by position quietly moves the
+        // selection onto a different item, which is then what Open or Delete acts on.
+        string? selected = _list.SelectedItems.Count > 0
+            && _list.SelectedItems[0].Tag is DropItem chosen
+            ? chosen.Id
+            : null;
         _list.BeginUpdate();
         try
         {
@@ -190,8 +196,19 @@ public sealed class DropForm : Form
         {
             _list.EndUpdate();
         }
-        if (selected >= 0 && selected < _list.Items.Count)
-            _list.Items[selected].Selected = true;
+        if (selected is not null)
+        {
+            foreach (ListViewItem row in _list.Items)
+            {
+                if (row.Tag is DropItem item && item.Id == selected)
+                {
+                    row.Selected = true;
+                    row.Focused = true;
+                    row.EnsureVisible();
+                    break;
+                }
+            }
+        }
 
         _count.Text = _drop.Items.Count == 0
             ? "Nothing here yet."

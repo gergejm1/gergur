@@ -1136,7 +1136,9 @@ public sealed class MainForm : Form
     {
         if (_session?.PhoneBridge?.PairingUrl is not { } url)
         {
-            ShowMessage("Phone drop is not running.");
+            ShowMessage(_session?.PhoneBridgeError is { } why
+                ? $"Phone drop is not running. {why}"
+                : "Phone drop is not running.");
             return;
         }
         using var pairing = new PairingForm(url);
