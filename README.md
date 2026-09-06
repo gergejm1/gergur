@@ -142,7 +142,10 @@ dotnet test                              # unit tests (policy engine, blocklist,
 
 Everything lives in `%LOCALAPPDATA%\Gergur`: `settings.json` (suspend/discard
 timers, search engine, browser flags), `blocklist.txt`, `bookmarks.json`,
-`history.jsonl`, `session.json`, and the WebView2 profile. The ≡ menu has
+`history.jsonl`, `session.json`, and the WebView2 profile. Also `agent-token.txt`,
+which since the MCP work is a long-lived credential rather than a per-launch one: it
+grants scripted access to every session this browser is logged into, so treat it as a
+password and never commit a client config containing it. The ≡ menu has
 "Sleep background tabs now", History, the browser task manager, and a memory-CSV
 dump for A/B-testing flags. Set `GERGUR_DEBUG=1` for a trace log.
 

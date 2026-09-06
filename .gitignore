@@ -4,3 +4,6 @@ obj/
 *.user
 *.suo
 TestResults/
+
+# Review marker written by the stop-gate hook; local state, not project content.
+.claude/.last-review

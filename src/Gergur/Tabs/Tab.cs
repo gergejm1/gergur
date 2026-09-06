@@ -498,12 +498,94 @@ public sealed class Tab : ITabHandle, IDisposable
         {
             PageLoaded?.Invoke(this, EventArgs.Empty);
         }
+        else if (IsFinishedOAuthCallback(Url, e.WebErrorStatus))
+        {
+            ShowSignInComplete();
+        }
         else if (e.WebErrorStatus is not (CoreWebView2WebErrorStatus.OperationCanceled
                  or CoreWebView2WebErrorStatus.ValidAuthenticationCredentialsRequired))
         {
             AddError($"Page failed to load: {e.WebErrorStatus}");
         }
         RaiseUpdated();
+    }
+
+    /// <summary>
+    /// A sign-in that already succeeded, not a failure. Tools like "gh auth login" run a
+    /// one-shot listener on a loopback port, take the code the provider redirects back
+    /// with, and shut down immediately. The browser's follow-up request then finds
+    /// nothing, which surfaces as ConnectionReset on a blank page and reads like the
+    /// login broke when it did not.
+    /// </summary>
+    internal static bool IsFinishedOAuthCallback(string url, CoreWebView2WebErrorStatus status)
+    {
+        if (status is not (CoreWebView2WebErrorStatus.ConnectionReset
+            or CoreWebView2WebErrorStatus.ConnectionAborted
+            or CoreWebView2WebErrorStatus.CannotConnect
+            or CoreWebView2WebErrorStatus.ServerUnreachable))
+            return false;
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri) || !uri.IsLoopback)
+            return false;
+        return HasAuthorizationResult(uri.Query);
+    }
+
+    /// <summary>
+    /// True only for a query carrying an actual authorization result: an exact "code" or
+    /// "access_token" parameter with a value, and no "error".
+    ///
+    /// Substring matching was wrong and dangerous. A denial redirect carries
+    /// "error=access_denied&amp;error_code=200051", and "error_code=" contains "code=", so a
+    /// refused sign-in rendered as "Sign-in complete" and hid the real failure.
+    /// </summary>
+    internal static bool HasAuthorizationResult(string query)
+    {
+        bool found = false;
+        foreach (var pair in query.TrimStart('?').Split('&', StringSplitOptions.RemoveEmptyEntries))
+        {
+            int equals = pair.IndexOf('=');
+            string key = Uri.UnescapeDataString(equals < 0 ? pair : pair[..equals]);
+            string value = equals < 0 ? "" : pair[(equals + 1)..];
+
+            // An explicit error wins outright, wherever it appears in the query.
+            if (key.Equals("error", StringComparison.OrdinalIgnoreCase))
+                return false;
+            if (value.Length > 0
+                && (key.Equals("code", StringComparison.OrdinalIgnoreCase)
+                    || key.Equals("access_token", StringComparison.OrdinalIgnoreCase)))
+                found = true;
+        }
+        return found;
+    }
+
+    private const string SignInCompleteHtml = """
+        <!doctype html>
+        <html><head><meta charset="utf-8"><title>Sign-in complete</title>
+        <style>
+          html,body{margin:0;height:100%;background:#05040a;color:#e8eef8;
+            font:400 16px/1.6 "Segoe UI",system-ui,sans-serif}
+          body{display:grid;place-items:center;text-align:center}
+          .card{max-width:30rem;padding:2rem}
+          .tick{width:64px;height:64px;border-radius:50%;background:#3d7bfa;margin:0 auto 1.5rem;
+            display:grid;place-items:center;font-size:32px;color:#fff}
+          h1{font-size:1.5rem;margin:0 0 .5rem;font-weight:600}
+          p{margin:0;color:#8894ac}
+        </style></head>
+        <body><div class="card">
+          <div class="tick">&#10003;</div>
+          <h1>Sign-in complete</h1>
+          <p>The app that asked for this has your authorization. You can close this tab.</p>
+        </div></body></html>
+        """;
+
+    private void ShowSignInComplete()
+    {
+        // Navigating from inside NavigationCompleted is asking for re-entrancy, so hop
+        // to the message loop first.
+        _webView?.BeginInvoke(() =>
+        {
+            try { Core?.NavigateToString(SignInCompleteHtml); }
+            catch { /* The tab is going away; a nicer page is not worth a crash. */ }
+        });
     }
 
     private void OnWebMessageReceived(object? sender, CoreWebView2WebMessageReceivedEventArgs e)

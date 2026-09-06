@@ -8,7 +8,21 @@ and let its engine processes exit before relaunching or new engine flags no-op.
 ## Driving the browser (agent API)
 
 When Gergur is running it serves a token-protected API on `http://127.0.0.1:24002`.
-The token is in `%LOCALAPPDATA%\Gergur\agent-token.txt` (regenerated every launch).
+The token is in `%LOCALAPPDATA%\Gergur\agent-token.txt`. It is a stable per-install
+secret, not rotated per launch, because MCP client config carries it in a static
+header. Only a token of the exact shape Gergur mints (48 hex characters) in a file
+owned by the current user is ever adopted, and the file is ACL'd to that user.
+
+Those checks stop a **different account** on the machine, and nothing more. Any
+process running as you can read that file, by design, since you have to read it
+yourself to configure a client; it can equally create the file first with a 48-hex
+value of its own choosing and have that adopted. Rotating the token per launch used
+to bound a stolen one to a single browser session, and persisting it gives that up
+with nothing in its place. Against code already running as you, treat this API as
+fully exposed.
+
+**Never commit a `.mcp.json` or any config containing the token:** it grants
+arbitrary JavaScript in every logged-in session this browser holds.
 Send it as the `X-Gergur-Token` header. PowerShell:
 
 ```powershell
@@ -30,6 +44,20 @@ Invoke-RestMethod "http://127.0.0.1:24002/tabs" -Headers $H
 | POST /eval | {"js": "...", "index": n?} | run JS, returns {"result": ...} |
 | POST /click | {"selector": "...", "index": n?} | querySelector + click |
 | POST /type | {"selector": "...", "text": "...", "index": n?} | fill input (React-safe) |
+| POST /mcp | JSON-RPC 2.0 | the same surface as MCP tools; see below |
+
+`/mcp` speaks Model Context Protocol over JSON-RPC (`initialize`, `ping`, `tools/list`,
+`tools/call`), so any Claude Code session can drive the browser as native tools rather
+than through a subagent. Register it once at user scope:
+
+```
+claude mcp add --transport http gergur http://127.0.0.1:24002/mcp \
+  --header "X-Gergur-Token: <token>" --scope user
+```
+
+Each tool maps onto an endpoint above, so there is one implementation of every action.
+An `index` that is supplied but unusable is an error, never a silent fall back to the
+tab the user is looking at.
 
 Tabs can be dragged out into their own windows, so `index` is a flat position
 across every window in window order: tearing a tab off renumbers what follows it.

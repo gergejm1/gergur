@@ -1,8 +1,11 @@
 using System.Net;
 using System.Net.Sockets;
+using System.Security.AccessControl;
 using System.Security.Cryptography;
+using System.Security.Principal;
 using System.Text;
 using System.Text.Json;
+using Gergur.Diagnostics;
 using Gergur.Tabs;
 using Gergur.UI;
 
@@ -38,10 +41,27 @@ public sealed class AgentServer
     /// space the API exposes, so tearing a tab off renumbers what follows it.
     /// </summary>
     private List<(MainForm Window, Tab Tab)> AllTabs()
-        => _session.Windows
-            .Where(w => w.Tabs is not null)
-            .SelectMany(w => w.Tabs!.Tabs.Select(t => (Window: w, Tab: t)))
-            .ToList();
+    {
+        // These lists belong to the UI thread and this runs on a request thread, so a
+        // tab opening or being torn off mid-enumeration throws "Collection was modified"
+        // and would surface as an opaque 500. Retrying rides out that momentary race.
+        // The complete fix is to resolve the target inside OnUiAsync; this bounds the
+        // damage without restructuring every endpoint.
+        for (int attempt = 0; ; attempt++)
+        {
+            try
+            {
+                return _session.Windows
+                    .Where(w => w.Tabs is not null)
+                    .SelectMany(w => w.Tabs!.Tabs.Select(t => (Window: w, Tab: t)))
+                    .ToList();
+            }
+            catch (InvalidOperationException) when (attempt < 3)
+            {
+                // The window list changed underneath us; read it again.
+            }
+        }
+    }
 
     /// <summary>The active tab of the focused window, falling back to the first window.</summary>
     private (MainForm Window, Tab Tab)? ActiveEntry()
@@ -53,9 +73,7 @@ public sealed class AgentServer
 
     public void Start()
     {
-        _token = Convert.ToHexString(RandomNumberGenerator.GetBytes(24));
-        Directory.CreateDirectory(Settings.DataDir);
-        File.WriteAllText(TokenPath, _token);
+        _token = LoadOrCreateToken();
 
         _cts = new CancellationTokenSource();
         _listener = new TcpListener(IPAddress.Loopback, _port);
@@ -69,9 +87,123 @@ public sealed class AgentServer
         {
             _cts?.Cancel();
             _listener?.Stop();
-            File.Delete(TokenPath);
+            // The token file deliberately survives: see LoadOrCreateToken.
         }
         catch { }
+    }
+
+    /// <summary>
+    /// A stable per-install token, reused across launches so the browser can be used as
+    /// an MCP server: that configuration carries the token in a static header, and a
+    /// rotating secret would break on every restart.
+    ///
+    /// Be honest about the trade, because it is not free. Loopback binding and the Origin
+    /// check stop remote attackers and web pages. The token was the only control against
+    /// other processes running as this user, and rotation bounded a stolen one to a
+    /// single browser session. That bound is gone and nothing here replaces it: any
+    /// process running as this user can read this file, by design, since the MCP workflow
+    /// requires the user to read it too, and it could equally create the file itself with
+    /// a 48-hex value of its choosing and pass every check below.
+    ///
+    /// So the shape and ownership checks are not a fix for that. What they do is stop a
+    /// *different* account planting a token, and the ACL raises the bar against other
+    /// users on a shared machine. Against code already running as this user, treat the
+    /// agent API as fully exposed.
+    /// </summary>
+    internal static string LoadOrCreateToken(string? path = null)
+    {
+        string file = path ?? TokenPath;
+        Directory.CreateDirectory(Path.GetDirectoryName(file)!);
+
+        if (TryReadTrustedToken(file) is { } existing)
+        {
+            // A token written by an older build carries inherited permissions, so
+            // adopting one has to re-apply the lockdown or the guarantee is not true.
+            RestrictToCurrentUser(file);
+            return existing;
+        }
+
+        string token = Convert.ToHexString(RandomNumberGenerator.GetBytes(24)); // 48 hex chars
+        WriteTokenForCurrentUserOnly(file, token);
+        return token;
+    }
+
+    /// <summary>The stored token, but only if this code could have written it.</summary>
+    internal static string? TryReadTrustedToken(string? path = null)
+    {
+        string file = path ?? TokenPath;
+        try
+        {
+            if (!File.Exists(file))
+                return null;
+            string value = File.ReadAllText(file).Trim();
+            if (!IsMintedTokenShape(value))
+                return null;
+
+            // Fail closed. An owner we cannot establish is an owner we do not trust:
+            // treating "unknown" as "mine" would adopt exactly the planted file the
+            // check exists to reject.
+            var current = WindowsIdentity.GetCurrent().User;
+            var owner = new FileInfo(file).GetAccessControl().GetOwner(typeof(SecurityIdentifier));
+            if (current is null || owner is not SecurityIdentifier sid || !sid.Equals(current))
+                return null;
+            return value;
+        }
+        catch
+        {
+            return null; // Unreadable or un-inspectable: mint a fresh one rather than trust it.
+        }
+    }
+
+    /// <summary>Exactly what <see cref="LoadOrCreateToken"/> mints: 24 random bytes as hex.</summary>
+    internal static bool IsMintedTokenShape(string value)
+        => value.Length == 48 && value.All(Uri.IsHexDigit);
+
+    private static void WriteTokenForCurrentUserOnly(string file, string token)
+    {
+        // Delete before creating. Overwriting a file somebody else created leaves them
+        // as its owner, holding WRITE_DAC, so they would keep read access to the secret
+        // we just minted and every restart would quietly re-leak a fresh one.
+        try { File.Delete(file); } catch { }
+        using (var stream = new FileStream(file, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+        using (var writer = new StreamWriter(stream))
+        {
+            writer.Write(token);
+        }
+        RestrictToCurrentUser(file);
+    }
+
+    /// <summary>Strips inherited permissions so only the current user can read the token.</summary>
+    private static void RestrictToCurrentUser(string file)
+    {
+        try
+        {
+            var user = WindowsIdentity.GetCurrent().User;
+            if (user is null)
+                return;
+            var info = new FileInfo(file);
+            var security = info.GetAccessControl();
+            var rules = security.GetAccessRules(true, false, typeof(SecurityIdentifier));
+            // "Protected with one rule" is not enough: that single rule could grant
+            // Everyone. Only skip the rewrite when the lone rule is this user's.
+            if (security.AreAccessRulesProtected && rules.Count == 1
+                && rules.Cast<FileSystemAccessRule>().Single() is
+                   { AccessControlType: AccessControlType.Allow } only
+                && only.IdentityReference.Equals(user)
+                && only.FileSystemRights.HasFlag(FileSystemRights.FullControl))
+                return; // already locked down to us; nothing to do
+
+            security.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
+            foreach (FileSystemAccessRule rule in rules)
+                security.RemoveAccessRule(rule);
+            security.AddAccessRule(new FileSystemAccessRule(user, FileSystemRights.FullControl, AccessControlType.Allow));
+            info.SetAccessControl(security);
+        }
+        catch (Exception ex)
+        {
+            // Say so rather than silently leaving the token world-readable.
+            DebugLog.WriteAlways($"agent token ACL not applied to {file}: {ex.Message}");
+        }
     }
 
     private async Task AcceptLoopAsync(CancellationToken ct)
@@ -93,11 +225,20 @@ public sealed class AgentServer
         {
             var (method, path, query, headers, body) = await ReadRequestAsync(stream);
 
-            if (headers.ContainsKey("origin")
-                || !headers.TryGetValue("x-gergur-token", out var token)
-                || token != _token)
+            // Distinguish the two rejections. MCP clients vary in whether they attach an
+            // Origin header, and an identical 403 for both left no way to tell a
+            // misconfigured token from a client this server will never accept.
+            // Neither message tells an attacker anything it did not already send.
+            if (headers.ContainsKey("origin"))
             {
-                await WriteAsync(stream, 403, "application/json", """{"error":"forbidden"}"""u8.ToArray());
+                await WriteAsync(stream, 403, "application/json",
+                    """{"error":"requests carrying an Origin header are rejected; this API is not reachable from web content"}"""u8.ToArray());
+                return;
+            }
+            if (!headers.TryGetValue("x-gergur-token", out var token) || token != _token)
+            {
+                await WriteAsync(stream, 403, "application/json",
+                    """{"error":"bad or missing X-Gergur-Token header"}"""u8.ToArray());
                 return;
             }
 
@@ -120,19 +261,19 @@ public sealed class AgentServer
     private async Task<(int, string, byte[])> RouteAsync(
         string method, string path, Dictionary<string, string> query, JsonDocument? body)
     {
+        // An index that was supplied but cannot be used must never fall back to the
+        // active tab. An agent that believes it is acting on tab 3 would otherwise
+        // navigate away from, type into, or run script against whatever the user is
+        // looking at right now. Only an absent index means "the active tab".
         (MainForm Window, Tab Tab)? TargetEntry()
         {
-            int? index = null;
-            if (query.TryGetValue("index", out var q) && int.TryParse(q, out var qi))
-                index = qi;
-            else if (body is not null && body.RootElement.TryGetProperty("index", out var b) && b.ValueKind == JsonValueKind.Number)
-                index = b.GetInt32();
-            if (index is { } i)
-            {
-                var all = AllTabs();
-                return i >= 0 && i < all.Count ? all[i] : null;
-            }
-            return ActiveEntry();
+            var (supplied, index) = ResolveIndex(query, body);
+            if (!supplied)
+                return ActiveEntry();
+            if (index is not { } i)
+                return null; // supplied but unusable: that is an error, not the active tab
+            var all = AllTabs();
+            return i >= 0 && i < all.Count ? all[i] : null;
         }
 
         Tab? Target() => TargetEntry()?.Tab;
@@ -146,6 +287,9 @@ public sealed class AgentServer
 
         switch ((method, path))
         {
+            case ("POST", "/mcp"):
+                return await HandleMcpAsync(body);
+
             case ("GET", "/tabs"):
             {
                 var list = await OnUiAsync(() =>
@@ -177,6 +321,10 @@ public sealed class AgentServer
 
             case ("POST", "/activate"):
             {
+                // Documented as taking an index. Defaulting to the active tab would make
+                // "activate" a no-op and "close" destructive, so require it explicitly.
+                if (!ResolveIndex(query, body).Supplied)
+                    return (400, "application/json", Json(new { error = "index required" }));
                 if (TargetEntry() is not { } entry || entry.Window.Tabs is null)
                     return (404, "application/json", Json(new { error = "no such tab" }));
                 await OnUiAsync(async () =>
@@ -190,6 +338,9 @@ public sealed class AgentServer
 
             case ("POST", "/close"):
             {
+                // Closing is the one destructive action here; it must never guess.
+                if (!ResolveIndex(query, body).Supplied)
+                    return (400, "application/json", Json(new { error = "index required" }));
                 if (TargetEntry() is not { } entry || entry.Window.Tabs is null)
                     return (404, "application/json", Json(new { error = "no such tab" }));
                 await OnUiAsync(async () => { await entry.Window.Tabs.CloseTabAsync(entry.Tab); return true; });
@@ -314,6 +465,338 @@ public sealed class AgentServer
                 return (404, "application/json", Json(new { error = "unknown endpoint" }));
         }
     }
+
+    // ------------------------------------------------------------------ MCP
+
+    // Speaking MCP here rather than from a wrapper process means any Claude Code
+    // session, in any project, gets these as native tools once the server is
+    // registered - no per-project subagent, no second codebase to keep in step.
+    private const string McpProtocolVersion = "2024-11-05";
+
+    /// <summary>How long a single tool call may run before the connection is released.</summary>
+    private static readonly TimeSpan ToolTimeout = TimeSpan.FromSeconds(20);
+
+    /// <summary>Past this, a screenshot is more likely to be rejected than read.</summary>
+    private const int MaxScreenshotBytes = 5 * 1024 * 1024;
+
+    private static object Text(string description) => new { type = "string", description };
+    private static object Index() => new { type = "integer", description = "Tab index from gergur_list_tabs. Omit for the active tab of the focused window." };
+    /// <summary>For the tools where the index is required, so the schema and the prose agree.</summary>
+    private static object NamedIndex() => new { type = "integer", description = "Tab index from gergur_list_tabs." };
+
+    private static object Tool(string name, string description, object properties, string[] required)
+        => new { name, description, inputSchema = new { type = "object", properties, required } };
+
+    /// <summary>
+    /// Where a request says to act, split out so it can be tested directly.
+    ///
+    /// Supplied-but-unusable must never collapse into "the active tab": an agent that
+    /// believes it is closing tab 3 would otherwise close whatever the user is looking
+    /// at. An explicit JSON null counts as not supplied, because models routinely send
+    /// null for an argument they are choosing to omit.
+    /// </summary>
+    internal static (bool Supplied, int? Index) ResolveIndex(
+        IReadOnlyDictionary<string, string> query, JsonDocument? body)
+    {
+        if (query.TryGetValue("index", out var fromQuery))
+        {
+            if (fromQuery.Length == 0 || fromQuery == "null")
+                return (false, null);
+            return (true, int.TryParse(fromQuery, out int parsed) ? parsed : null);
+        }
+
+        if (body is { RootElement.ValueKind: JsonValueKind.Object }
+            && body.RootElement.TryGetProperty("index", out var fromBody))
+        {
+            // Models send an index as a number or as a string; accept both, nothing else.
+            return fromBody.ValueKind switch
+            {
+                JsonValueKind.Null => (false, null),
+                JsonValueKind.Number => (true, fromBody.TryGetInt32(out int number) ? number : null),
+                JsonValueKind.String => (true, int.TryParse(fromBody.GetString(), out int text) ? text : null),
+                _ => (true, null),
+            };
+        }
+        return (false, null);
+    }
+
+    /// <summary>
+    /// Arguments a tool cannot run without. The schema declares these, but a schema is
+    /// only a hint to the caller: nothing stops one being omitted, and for
+    /// gergur_close_tab that meant falling through to "the active tab" and closing the
+    /// page the user was reading.
+    /// </summary>
+    internal static string[] RequiredArgsForTool(string name) => name switch
+    {
+        "gergur_open_tab" => ["url"],
+        "gergur_navigate" => ["url"],
+        "gergur_activate_tab" => ["index"],
+        "gergur_close_tab" => ["index"],
+        "gergur_run_javascript" => ["js"],
+        "gergur_click" => ["selector"],
+        "gergur_type_text" => ["selector", "text"],
+        _ => [],
+    };
+
+    /// <summary>
+    /// Arguments where an empty string cannot mean anything. Deliberately excludes
+    /// "text": clearing a field by typing nothing into it is a real action.
+    /// </summary>
+    private static bool EmptyIsMeaningless(string key) => key is "url" or "js" or "selector";
+
+    /// <summary>The first required argument this call is missing, or null when complete.</summary>
+    internal static string? MissingRequiredArg(string name, JsonElement? args)
+    {
+        foreach (string key in RequiredArgsForTool(name))
+        {
+            if (args is not { ValueKind: JsonValueKind.Object } supplied
+                || !supplied.TryGetProperty(key, out var value)
+                || value.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined
+                || (EmptyIsMeaningless(key)
+                    && value.ValueKind == JsonValueKind.String
+                    && value.GetString()?.Length is null or 0))
+                return key;
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// The endpoint behind each tool. A closed map with a rejecting default: the path is
+    /// never built from input, so no tool name can reach an endpoint not listed here.
+    /// An empty path means the name is not a tool.
+    /// </summary>
+    internal static (string Method, string Path) RouteForTool(string name) => name switch
+    {
+        "gergur_list_tabs" => ("GET", "/tabs"),
+        "gergur_open_tab" => ("POST", "/open"),
+        "gergur_navigate" => ("POST", "/navigate"),
+        "gergur_activate_tab" => ("POST", "/activate"),
+        "gergur_close_tab" => ("POST", "/close"),
+        "gergur_read_page" => ("GET", "/page"),
+        "gergur_read_html" => ("GET", "/html"),
+        "gergur_screenshot" => ("GET", "/screenshot"),
+        "gergur_run_javascript" => ("POST", "/eval"),
+        "gergur_click" => ("POST", "/click"),
+        "gergur_type_text" => ("POST", "/type"),
+        _ => ("", ""),
+    };
+
+    /// <summary>Every tool maps onto an endpoint this server already serves.</summary>
+    internal static object[] McpTools() =>
+    [
+        Tool("gergur_list_tabs",
+            "List every open tab across all Gergur windows: flat index, which window, url, title, sleep state, and any errors the page reported.",
+            new { }, []),
+        Tool("gergur_open_tab", "Open a url in a new tab and focus it. Bare terms are treated as a search.",
+            new { url = Text("The url or search terms to open.") }, ["url"]),
+        Tool("gergur_navigate", "Point an existing tab at a url.",
+            new { url = Text("The url to go to."), index = Index() }, ["url"]),
+        Tool("gergur_activate_tab", "Bring a tab to the front, and its window with it.",
+            new { index = NamedIndex() }, ["index"]),
+        Tool("gergur_close_tab", "Close a tab.", new { index = NamedIndex() }, ["index"]),
+        Tool("gergur_read_page", "Read a page as rendered text. Prefer this over a screenshot for reading: it does not disturb which tab the user is looking at.",
+            new { index = Index() }, []),
+        Tool("gergur_read_html", "Read a page's full HTML.", new { index = Index() }, []),
+        Tool("gergur_screenshot", "Capture a tab as a PNG. This activates the tab first, so it changes what the user sees.",
+            new { index = Index() }, []),
+        Tool("gergur_run_javascript", "Evaluate JavaScript in a page and return the result.",
+            new { js = Text("The expression to evaluate."), index = Index() }, ["js"]),
+        Tool("gergur_click", "Click the first element matching a CSS selector. Animates a visible cursor to it first.",
+            new { selector = Text("A CSS selector."), index = Index() }, ["selector"]),
+        Tool("gergur_type_text", "Fill an input or textarea, in a way React and similar frameworks notice.",
+            new { selector = Text("A CSS selector for the field."), text = Text("The text to enter."), index = Index() },
+            ["selector", "text"]),
+    ];
+
+    private Task<(int, string, byte[])> HandleMcpAsync(JsonDocument? body)
+        => HandleJsonRpcAsync(body, CallToolAsync);
+
+    /// <summary>
+    /// The JSON-RPC envelope, split from the browser so it can be tested without an
+    /// engine: every malformed-input path below is reachable with no session at all.
+    /// </summary>
+    internal static async Task<(int, string, byte[])> HandleJsonRpcAsync(
+        JsonDocument? body, Func<JsonElement, Task<object>> callTool)
+    {
+        byte[] Json(object o) => JsonSerializer.SerializeToUtf8Bytes(o);
+        (int, string, byte[]) Invalid(string message) => (200, "application/json",
+            Json(new { jsonrpc = "2.0", id = (object?)null, error = new { code = -32600, message } }));
+
+        if (body is null)
+            return (400, "application/json",
+                Json(new { jsonrpc = "2.0", id = (object?)null, error = new { code = -32700, message = "parse error" } }));
+
+        // Anything that is not a JSON object gets a JSON-RPC error, not an exception.
+        // A batch (array root) is legal JSON-RPC that this server does not implement,
+        // and used to escape as an HTTP 500 that clients read as a transport failure.
+        var root = body.RootElement;
+        if (root.ValueKind != JsonValueKind.Object)
+            return Invalid(root.ValueKind == JsonValueKind.Array
+                ? "batched requests are not supported; send one request per call"
+                : "request must be a JSON object");
+
+        if (!root.TryGetProperty("method", out var methodElement) || methodElement.ValueKind != JsonValueKind.String)
+            return Invalid("missing or non-string \"method\"");
+        string method = methodElement.GetString() ?? "";
+
+        // A JSON-RPC notification carries no id and must get no response body.
+        if (!root.TryGetProperty("id", out var idElement) || idElement.ValueKind == JsonValueKind.Null)
+            return (202, "application/json", Array.Empty<byte>());
+
+        // Only a string or a number is a legal id.
+        if (idElement.ValueKind is not (JsonValueKind.String or JsonValueKind.Number))
+            return Invalid("\"id\" must be a string or a number");
+
+        // Echo it back verbatim. Converting a number to a string here meant a client
+        // matching replies by strict equality would not recognise its own request, and
+        // ids beyond Int64 or with a fraction changed type silently.
+        object id = idElement.Clone();
+
+        switch (method)
+        {
+            case "initialize":
+                return (200, "application/json", Json(new
+                {
+                    jsonrpc = "2.0",
+                    id,
+                    result = new
+                    {
+                        protocolVersion = McpProtocolVersion,
+                        capabilities = new { tools = new { listChanged = false } },
+                        serverInfo = new { name = "gergur", version = "1.0.0" },
+                    },
+                }));
+
+            case "ping":
+                return (200, "application/json", Json(new { jsonrpc = "2.0", id, result = new { } }));
+
+            case "tools/list":
+                return (200, "application/json", Json(new { jsonrpc = "2.0", id, result = new { tools = McpTools() } }));
+
+            case "tools/call":
+                return (200, "application/json", Json(new { jsonrpc = "2.0", id, result = await callTool(root) }));
+
+            default:
+                return (200, "application/json", Json(new
+                {
+                    jsonrpc = "2.0",
+                    id,
+                    error = new { code = -32601, message = $"unknown method: {method}" },
+                }));
+        }
+    }
+
+    private async Task<object> CallToolAsync(JsonElement request)
+    {
+        if (RejectBadToolCall(request, out string name) is { } rejection)
+            return rejection;
+        var (httpMethod, path) = RouteForTool(name);
+
+        JsonDocument? args = null;
+        bool abandoned = false;
+        try
+        {
+            // Safe: RejectBadToolCall has already established that params is an object.
+            var parameters = request.GetProperty("params");
+            if (parameters.TryGetProperty("arguments", out var argsElement) && argsElement.ValueKind == JsonValueKind.Object)
+                args = JsonDocument.Parse(argsElement.GetRawText());
+
+            // Refuse before dispatch. Without this, gergur_close_tab with no index
+            // reaches /close with nothing to target and closes the user's active tab.
+            if (MissingRequiredArg(name, args?.RootElement) is { } missing)
+                return McpError($"{name} requires \"{missing}\", which was not supplied.");
+
+            // The GET endpoints take the tab index from the query string. Pass through
+            // whatever was supplied, valid or not, so TargetEntry can reject a bad index
+            // rather than quietly retargeting the user's active tab.
+            var query = new Dictionary<string, string>();
+            if (httpMethod == "GET" && args is { RootElement.ValueKind: JsonValueKind.Object }
+                && args.RootElement.TryGetProperty("index", out var index))
+            {
+                query["index"] = index.ValueKind switch
+                {
+                    JsonValueKind.Number => index.TryGetInt32(out int n) ? n.ToString() : index.GetRawText(),
+                    JsonValueKind.String => index.GetString() ?? "",
+                    _ => index.GetRawText(),
+                };
+            }
+
+            // A page running a script that never returns would otherwise hold this
+            // connection, its stream and its task for the life of the process.
+            var dispatch = RouteAsync(httpMethod, path, query, args);
+            if (await Task.WhenAny(dispatch, Task.Delay(ToolTimeout)) != dispatch)
+            {
+                // The abandoned call still holds args, so disposing here would be a
+                // use-after-dispose on a live task. Hand disposal to that task instead,
+                // and observe its fault so it does not go unhandled.
+                abandoned = true;
+                _ = dispatch.ContinueWith(
+                    finished => { _ = finished.Exception; args?.Dispose(); }, TaskScheduler.Default);
+
+                // Say it may still land: giving up waiting is not the same as cancelling,
+                // and for a close the tab really does disappear afterwards.
+                return McpError(
+                    $"{name} did not finish within {ToolTimeout.TotalSeconds:0} seconds and was abandoned. "
+                    + "It may still complete. If it was a read, the page may be running a script that never returns.");
+            }
+
+            var (status, contentType, payload) = await dispatch;
+            if (contentType == "image/png")
+            {
+                // /page and /html both bound their output; this did not. A 4K capture is
+                // megabytes of base64 that most clients reject with an opaque error.
+                if (payload.Length > MaxScreenshotBytes)
+                {
+                    return McpError(
+                        $"the screenshot is {payload.Length / 1024.0 / 1024.0:0.0} MB, over the {MaxScreenshotBytes / 1024 / 1024} MB limit. "
+                        + "Use gergur_read_page to read the content instead.");
+                }
+                return new
+                {
+                    content = new object[]
+                    {
+                        new { type = "image", data = Convert.ToBase64String(payload), mimeType = "image/png" },
+                    },
+                };
+            }
+            string text = Encoding.UTF8.GetString(payload);
+            return status >= 400 ? McpError(text) : McpText(text);
+        }
+        catch (Exception ex)
+        {
+            // A failed tool call is reported to the caller, never thrown at the transport.
+            return McpError($"{name} failed: {ex.Message}");
+        }
+        finally
+        {
+            if (!abandoned)
+                args?.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Shape and name checks for a tools/call, split out so they can be exercised
+    /// without a browser. Everything here must run before any dispatch: these are
+    /// exactly the paths that used to throw out of the handler as an HTTP 500.
+    /// Returns an error result to send back, or null when the call is well formed.
+    /// </summary>
+    internal static object? RejectBadToolCall(JsonElement request, out string name)
+    {
+        name = "";
+        if (!request.TryGetProperty("params", out var parameters) || parameters.ValueKind != JsonValueKind.Object)
+            return McpError("\"params\" must be an object naming a tool");
+        if (!parameters.TryGetProperty("name", out var nameElement) || nameElement.ValueKind != JsonValueKind.String)
+            return McpError("the call named no tool");
+
+        name = nameElement.GetString() ?? "";
+        return RouteForTool(name).Path.Length == 0 ? McpError($"unknown tool: {name}") : null;
+    }
+
+    private static object McpText(string text)
+        => new { content = new object[] { new { type = "text", text } } };
+
+    private static object McpError(string message)
+        => new { content = new object[] { new { type = "text", text = message } }, isError = true };
 
     /// <summary>
     /// The visible agent cursor: a Gergur-blue dot that glides to the target,
@@ -461,7 +944,17 @@ public sealed class AgentServer
 
     private static async Task WriteAsync(NetworkStream stream, int status, string contentType, byte[] body)
     {
-        string reason = status switch { 200 => "OK", 400 => "Bad Request", 403 => "Forbidden", 404 => "Not Found", _ => "Error" };
+        string reason = status switch
+        {
+            200 => "OK",
+            202 => "Accepted", // JSON-RPC notifications answer with this and no body
+            400 => "Bad Request",
+            403 => "Forbidden",
+            404 => "Not Found",
+            500 => "Internal Server Error",
+            503 => "Service Unavailable",
+            _ => "Error",
+        };
         var head = Encoding.ASCII.GetBytes(
             $"HTTP/1.1 {status} {reason}\r\nContent-Type: {contentType}\r\nContent-Length: {body.Length}\r\nConnection: close\r\n\r\n");
         await stream.WriteAsync(head);

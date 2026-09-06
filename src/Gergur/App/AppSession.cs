@@ -59,9 +59,12 @@ public sealed class AppSession
             Agent = new AgentServer(this, Settings.AgentServerPort);
             Agent.Start();
         }
-        catch
+        catch (Exception ex)
         {
-            Agent = null; // port taken etc.; browsing works without the agent API
+            // Browsing works without it, but say why: a silent failure leaves an MCP
+            // client reporting "connection refused" with nothing to diagnose.
+            Agent = null;
+            Diagnostics.DebugLog.WriteAlways($"agent server did not start: {ex.Message}");
         }
     }
 
