@@ -77,13 +77,35 @@ public sealed class DropStore
         return item;
     }
 
+    /// <summary>
+    /// Records a file already on disk by moving it into the drop. The phone bridge
+    /// streams uploads to a staging file rather than holding them in memory, so this is
+    /// how they arrive.
+    /// </summary>
+    public DropItem AddFileFromPath(string originalName, string sourcePath, string from)
+    {
+        string id = NewId();
+        string stored = id + StorableExtension(originalName);
+        Directory.CreateDirectory(FilesDir);
+        string destination = Path.Combine(FilesDir, stored);
+
+        File.Move(sourcePath, destination, overwrite: true);
+        long size = new FileInfo(destination).Length;
+        if (from != "pc")
+            MarkAsFromNetwork(destination);
+
+        var item = new DropItem(id, "file", DisplayName(originalName), stored, size, from, DateTime.UtcNow);
+        Insert(item);
+        return item;
+    }
+
     /// <summary>Stores a file's bytes and records it. The stored name is never caller-controlled.</summary>
     public DropItem AddFile(string originalName, Stream content, string from)
     {
         string id = NewId();
         // The phone supplies the name, so it never becomes a path: only its extension
         // is kept, and the file on disk is named after the id we generated.
-        string extension = SafeExtension(originalName);
+        string extension = StorableExtension(originalName);
         string stored = id + extension;
 
         Directory.CreateDirectory(FilesDir);
@@ -205,6 +227,20 @@ public sealed class DropStore
         || c is '‎' or '‏';        // left/right to left marks
 
     /// <summary>
+    /// The extension a stored file is allowed to carry. An executable one becomes ".bin",
+    /// so a double-click in Explorer cannot run it either.
+    ///
+    /// Refusing only at the click in our own window left the deny list load-bearing: miss
+    /// one extension and the file is still sitting there, runnable. Renaming at the point
+    /// the bytes land makes an incomplete list harmless instead.
+    /// </summary>
+    internal static string StorableExtension(string originalName)
+    {
+        string extension = SafeExtension(originalName);
+        return extension.Length > 0 && IsExecutable(extension) ? ".bin" : extension;
+    }
+
+    /// <summary>
     /// Extensions Windows will execute. This feature moves files between your devices;
     /// it is not a way to run one, so a click never launches these. Anyone holding the
     /// pairing key could otherwise put an executable in the drop.
@@ -268,8 +304,19 @@ public sealed class DropStore
     {
         try
         {
-            if (File.Exists(IndexPath))
-                return JsonSerializer.Deserialize<List<DropItem>>(File.ReadAllText(IndexPath)) ?? [];
+            if (!File.Exists(IndexPath))
+                return [];
+            var loaded = JsonSerializer.Deserialize<List<DropItem>>(File.ReadAllText(IndexPath));
+            if (loaded is null)
+                return [];
+
+            // Locking the list closed one source of nulls; this is the other. A hand
+            // edited or truncated index can deserialize entries that are null, or whose
+            // Text is, and those throw on the UI thread when the window renders them,
+            // which is the crash the lock was meant to end.
+            return loaded
+                .Where(i => i is not null && i.Id is not null && i.Text is not null && i.Kind is not null)
+                .ToList();
         }
         catch
         {
@@ -284,7 +331,12 @@ public sealed class DropStore
         try
         {
             Directory.CreateDirectory(_root);
-            File.WriteAllText(IndexPath, JsonSerializer.Serialize(_items, JsonOptions));
+            // Write beside it and move into place. A direct write that is interrupted
+            // leaves a truncated index, which loads as an empty drop and orphans every
+            // file it referenced, with nothing to tell the user it happened.
+            string staging = IndexPath + ".tmp";
+            File.WriteAllText(staging, JsonSerializer.Serialize(_items, JsonOptions));
+            File.Move(staging, IndexPath, overwrite: true);
         }
         catch
         {

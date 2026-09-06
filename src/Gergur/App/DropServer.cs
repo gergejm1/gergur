@@ -27,6 +27,17 @@ public sealed class DropServer
     /// <summary>A single request may not hold a connection longer than this.</summary>
     private static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(30);
 
+    /// <summary>
+    /// A peer gets far less time to send its request line and headers than to finish a
+    /// transfer. Without this split, sockets that connect and say nothing hold their slot
+    /// for the full request timeout, which made the connection cap a cheaper denial than
+    /// having no cap at all: sixteen idle sockets locked out a correctly paired phone.
+    /// </summary>
+    private static readonly TimeSpan HeadTimeout = TimeSpan.FromSeconds(5);
+
+    /// <summary>Uploads stream to disk in chunks this size, never sized from a declared length.</summary>
+    private const int CopyChunkBytes = 64 * 1024;
+
     private readonly DropStore _store;
     private readonly Settings _settings;
     /// <summary>Bounds concurrent handlers, so opening sockets cannot exhaust the process.</summary>
@@ -171,25 +182,46 @@ public sealed class DropServer
 
     private async Task HandleAsync(TcpClient client)
     {
-        // Cap concurrent handlers. Without it, opening sockets and never sending is
-        // enough to exhaust the process, all before any key is checked.
+        // Cap concurrent handlers, but say so rather than closing silently: a phone that
+        // arrives while the cap is full should be told to retry, not left guessing.
         if (!await _slots.WaitAsync(TimeSpan.FromSeconds(2)))
         {
+            try
+            {
+                using var busy = client.GetStream();
+                await WriteAsync(busy, 503, "text/plain", "Busy, try again."u8.ToArray());
+                await busy.FlushAsync();
+                // Close the send side first. Disposing straight after writing resets the
+                // connection, so the peer sees a reset rather than the answer we wrote.
+                client.Client.Shutdown(SocketShutdown.Both);
+            }
+            catch { }
             client.Dispose();
             return;
         }
 
         using var _ = client;
-        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(_cts?.Token ?? default);
-        timeout.CancelAfter(RequestTimeout);
+        // Capture the source once: Stop() can dispose it underneath us, and reading
+        // .Token on a disposed source throws outside the try that releases the slot.
+        var lifetime = _cts;
+        using var timeout = lifetime is null
+            ? new CancellationTokenSource()
+            : CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
+        // Held outside the try so the handler below can still answer on the way out.
+        NetworkStream? stream = null;
         try
         {
             // Belt and braces with the token: these bound a blocking socket too.
             client.ReceiveTimeout = (int)RequestTimeout.TotalMilliseconds;
             client.SendTimeout = (int)RequestTimeout.TotalMilliseconds;
 
-            using var stream = client.GetStream();
+            stream = client.GetStream();
+
+            // The head gets a short deadline of its own. A peer holding a slot without
+            // sending anything is released in seconds rather than half a minute.
+            timeout.CancelAfter(HeadTimeout);
             var (request, error, buffered) = await ReadHeadAsync(stream, timeout.Token);
+            timeout.CancelAfter(RequestTimeout); // a real transfer gets the full budget
             if (request is null)
             {
                 int status = error switch
@@ -211,12 +243,24 @@ public sealed class DropServer
 
             await RouteAsync(stream, request, buffered, timeout.Token);
         }
+        catch (OperationCanceledException)
+        {
+            // Ran out of time. Say so rather than closing silently: an empty read is
+            // indistinguishable from a crash, and the phone has no way to tell why.
+            try
+            {
+                if (stream is not null)
+                    await WriteAsync(stream, 408, "text/plain", "Request timed out."u8.ToArray());
+            }
+            catch { }
+        }
         catch (Exception ex)
         {
             DebugLog.Write($"drop request failed: {ex.Message}");
         }
         finally
         {
+            stream?.Dispose();
             _slots.Release();
         }
     }
@@ -289,18 +333,25 @@ public sealed class DropServer
                 // The body is the raw file. The page posts it directly rather than as
                 // multipart, which keeps the parsing here trivial and the name out of band.
                 request.Query.TryGetValue("name", out var name);
-                var bytes = await ReadBodyAsync(stream, request.ContentLength, MaxUploadBytes, buffered, ct);
-                if (bytes is null)
+
+                // Straight to a temp file in chunks, so nothing is sized from a declared
+                // length and a failed transfer leaves nothing behind.
+                string staging = Path.Combine(Path.GetTempPath(), $"gergur-drop-{Guid.NewGuid():N}");
+                try
                 {
-                    // A phone that walked out of Wi-Fi range mid-transfer used to leave a
-                    // truncated file recorded as a complete one, with a 200 to match.
-                    await WriteAsync(stream, 400, "application/json",
-                        """{"error":"transfer did not complete; nothing was saved"}"""u8.ToArray());
-                    return;
+                    if (!await CopyBodyToFileAsync(stream, request.ContentLength, MaxUploadBytes, buffered, staging, ct))
+                    {
+                        // A phone that walked out of Wi-Fi range mid-transfer used to leave
+                        // a truncated file recorded as a complete one, with a 200 to match.
+                        await WriteAsync(stream, 400, "application/json",
+                            """{"error":"transfer did not complete; nothing was saved"}"""u8.ToArray());
+                        return;
+                    }
+                    _store.AddFileFromPath(name ?? "file", staging, from: "phone");
                 }
-                using (var content = new MemoryStream(bytes))
+                finally
                 {
-                    _store.AddFile(name ?? "file", content, from: "phone");
+                    try { File.Delete(staging); } catch { }
                 }
                 await WriteAsync(stream, 200, "application/json", """{"ok":true}"""u8.ToArray());
                 return;
@@ -431,6 +482,43 @@ public sealed class DropServer
     /// transfer cut off midway is refused rather than stored as a complete file and
     /// answered with success.
     /// </summary>
+    /// <summary>
+    /// Copies exactly the declared number of body bytes into a file, in fixed chunks.
+    ///
+    /// Never sizes a buffer from what the peer claims. Allocating the declared length up
+    /// front meant sixteen sockets promising 100 MB and sending nothing took the process
+    /// from 7 MB to 1.6 GB, in a browser whose whole point is its memory behaviour.
+    /// Returns false when the transfer did not complete, and the caller keeps nothing.
+    /// </summary>
+    internal static async Task<bool> CopyBodyToFileAsync(
+        Stream stream, long length, long cap, byte[] alreadyRead, string path, CancellationToken ct = default)
+    {
+        if (length <= 0 || length > cap)
+            return false;
+
+        using var file = File.Create(path);
+        long written = 0;
+
+        if (alreadyRead.Length > 0)
+        {
+            int take = (int)Math.Min(alreadyRead.Length, length);
+            await file.WriteAsync(alreadyRead.AsMemory(0, take), ct);
+            written = take;
+        }
+
+        var chunk = new byte[CopyChunkBytes];
+        while (written < length)
+        {
+            int want = (int)Math.Min(chunk.Length, length - written);
+            int read = await stream.ReadAsync(chunk.AsMemory(0, want), ct);
+            if (read == 0)
+                return false; // peer stopped before sending what it promised
+            await file.WriteAsync(chunk.AsMemory(0, read), ct);
+            written += read;
+        }
+        return true;
+    }
+
     internal static async Task<byte[]?> ReadBodyAsync(
         Stream stream, long length, long cap, byte[]? alreadyRead = null, CancellationToken ct = default)
     {
