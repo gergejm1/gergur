@@ -1,0 +1,6 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Gergur.Tests/Gergur.Tests.csproj" />
+    <Project Path="src/Gergur/Gergur.csproj" />
+  </Folder>
+</Solution>
