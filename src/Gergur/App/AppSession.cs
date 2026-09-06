@@ -20,6 +20,8 @@ public sealed class AppSession
     public HistoryStore History { get; } = new();
     public BookmarkStore Bookmarks { get; } = new();
     public DownloadManager Downloads { get; } = new();
+    public DropStore Drop { get; } = new();
+    public DropServer? PhoneBridge { get; private set; }
     public VpnTunnel Vpn { get; }
     public AgentServer? Agent { get; private set; }
 
@@ -68,6 +70,32 @@ public sealed class AppSession
         }
     }
 
+    /// <summary>
+    /// Brings up the phone bridge when it is switched on. Separate from StartAgent
+    /// because this one listens beyond loopback: it stays off unless asked for.
+    /// </summary>
+    public void StartPhoneBridge()
+    {
+        if (PhoneBridge is not null || !Settings.DropEnabled)
+            return;
+        try
+        {
+            PhoneBridge = new DropServer(Drop, Settings);
+            PhoneBridge.Start();
+        }
+        catch (Exception ex)
+        {
+            PhoneBridge = null;
+            Diagnostics.DebugLog.WriteAlways($"phone bridge did not start: {ex.Message}");
+        }
+    }
+
+    public void StopPhoneBridge()
+    {
+        PhoneBridge?.Stop();
+        PhoneBridge = null;
+    }
+
     public void AddWindow(MainForm window) => _windows.Add(window);
 
     /// <summary>Drops a closed window and, when it was the last one, tears the shared services down.</summary>
@@ -78,6 +106,7 @@ public sealed class AppSession
             return;
         Agent?.Stop();
         Agent = null;
+        StopPhoneBridge();
         Vpn.Stop();
     }
 

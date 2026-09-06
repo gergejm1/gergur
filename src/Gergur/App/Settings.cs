@@ -13,6 +13,7 @@ public sealed class Settings
     private const string Privacy = "4 Privacy and blocking";
     private const string Vpn = "5 VPN";
     private const string Agent = "6 Agent API";
+    private const string Phone = "7 Phone drop";
 
     [Category(Memory), DisplayName("Suspend after (minutes)")]
     [Description("Idle minutes before a background tab is frozen and its renderer memory trimmed. Tabs playing audio are exempt.")]
@@ -115,6 +116,17 @@ public sealed class Settings
     [Category(Agent), DisplayName("Agent API port")]
     public int AgentServerPort { get; set; } = 24002;
 
+    [Category(Phone), DisplayName("Phone drop enabled")]
+    [Description("Serves a small page on your local network so a paired phone can send and receive links, messages and files. Off by default: unlike the agent API this listens beyond loopback. It can only pass items back and forth, never drive the browser.")]
+    public bool DropEnabled { get; set; } = false;
+
+    [Category(Phone), DisplayName("Phone drop port")]
+    public int DropPort { get; set; } = 24003;
+
+    [Category(Phone), DisplayName("Pairing key")]
+    [Description("Every phone request must carry this. Generated on first use. Change it to revoke a phone that has the link.")]
+    public string DropKey { get; set; } = "";
+
     [Browsable(false)]
     [JsonIgnore]
     public static string DataDir { get; } =
@@ -131,6 +143,7 @@ public sealed class Settings
         nameof(InactiveMemoryPressure), nameof(DisableFedCm), nameof(V8ScavengerMaxMb),
         nameof(ExtraBrowserArguments), nameof(VpnEnabled), nameof(VpnLocalPort),
         nameof(VpnBypassHosts), nameof(AgentServerEnabled), nameof(AgentServerPort),
+        nameof(DropEnabled), nameof(DropPort),
     };
 
     private static readonly JsonSerializerOptions JsonOptions = new()

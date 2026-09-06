@@ -24,6 +24,8 @@ public sealed class MainForm : Form
     private TabLifecycleManager? _lifecycle;
     private HistoryForm? _historyWindow;
     private DownloadsForm? _downloadsWindow;
+    private DropForm? _dropWindow;
+    private NotifyIcon? _tray;
     private bool _closing;
     private bool _lifecycleTickRunning;
     private bool _isMinimized;
@@ -280,6 +282,7 @@ public sealed class MainForm : Form
         _menu.Items.Add(new ToolStripMenuItem("Update blocklist (StevenBlack hosts)", null, async (_, _) => await UpdateBlocklistAsync(silent: false)));
 
         _menu.Items.Add(BuildVpnMenu());
+        _menu.Items.Add(BuildPhoneMenu());
         _menu.Items.Add(new ToolStripSeparator());
 
         _menu.Items.Add(new ToolStripMenuItem("Browser task manager", null, (_, _) => Tabs?.ActiveTab?.OpenTaskManager()));
@@ -366,6 +369,9 @@ public sealed class MainForm : Form
         _session = await AppSession.CreateAsync(_settings, vpn);
         _session.Env.Core.BrowserProcessExited += OnBrowserProcessExited;
         _session.StartAgent();
+        _session.StartPhoneBridge();
+        // Only the first window listens, or an arrival would notify once per window.
+        _session.Drop.ItemAdded += OnDropItemArrived;
 
         // First run with blocking on but no list yet: fetch one quietly.
         if (_session.Blocker.Enabled && _session.Blocker.RuleCount == 0)
@@ -578,6 +584,14 @@ public sealed class MainForm : Form
         _session?.SaveSession();
         _lifecycleTimer.Stop();
         _statusTimer.Stop();
+        if (_tray is not null)
+        {
+            _tray.Visible = false; // or the icon lingers in the tray until hovered
+            _tray.Dispose();
+            _tray = null;
+        }
+        if (_session is not null)
+            _session.Drop.ItemAdded -= OnDropItemArrived;
         Tabs?.DisposeAll(); // engine processes exit promptly once the last WebView is gone
         _session?.RemoveWindow(this); // stops the agent and tunnel when this was the last
         if (_session is null || _session.Windows.Count == 0)
@@ -619,6 +633,30 @@ public sealed class MainForm : Form
 
         menu.DropDownItems.Add(new ToolStripSeparator());
         menu.DropDownItems.Add(new ToolStripMenuItem("Add profile from .conf file…", null, (_, _) => ImportVpnProfile()));
+        return menu;
+    }
+
+    /// <summary>Phone submenu: on/off, the pairing link, and the two everyday actions.</summary>
+    private ToolStripMenuItem BuildPhoneMenu()
+    {
+        bool running = _session?.PhoneBridge?.IsRunning == true;
+        var menu = new ToolStripMenuItem($"Phone drop ({(running ? "on" : "off")})") { Checked = running };
+
+        menu.DropDownItems.Add(new ToolStripMenuItem(running ? "Turn off" : "Turn on…", null,
+            (_, _) => TogglePhoneBridge()));
+        menu.DropDownItems.Add(new ToolStripSeparator());
+
+        int waiting = _session?.Drop.Items.Count ?? 0;
+        menu.DropDownItems.Add(new ToolStripMenuItem(
+            waiting > 0 ? $"Open drop ({waiting})" : "Open drop", null, (_, _) => OpenDrop()));
+        menu.DropDownItems.Add(new ToolStripMenuItem("Send this page to phone", null, (_, _) => SendPageToPhone())
+        {
+            Enabled = running && Tabs?.ActiveTab is { } tab && !HomePage.IsHome(tab.Url),
+        });
+        menu.DropDownItems.Add(new ToolStripMenuItem("Show pairing link…", null, (_, _) => ShowPairingLink())
+        {
+            Enabled = running,
+        });
         return menu;
     }
 
@@ -998,6 +1036,111 @@ public sealed class MainForm : Form
             RestartForNewEngineFlags();
         else
             ShowMessage("Settings saved; engine changes apply on the next restart.");
+    }
+
+    // ------------------------------------------------------------------ phone drop
+
+    /// <summary>
+    /// Something arrived from the phone. A tray balloon rather than a dialog: this is a
+    /// notification, not a question, and it must not steal focus from what you are doing.
+    /// </summary>
+    private void OnDropItemArrived(object? sender, DropItem item)
+    {
+        if (item.From != "phone" || _closing || IsDisposed)
+            return;
+        BeginInvoke(() =>
+        {
+            string summary = DropForm.Summarize(item);
+            ShowMessage($"From your phone: {summary}");
+            EnsureTray()?.ShowBalloonTip(5000, "Gergur Drop", summary, ToolTipIcon.Info);
+        });
+    }
+
+    /// <summary>The tray icon exists only once the phone bridge has something to say.</summary>
+    private NotifyIcon? EnsureTray()
+    {
+        if (_tray is not null)
+            return _tray;
+        try
+        {
+            _tray = new NotifyIcon { Icon = Icon, Text = "Gergur Drop", Visible = true };
+            _tray.BalloonTipClicked += (_, _) => OpenDrop();
+            _tray.DoubleClick += (_, _) => OpenDrop();
+        }
+        catch
+        {
+            _tray = null; // No tray is survivable; the status bar still says so.
+        }
+        return _tray;
+    }
+
+    /// <summary>Modeless, one window, shared by every browser window.</summary>
+    public void OpenDrop()
+    {
+        if (_session is null)
+            return;
+        if (_dropWindow is { IsDisposed: false })
+        {
+            _dropWindow.Activate();
+            return;
+        }
+        _dropWindow = new DropForm(_session.Drop, url => _ = NewTabAsync(url));
+        _dropWindow.FormClosed += (_, _) => _dropWindow = null;
+        _dropWindow.Show(this);
+    }
+
+    /// <summary>Puts the current page in the drop so the phone can pick it up.</summary>
+    private void SendPageToPhone()
+    {
+        if (_session is null || Tabs?.ActiveTab is not { } active || HomePage.IsHome(active.Url))
+            return;
+        _session.Drop.AddText(active.Url, from: "pc");
+        ShowMessage("Sent to your phone's drop.");
+    }
+
+    /// <summary>
+    /// Turning the bridge on is a real decision: it opens a port on your network, so it
+    /// says what it does and what it cannot do before starting.
+    /// </summary>
+    private void TogglePhoneBridge()
+    {
+        if (_session is null)
+            return;
+        if (_settings.DropEnabled)
+        {
+            _settings.DropEnabled = false;
+            _settings.Save();
+            _session.StopPhoneBridge();
+            ShowMessage("Phone drop off.");
+            return;
+        }
+
+        var answer = MessageBox.Show(this,
+            "Start the phone drop?\n\n"
+            + "This opens a port on your local network so a paired phone can send and receive "
+            + "links, messages and files. Only devices with the pairing link can reach it, and it "
+            + "cannot control the browser: the agent API stays on loopback.\n\n"
+            + "Windows may ask you to allow it through the firewall.",
+            "Gergur", MessageBoxButtons.OKCancel, MessageBoxIcon.Question);
+        if (answer != DialogResult.OK)
+            return;
+
+        _settings.DropEnabled = true;
+        _settings.Save();
+        _session.StartPhoneBridge();
+        ShowPairingLink();
+    }
+
+    /// <summary>The address to open on the phone, with a copy button, since you type it once.</summary>
+    private void ShowPairingLink()
+    {
+        if (_session?.PhoneBridge?.PairingUrl is not { } url)
+        {
+            ShowMessage("Phone drop is not running.");
+            return;
+        }
+        using var pairing = new PairingForm(url);
+        pairing.ShowDialog(this);
     }
 
     /// <summary>Modeless, one window, shared across every browser window's downloads.</summary>

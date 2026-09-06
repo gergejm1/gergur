@@ -18,6 +18,10 @@
 
   <ItemGroup>
     <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.4129.50" />
+    <!-- Pairing QR for the phone drop. MIT, no dependencies of its own. A hand-rolled
+         encoder is a lot of spec to get subtly wrong, and a QR that will not scan is
+         worse than no QR. -->
+    <PackageReference Include="QRCoder" Version="1.8.0" />
   </ItemGroup>
 
   <ItemGroup>

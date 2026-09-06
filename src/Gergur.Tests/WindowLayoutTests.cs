@@ -82,6 +82,19 @@ public sealed class WindowLayoutTests
     });
 
     [Fact]
+    public void DropFooterButtonsAreNeverClipped() => OnSta(() =>
+    {
+        string root = Path.Combine(Path.GetTempPath(), $"gergur-drop-layout-{Guid.NewGuid():N}");
+        try
+        {
+            using var form = new DropForm(new DropStore(root), _ => { });
+            _ = form.Handle;
+            AssertFooterFits(form, form.FooterControls, form.LayoutFooter);
+        }
+        finally { try { Directory.Delete(root, recursive: true); } catch { } }
+    });
+
+    [Fact]
     public void HistoryFooterButtonsAreNeverClipped() => OnSta(() =>
     {
         string path = Path.Combine(Path.GetTempPath(), $"gergur-layout-{Guid.NewGuid():N}.jsonl");
