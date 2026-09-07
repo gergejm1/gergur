@@ -625,7 +625,25 @@ public sealed class UploadNamingTests : IDisposable
 
     [Fact]
     public void APngIsRecognised()
-        => Assert.Equal((".png", "Photo"), DropServer.Sniff("\x89PNG\r\n\x1a\n"u8));
+    {
+        // Written as bytes, never as a string escape. The implementation used
+        // "\x89PNG\r\n\x1a\n"u8, and \x89 is the character U+0089, which UTF-8 encodes
+        // as two bytes: the literal matched no real PNG at all. The first version of
+        // this test fed the same broken literal back in and agreed with the bug, which
+        // is why correcting the implementation made it fail. Every iPhone screenshot
+        // is a PNG.
+        Assert.Equal(
+            (".png", "Photo"),
+            DropServer.Sniff([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x0D]));
+    }
+
+    [Fact]
+    public void TheBrokenSignatureIsNotWhatIsMatched()
+    {
+        // The bytes the old literal actually produced, which start with 0xC2. Nothing
+        // should recognise them, or the same mistake can be made again quietly.
+        Assert.Equal((".bin", "File"), DropServer.Sniff("\x89PNG\r\n\x1a\n"u8));
+    }
 
     [Fact]
     public void AGifIsRecognised()
@@ -641,9 +659,25 @@ public sealed class UploadNamingTests : IDisposable
     public void TheFormatAnIphoneActuallyShootsIsRecognised(string brand)
         => Assert.Equal((".heic", "Photo"), DropServer.Sniff(Encoding.UTF8.GetBytes("....ftyp" + brand)));
 
-    [Fact]
-    public void TheSameContainerCarryingVideoIsNotCalledAPhoto()
-        => Assert.Equal((".mov", "Video"), DropServer.Sniff("....ftypqt  "u8));
+    [Theory]
+    [InlineData("qt  ")]
+    [InlineData("isom")]
+    [InlineData("mp42")]
+    public void TheSameContainerCarryingVideoIsNotCalledAPhoto(string brand)
+        => Assert.Equal((".mov", "Video"), DropServer.Sniff(Encoding.UTF8.GetBytes("....ftyp" + brand)));
+
+    [Theory]
+    [InlineData("avif")]   // a still picture, and it was being called a video
+    [InlineData("hevx")]
+    [InlineData("heim")]
+    public void OtherStillPictureBrandsAreAlsoPhotos(string brand)
+        => Assert.Equal((".heic", "Photo"), DropServer.Sniff(Encoding.UTF8.GetBytes("....ftyp" + brand)));
+
+    [Theory]
+    [InlineData("M4A ")]   // a voice memo is neither
+    [InlineData("what")]
+    public void AContainerBrandWeDoNotKnowIsNotGuessedAt(string brand)
+        => Assert.Equal((".bin", "File"), DropServer.Sniff(Encoding.UTF8.GetBytes("....ftyp" + brand)));
 
     [Fact]
     public void APdfIsRecognised()

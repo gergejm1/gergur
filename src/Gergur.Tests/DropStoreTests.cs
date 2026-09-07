@@ -1323,22 +1323,44 @@ public sealed class DropStoreIndexCopyTests : IDisposable
     }
 
     [Fact]
-    public void AnIndexCopyIsRemovedOnceNothingItNamesIsLeft()
+    public void AReadableCopyIsRemovedOnceNothingItNamesIsLeft()
     {
-        GiveItAPartialIndex("a", 2);
-        new DropStore(_root).AddText("round one", from: "pc");
-        string copy = Directory.GetFiles(_root, "items.json.superseded*").Single();
-
-        // The photos are gone from the drop, and the copy is old. It accounts for
-        // nothing now, and nothing else ever removes it.
-        foreach (string path in Directory.GetFiles(FilesDir))
-            File.Delete(path);
+        // A copy this build understands completely: the promotion path makes these when
+        // it replaces one working index with a newer one.
+        Directory.CreateDirectory(FilesDir);
+        File.WriteAllText(IndexPath, "[]");
+        string copy = IndexPath + ".superseded";
+        File.WriteAllText(copy, """
+            [{"Id":"a1","Kind":"file","Text":"holiday.jpg","StoredName":"a1.jpg",
+              "Size":5,"From":"phone","AddedUtc":"2026-01-01T00:00:00Z"}]
+            """);
         File.SetLastWriteTimeUtc(copy, DateTime.UtcNow.AddDays(-61));
 
+        // Nothing it names is on disk any more, and it is long past the cutoff.
         var drop = new DropStore(_root);
 
         Assert.False(File.Exists(copy));
         Assert.Equal(0, drop.SetAsideCount);
+    }
+
+    [Fact]
+    public void ACopyThisBuildCannotFullyReadIsNeverAgedOut()
+    {
+        // The whole reason it was kept is that its entries could not be read, so there
+        // is no way to know what it accounts for, and "names nothing I can see" is not
+        // "names nothing". It costs one small file and it is the only record of those
+        // entries; deleting it on a timer is how twenty photos were lost.
+        GiveItAPartialIndex("a", 2);
+        new DropStore(_root).AddText("round one", from: "pc");
+        string copy = Directory.GetFiles(_root, "items.json.superseded*").Single();
+
+        foreach (string path in Directory.GetFiles(FilesDir))
+            File.Delete(path);
+        File.SetLastWriteTimeUtc(copy, DateTime.UtcNow.AddDays(-61));
+
+        _ = new DropStore(_root);
+
+        Assert.True(File.Exists(copy));
     }
 
     [Fact]
@@ -1463,5 +1485,66 @@ public sealed class DropStoreIndexPruneTests : IDisposable
 
         Assert.Equal(20, Directory.GetFiles(Path.Combine(_root, "files")).Length);
         Assert.False(Directory.Exists(Path.Combine(_root, "orphans")));
+    }
+}
+
+/// <summary>
+/// The staging file left by a save that did not finish. Deleting one this build can only
+/// half read counted its unreadable entries as naming nothing, and the photos they
+/// accounted for were set aside on the launch after that.
+/// </summary>
+public sealed class DropStoreStagingReadabilityTests : IDisposable
+{
+    private readonly string _root = Path.Combine(Path.GetTempPath(), $"gergur-staging-{Guid.NewGuid():N}");
+
+    public void Dispose()
+    {
+        try { Directory.Delete(_root, recursive: true); } catch { }
+    }
+
+    private string IndexPath => Path.Combine(_root, "items.json");
+    private string FilesDir => Path.Combine(_root, "files");
+
+    [Fact]
+    public void AStagingFileThisBuildCannotReadIsKeptAndItsPhotoWithIt()
+    {
+        Directory.CreateDirectory(FilesDir);
+        File.WriteAllText(Path.Combine(FilesDir, "a1.jpg"), "a photo");
+
+        // A save from a later build that crashed before the move. It parses, but the
+        // field this build reads names from is not there, so it names nothing to us.
+        string staging = IndexPath + ".tmp";
+        File.WriteAllText(staging, """
+            [{"Id":"a1","Kind":"file","Text":"holiday.jpg","StoredName":null,
+              "Size":7,"From":"phone","AddedUtc":"2026-01-01T00:00:00Z"}]
+            """);
+        File.SetLastWriteTimeUtc(staging, DateTime.UtcNow.AddMinutes(-10));
+
+        // A newer, perfectly readable index that does not mention the photo.
+        File.WriteAllText(IndexPath, "[]");
+
+        _ = new DropStore(_root);
+        Assert.True(File.Exists(staging), "the only list naming the photo was deleted");
+
+        // And the launch after, which is where the loss actually showed up.
+        _ = new DropStore(_root);
+
+        Assert.Single(Directory.GetFiles(FilesDir));
+    }
+
+    [Fact]
+    public void AStagingFileThatIsHalfAWriteIsStillDiscarded()
+    {
+        // Not an index by any reading, so keeping it would only stand the sweep down
+        // forever on a file that can never say anything.
+        Directory.CreateDirectory(FilesDir);
+        File.WriteAllText(IndexPath, "[]");
+        string staging = IndexPath + ".tmp";
+        File.WriteAllText(staging, """[{"Id":"a1","Kind":"fi""");
+        File.SetLastWriteTimeUtc(staging, DateTime.UtcNow.AddMinutes(-10));
+
+        _ = new DropStore(_root);
+
+        Assert.False(File.Exists(staging));
     }
 }

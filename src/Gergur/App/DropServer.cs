@@ -3,6 +3,7 @@ using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Text;
+using System.Globalization;
 using System.Text.Json;
 using Gergur.Data;
 using Gergur.Diagnostics;
@@ -434,7 +435,9 @@ public sealed class DropServer
         {
             // Unreadable is not worth failing the upload over; it keeps the plain name.
         }
-        return $"{kind} {DateTime.Now:yyyy-MM-dd HH.mm.ss}{extension}";
+        // Invariant, because this is meant to be a date: the Thai and Umm al-Qura
+        // calendars render the same instant as 2569 and 1448.
+        return $"{kind} {DateTime.Now.ToString("yyyy-MM-dd HH.mm.ss", CultureInfo.InvariantCulture)}{extension}";
     }
 
     /// <summary>
@@ -442,11 +445,27 @@ public sealed class DropServer
     /// signatures that are unambiguous: anything else keeps the neutral name, because a
     /// wrong extension is worse than no extension.
     /// </summary>
+    /// <summary>
+    /// The eight bytes every PNG starts with, written as bytes on purpose. As a string
+    /// escape this is silently wrong: "\x89" is the character U+0089, which UTF-8 encodes
+    /// as two bytes, so the literal never matched a real PNG and every iPhone screenshot
+    /// arrived as an unopenable ".bin". The test that covered it fed the same broken
+    /// literal back in and agreed with the bug.
+    /// </summary>
+    private static ReadOnlySpan<byte> PngSignature => [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+
+    /// <summary>ISO base media brands that mean a still picture, and ones that mean video.</summary>
+    private static readonly HashSet<string> PhotoBrands =
+        new(StringComparer.Ordinal) { "heic", "heix", "hevc", "hevx", "heim", "heis", "mif1", "msf1", "avif", "avis" };
+
+    private static readonly HashSet<string> VideoBrands =
+        new(StringComparer.Ordinal) { "qt  ", "isom", "iso2", "mp41", "mp42", "M4V ", "M4VP", "3gp4", "3gp5", "3g2a" };
+
     internal static (string Extension, string Kind) Sniff(ReadOnlySpan<byte> head)
     {
         if (head.Length >= 3 && head[0] == 0xFF && head[1] == 0xD8 && head[2] == 0xFF)
             return (".jpg", "Photo");
-        if (head.StartsWith("\x89PNG\r\n\x1a\n"u8))
+        if (head.StartsWith(PngSignature))
             return (".png", "Photo");
         if (head.StartsWith("GIF87a"u8) || head.StartsWith("GIF89a"u8))
             return (".gif", "Photo");
@@ -454,12 +473,15 @@ public sealed class DropServer
             return (".webp", "Photo");
         if (head.Length >= 12 && head[4..8].SequenceEqual("ftyp"u8))
         {
-            // The same container carries both, and the brand is what separates them.
-            var brand = head[8..12];
-            return brand.SequenceEqual("heic"u8) || brand.SequenceEqual("heix"u8)
-                || brand.SequenceEqual("hevc"u8) || brand.SequenceEqual("mif1"u8)
-                ? (".heic", "Photo")
-                : (".mov", "Video");
+            // One container, many things inside it, and only the brand says which. Listed
+            // rather than assumed: treating everything that was not a known photo brand
+            // as video called an AVIF picture and a voice memo ".mov", and neither opens.
+            string brand = Encoding.ASCII.GetString(head[8..12]);
+            if (PhotoBrands.Contains(brand))
+                return (".heic", "Photo");
+            if (VideoBrands.Contains(brand))
+                return (".mov", "Video");
+            return (".bin", "File");
         }
         if (head.StartsWith("%PDF-"u8))
             return (".pdf", "Document");

@@ -161,9 +161,28 @@ public sealed class DropStore
             string staging = IndexPath + ".tmp";
             if (File.Exists(staging))
             {
-                var live = _items.Select(i => i.StoredName).ToHashSet(StringComparer.OrdinalIgnoreCase);
-                if (NamesIn(staging).Where(n => n.Length > 0).All(live.Contains))
+                if (!Readable(staging))
+                {
+                    // Locked right now, by the backup or the scanner this whole class is
+                    // written around. Not evidence of anything either way, and certainly
+                    // not something to delete on the strength of not being able to open
+                    // it. It will still be here next launch.
+                }
+                else if (ReadIndex(staging) is null)
+                {
+                    // Half a write. It is not an index by any reading, so it is not
+                    // evidence of anything and it cannot become one.
                     File.Delete(staging);
+                }
+                else if (FullyReadable(staging))
+                {
+                    // It reads, so what it names can be compared. Deleting one this build
+                    // could only half read counted its unreadable entries as naming
+                    // nothing, and the photos they accounted for went the launch after.
+                    var live = _items.Select(i => i.StoredName).ToHashSet(StringComparer.OrdinalIgnoreCase);
+                    if (NamesIn(staging).Where(n => n.Length > 0).All(live.Contains))
+                        File.Delete(staging);
+                }
             }
 
             PruneIndexCopies();
@@ -232,6 +251,14 @@ public sealed class DropStore
             {
                 if (File.GetLastWriteTimeUtc(path) >= cutoff)
                     continue;
+
+                // The same inference the sweep above refuses to make, in the line that
+                // actually deletes. A list that will not read names nothing to us, which
+                // is not the same as naming nothing, and reading it as the latter deleted
+                // the only record of twenty photos and then quarantined the photos.
+                if (!FullyReadable(path))
+                    continue;
+
                 if (NamesIn(path).Any(n => n.Length > 0 && File.Exists(Path.Combine(FilesDir, n))))
                     continue;
                 File.Delete(path);
@@ -318,6 +345,20 @@ public sealed class DropStore
     /// caught mid write, or a copy from a build whose entries this one cannot parse,
     /// both answer false: neither can be used to decide that a file is unreferenced.
     /// </summary>
+    /// <summary>Whether the file can be opened at all right now, lock or no lock.</summary>
+    private static bool Readable(string path)
+    {
+        try
+        {
+            using var probe = File.OpenRead(path);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     private static bool FullyReadable(string path)
         => ReadIndex(path) is { } loaded && loaded.All(IsUsable);
 
