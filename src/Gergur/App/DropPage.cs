@@ -93,7 +93,7 @@ internal static class DropPage
               button { background:#dc143c; color:#fff; border:0; border-radius:10px;
                        padding:12px 16px; font:600 15px/1 inherit; width:100%; min-height:48px; }
               a { color:#ff8fa3; }
-              .note { color:#667; font-size:.85rem; margin-top:1.5rem; }
+              .note { color: #9c8288; font-size:.85rem; margin-top:1.5rem; }
             </style></head>
             <body>
             <h1>Send from any app</h1>
@@ -230,12 +230,12 @@ internal static class DropPage
           .file input { display: none; }
           ul { list-style: none; margin: 0; padding: 0 16px 24px; }
           li { border-top: 1px solid #38222a; padding: 12px 0; display: flex; gap: 10px; }
-          .who { font-size: 12px; color: #667; min-width: 44px; padding-top: 2px; }
+          .who { font-size: 12px; color: #9c8288; min-width: 44px; padding-top: 2px; }
           .body { flex: 1; min-width: 0; }
           .body a { color: #ff8fa3; word-break: break-all; }
           .msg { white-space: pre-wrap; word-break: break-word; }
-          .meta { font-size: 12px; color: #667; margin-top: 2px; }
-          .empty { color: #667; text-align: center; padding: 40px 16px; }
+          .meta { font-size: 12px; color: #9c8288; margin-top: 2px; }
+          .empty { color: #9c8288; text-align: center; padding: 40px 16px; }
           .setup { display: block; text-align: center; color: #ff8fa3; font-size: 15px;
             padding: 10px; text-decoration: none; }
         </style>

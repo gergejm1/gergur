@@ -674,10 +674,23 @@ public sealed class UploadNamingTests : IDisposable
         => Assert.Equal((".heic", "Photo"), DropServer.Sniff(Encoding.UTF8.GetBytes("....ftyp" + brand)));
 
     [Theory]
-    [InlineData("M4A ")]   // a voice memo is neither
+    [InlineData("M4A ")]   // a voice memo
+    [InlineData("M4B ")]
+    public void TheSameContainerCarryingSoundIsAudio(string brand)
+        => Assert.Equal((".m4a", "Audio"), DropServer.Sniff(Encoding.UTF8.GetBytes("....ftyp" + brand)));
+
+    [Theory]
     [InlineData("what")]
+    [InlineData("    ")]
     public void AContainerBrandWeDoNotKnowIsNotGuessedAt(string brand)
         => Assert.Equal((".bin", "File"), DropServer.Sniff(Encoding.UTF8.GetBytes("....ftyp" + brand)));
+
+    [Theory]
+    [InlineData("iso4")]   // ordinary web and ffmpeg mp4, which was landing as .bin
+    [InlineData("iso6")]
+    [InlineData("mp4v")]
+    public void TheOrdinaryMp4BrandsAreVideo(string brand)
+        => Assert.Equal((".mov", "Video"), DropServer.Sniff(Encoding.UTF8.GetBytes("....ftyp" + brand)));
 
     [Fact]
     public void APdfIsRecognised()

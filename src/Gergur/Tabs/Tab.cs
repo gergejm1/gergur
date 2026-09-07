@@ -561,14 +561,14 @@ public sealed class Tab : ITabHandle, IDisposable
         <!doctype html>
         <html><head><meta charset="utf-8"><title>Sign-in complete</title>
         <style>
-          html,body{margin:0;height:100%;background:#05040a;color:#e8eef8;
+          html,body{margin:0;height:100%;background:#0a0406;color:#f8eced;
             font:400 16px/1.6 "Segoe UI",system-ui,sans-serif}
           body{display:grid;place-items:center;text-align:center}
           .card{max-width:30rem;padding:2rem}
-          .tick{width:64px;height:64px;border-radius:50%;background:#3d7bfa;margin:0 auto 1.5rem;
+          .tick{width:64px;height:64px;border-radius:50%;background:#fa3d4d;margin:0 auto 1.5rem;
             display:grid;place-items:center;font-size:32px;color:#fff}
           h1{font-size:1.5rem;margin:0 0 .5rem;font-weight:600}
-          p{margin:0;color:#8894ac}
+          p{margin:0;color:#ac8c94}
         </style></head>
         <body><div class="card">
           <div class="tick">&#10003;</div>

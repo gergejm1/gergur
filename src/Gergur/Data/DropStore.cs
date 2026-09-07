@@ -256,8 +256,18 @@ public sealed class DropStore
                 // actually deletes. A list that will not read names nothing to us, which
                 // is not the same as naming nothing, and reading it as the latter deleted
                 // the only record of twenty photos and then quarantined the photos.
+                //
+                // It is set aside instead of deleted, and set aside rather than left,
+                // because leaving it made it immortal: it stays a sibling, so every later
+                // launch sees a list it cannot read and stands the whole sweep down. One
+                // unreadable file quietly turned the tidying off for the life of the
+                // profile, and the drop window said "1 thing set aside" forever.
                 if (!FullyReadable(path))
+                {
+                    Directory.CreateDirectory(OrphansDir);
+                    SetAside(path);
                     continue;
+                }
 
                 if (NamesIn(path).Any(n => n.Length > 0 && File.Exists(Path.Combine(FilesDir, n))))
                     continue;
@@ -337,15 +347,10 @@ public sealed class DropStore
     }
 
     /// <summary>
-    /// Stored names an index file mentions, or nothing when it is missing or unreadable.
-    /// Used to decide what is referenced, so it errs towards naming more rather than less.
+    /// Whether the file can be opened at all right now. Says nothing about its contents:
+    /// a file held by a backup or a scanner answers false and may be perfectly good, and
+    /// that difference is why nothing is deleted on the strength of a failed open.
     /// </summary>
-    /// <summary>
-    /// Whether a list beside the index can be read all the way through. A staging file
-    /// caught mid write, or a copy from a build whose entries this one cannot parse,
-    /// both answer false: neither can be used to decide that a file is unreferenced.
-    /// </summary>
-    /// <summary>Whether the file can be opened at all right now, lock or no lock.</summary>
     private static bool Readable(string path)
     {
         try
@@ -359,9 +364,18 @@ public sealed class DropStore
         }
     }
 
+    /// <summary>
+    /// Whether a list beside the index can be read all the way through. A staging file
+    /// caught mid write, or a copy from a build whose entries this one cannot parse,
+    /// both answer false: neither can be used to decide that a file is unreferenced.
+    /// </summary>
     private static bool FullyReadable(string path)
         => ReadIndex(path) is { } loaded && loaded.All(IsUsable);
 
+    /// <summary>
+    /// Stored names an index file mentions, or nothing when it is missing or unreadable.
+    /// Used to decide what is referenced, so it errs towards naming more rather than less.
+    /// </summary>
     private static IEnumerable<string> NamesIn(string indexPath)
         => ReadIndex(indexPath)?.Where(i => i?.StoredName is not null).Select(i => i.StoredName) ?? [];
 

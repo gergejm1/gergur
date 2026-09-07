@@ -411,10 +411,6 @@ public sealed class DropServer
     }
 
     /// <summary>
-    /// Fixed-time comparison of the pairing key. Length mismatch returns false by design;
-    /// the key is a fixed length, so that leaks nothing an attacker did not already send.
-    /// </summary>
-    /// <summary>
     /// A name for something that arrived without one, from its first bytes and the time.
     /// The alternative is a drop full of items called "file", which is what a photo
     /// shared from the iPhone share sheet gives you: the Shortcut has no filename to put
@@ -441,11 +437,6 @@ public sealed class DropServer
     }
 
     /// <summary>
-    /// What a file starts with, for the handful of things a phone actually sends. Only
-    /// signatures that are unambiguous: anything else keeps the neutral name, because a
-    /// wrong extension is worse than no extension.
-    /// </summary>
-    /// <summary>
     /// The eight bytes every PNG starts with, written as bytes on purpose. As a string
     /// escape this is silently wrong: "\x89" is the character U+0089, which UTF-8 encodes
     /// as two bytes, so the literal never matched a real PNG and every iPhone screenshot
@@ -458,9 +449,26 @@ public sealed class DropServer
     private static readonly HashSet<string> PhotoBrands =
         new(StringComparer.Ordinal) { "heic", "heix", "hevc", "hevx", "heim", "heis", "mif1", "msf1", "avif", "avis" };
 
-    private static readonly HashSet<string> VideoBrands =
-        new(StringComparer.Ordinal) { "qt  ", "isom", "iso2", "mp41", "mp42", "M4V ", "M4VP", "3gp4", "3gp5", "3g2a" };
+    /// <summary>
+    /// The video brands. Long, because the fallback is a file that opens nothing: the
+    /// short version turned an ordinary web MP4 into ".bin", which is a worse answer than
+    /// the guess it replaced.
+    /// </summary>
+    private static readonly HashSet<string> VideoBrands = new(StringComparer.Ordinal)
+    {
+        "qt  ", "isom", "iso2", "iso4", "iso5", "iso6", "mp41", "mp42", "mp4v", "avc1",
+        "M4V ", "M4VP", "mmp4", "dash", "3gp4", "3gp5", "3gp6", "3g2a", "3g2b",
+    };
 
+    /// <summary>The same container carrying sound. A voice memo is one of these.</summary>
+    private static readonly HashSet<string> AudioBrands =
+        new(StringComparer.Ordinal) { "M4A ", "M4B ", "M4P " };
+
+    /// <summary>
+    /// What a file starts with, for the handful of things a phone actually sends. Only
+    /// signatures that are unambiguous: anything else keeps the neutral name, because a
+    /// wrong extension is worse than no extension.
+    /// </summary>
     internal static (string Extension, string Kind) Sniff(ReadOnlySpan<byte> head)
     {
         if (head.Length >= 3 && head[0] == 0xFF && head[1] == 0xD8 && head[2] == 0xFF)
@@ -481,6 +489,8 @@ public sealed class DropServer
                 return (".heic", "Photo");
             if (VideoBrands.Contains(brand))
                 return (".mov", "Video");
+            if (AudioBrands.Contains(brand))
+                return (".m4a", "Audio");
             return (".bin", "File");
         }
         if (head.StartsWith("%PDF-"u8))

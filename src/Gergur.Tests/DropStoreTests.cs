@@ -1344,15 +1344,17 @@ public sealed class DropStoreIndexCopyTests : IDisposable
     }
 
     [Fact]
-    public void ACopyThisBuildCannotFullyReadIsNeverAgedOut()
+    public void ACopyThisBuildCannotFullyReadIsSetAsideRatherThanDeleted()
     {
-        // The whole reason it was kept is that its entries could not be read, so there
-        // is no way to know what it accounts for, and "names nothing I can see" is not
-        // "names nothing". It costs one small file and it is the only record of those
-        // entries; deleting it on a timer is how twenty photos were lost.
+        // Its entries could not be read, so there is no way to know what it accounts
+        // for, and "names nothing I can see" is not "names nothing": deleting it on a
+        // timer is how twenty photos were lost. It is not left where it is either,
+        // because a sibling it cannot read stands the whole sweep down on every launch
+        // after, so one file quietly turned the tidying off for good.
         GiveItAPartialIndex("a", 2);
         new DropStore(_root).AddText("round one", from: "pc");
         string copy = Directory.GetFiles(_root, "items.json.superseded*").Single();
+        string contents = File.ReadAllText(copy);
 
         foreach (string path in Directory.GetFiles(FilesDir))
             File.Delete(path);
@@ -1360,20 +1362,49 @@ public sealed class DropStoreIndexCopyTests : IDisposable
 
         _ = new DropStore(_root);
 
-        Assert.True(File.Exists(copy));
+        Assert.False(File.Exists(copy), "it stayed a sibling and would disable the sweep");
+        Assert.Equal(contents, File.ReadAllText(Directory.GetFiles(OrphansDir).Single()));
     }
 
     [Fact]
-    public void AnIndexCopyIsKeptWhileItStillAccountsForAPhoto()
+    public void TheSweepWorksAgainOnceThatCopyIsOutOfTheWay()
     {
+        // The point of moving it rather than leaving it: an unreadable sibling was making
+        // canDecide false forever, so nothing was ever tidied again on that profile.
         GiveItAPartialIndex("a", 2);
         new DropStore(_root).AddText("round one", from: "pc");
         string copy = Directory.GetFiles(_root, "items.json.superseded*").Single();
         File.SetLastWriteTimeUtc(copy, DateTime.UtcNow.AddDays(-61));
 
+        // A launch that moves the copy aside, then one that can finally decide again.
+        _ = new DropStore(_root);
+        File.WriteAllText(Path.Combine(FilesDir, "stray.jpg"), "referenced by nothing");
         _ = new DropStore(_root);
 
-        Assert.True(File.Exists(copy), "the only record of two photos still on disk was deleted");
+        Assert.DoesNotContain(
+            Directory.GetFiles(FilesDir),
+            p => Path.GetFileName(p) == "stray.jpg");
+    }
+
+    [Fact]
+    public void AnIndexCopyIsKeptWhileItStillAccountsForAPhoto()
+    {
+        // A copy this build can read completely, whose photos are still here. Age alone
+        // is not a reason to remove the only thing that gives them their names.
+        Directory.CreateDirectory(FilesDir);
+        File.WriteAllText(Path.Combine(FilesDir, "a1.jpg"), "photo");
+        File.WriteAllText(IndexPath, "[]");
+        string copy = IndexPath + ".superseded";
+        File.WriteAllText(copy, """
+            [{"Id":"a1","Kind":"file","Text":"holiday.jpg","StoredName":"a1.jpg",
+              "Size":5,"From":"phone","AddedUtc":"2026-01-01T00:00:00Z"}]
+            """);
+        File.SetLastWriteTimeUtc(copy, DateTime.UtcNow.AddDays(-61));
+
+        _ = new DropStore(_root);
+
+        Assert.True(File.Exists(copy), "the only record of a photo still on disk was deleted");
+        Assert.Single(Directory.GetFiles(FilesDir));
     }
 }
 

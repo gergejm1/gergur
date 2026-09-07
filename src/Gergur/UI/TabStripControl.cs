@@ -140,6 +140,17 @@ public sealed class TabStripControl : Control
         }
     }
 
+    /// <summary>
+    /// The colour of the close cross. Dark on the hovered disc, light everywhere else.
+    ///
+    /// The disc was lightened when the theme went red so it would stand out against the
+    /// chrome, and that left the near-white cross on it at 2.76:1, under the 3:1 a
+    /// control needs. Against the same disc the darkest chrome colour reads 6.33:1.
+    /// Separated from the drawing so the ratio can be measured rather than described.
+    /// </summary>
+    internal static Color CloseGlyphColor(bool hovered, bool sleeping)
+        => hovered ? Theme.TabStripBg : sleeping ? Theme.TextDim : Theme.Text;
+
     private void DrawTab(Graphics g, Tab tab, Rectangle rect, int index)
     {
         bool isActive = _tabs?.ActiveTab == tab;
@@ -186,7 +197,7 @@ public sealed class TabStripControl : Control
                 g.FillEllipse(brush, closeRect);
             }
             // Vector ×: text glyphs never center; two strokes always do.
-            var glyphColor = closeHovered ? Theme.Text : isSleeping ? Theme.TextDim : Theme.Text;
+            var glyphColor = CloseGlyphColor(closeHovered, isSleeping);
             using var closePen = new Pen(glyphColor, Math.Max(1.4f, S(3) / 2f))
             {
                 StartCap = LineCap.Round,
