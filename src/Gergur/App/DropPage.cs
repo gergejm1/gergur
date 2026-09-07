@@ -35,17 +35,17 @@ internal static class DropPage
         <style>
           :root { color-scheme: dark; }
           body { margin:0; height:100vh; display:grid; place-items:center; text-align:center;
-                 background:#0a0d16; color:#e8eef8;
+                 background:#160a0e; color:#f8eced;
                  font:400 17px/1.5 -apple-system,"Segoe UI",system-ui,sans-serif; }
           .tick { width:64px; height:64px; border-radius:50%; background:__ACCENT__; margin:0 auto 1.25rem;
                   display:grid; place-items:center; font-size:32px; color:#fff; }
           h1 { font-size:1.35rem; margin:0 0 .35rem; font-weight:600; }
-          p { margin:0; color:#8894ac; }
+          p { margin:0; color:#ac8c94; }
         </style></head>
         <body><div><div class="tick">__GLYPH__</div><h1>__TITLE__</h1><p>__DETAIL__</p></div></body></html>
         """
         // Both of these are chosen here, never passed in, so neither is a way into the markup.
-        .Replace("__ACCENT__", good ? "#3d7bfa" : "#c2503c")
+        .Replace("__ACCENT__", good ? "#dc143c" : "#c07a2c")
         .Replace("__GLYPH__", good ? "&#10003;" : "&#33;")
         .Replace("__TITLE__", Escape(title))
         .Replace("__DETAIL__", Escape(detail));
@@ -79,20 +79,20 @@ internal static class DropPage
             <style>
               :root { color-scheme: dark; }
               * { box-sizing:border-box; }
-              body { margin:0; background:#0a0d16; color:#e8eef8;
+              body { margin:0; background:#160a0e; color:#f8eced;
                      font:400 16px/1.6 -apple-system,"Segoe UI",system-ui,sans-serif;
                      padding: env(safe-area-inset-top) 16px env(safe-area-inset-bottom); }
               h1 { font-size:1.3rem; margin:1.25rem 0 .25rem; }
-              .lead { color:#8894ac; margin:0 0 1.25rem; }
+              .lead { color:#ac8c94; margin:0 0 1.25rem; }
               ol { padding-left:1.2rem; margin:0 0 1.5rem; }
               li { margin-bottom:.85rem; }
-              code { background:#141c30; border:1px solid #2a3a5c; border-radius:6px;
+              code { background:#30141c; border:1px solid #5c2a38; border-radius:6px;
                      padding:.1rem .35rem; font-size:.85rem; }
-              .url { background:#141c30; border:1px solid #2a3a5c; border-radius:10px;
+              .url { background:#30141c; border:1px solid #5c2a38; border-radius:10px;
                      padding:12px; word-break:break-all; font-size:.85rem; margin-bottom:.6rem; }
-              button { background:#3d7bfa; color:#fff; border:0; border-radius:10px;
+              button { background:#dc143c; color:#fff; border:0; border-radius:10px;
                        padding:12px 16px; font:600 15px/1 inherit; width:100%; min-height:48px; }
-              a { color:#6ea2ff; }
+              a { color:#ff8fa3; }
               .note { color:#667; font-size:.85rem; margin-top:1.5rem; }
             </style></head>
             <body>
@@ -196,47 +196,47 @@ internal static class DropPage
         <meta name="apple-mobile-web-app-capable" content="yes">
         <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
         <meta name="apple-mobile-web-app-title" content="Gergur Drop">
-        <meta name="theme-color" content="#0a0d16">
+        <meta name="theme-color" content="#160a0e">
         <title>Gergur Drop</title>
         <style>
           :root { color-scheme: dark; }
           * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
           body {
-            margin: 0; background: #0a0d16; color: #e8eef8;
+            margin: 0; background: #160a0e; color: #f8eced;
             font: 400 16px/1.5 -apple-system, "Segoe UI", system-ui, sans-serif;
             padding: env(safe-area-inset-top) 0 env(safe-area-inset-bottom);
           }
           header {
-            padding: 14px 16px; background: #101625; position: sticky; top: 0;
-            border-bottom: 1px solid #2a3a5c; display: flex; align-items: center; gap: 10px;
+            padding: 14px 16px; background: #251016; position: sticky; top: 0;
+            border-bottom: 1px solid #5c2a38; display: flex; align-items: center; gap: 10px;
           }
           header h1 { font-size: 17px; margin: 0; font-weight: 600; flex: 1; }
-          #status { font-size: 13px; color: #8894ac; }
+          #status { font-size: 13px; color: #ac8c94; }
           .compose { padding: 12px 16px; display: flex; gap: 8px; align-items: flex-end; }
           textarea {
-            flex: 1; background: #141c30; color: #e8eef8; border: 1px solid #2a3a5c;
+            flex: 1; background: #30141c; color: #f8eced; border: 1px solid #5c2a38;
             border-radius: 10px; padding: 10px 12px; font: inherit; resize: none; min-height: 44px;
           }
           button {
-            background: #3d7bfa; color: #fff; border: 0; border-radius: 10px;
+            background: #dc143c; color: #fff; border: 0; border-radius: 10px;
             padding: 12px 16px; font: 600 15px/1 inherit; min-height: 44px;
           }
           button:disabled { opacity: .5; }
           .file { padding: 0 16px 12px; }
           .file label {
-            display: block; text-align: center; padding: 12px; border: 1px dashed #2a3a5c;
-            border-radius: 10px; color: #8894ac; font-size: 15px;
+            display: block; text-align: center; padding: 12px; border: 1px dashed #5c2a38;
+            border-radius: 10px; color: #ac8c94; font-size: 15px;
           }
           .file input { display: none; }
           ul { list-style: none; margin: 0; padding: 0 16px 24px; }
-          li { border-top: 1px solid #1a2338; padding: 12px 0; display: flex; gap: 10px; }
+          li { border-top: 1px solid #38222a; padding: 12px 0; display: flex; gap: 10px; }
           .who { font-size: 12px; color: #667; min-width: 44px; padding-top: 2px; }
           .body { flex: 1; min-width: 0; }
-          .body a { color: #6ea2ff; word-break: break-all; }
+          .body a { color: #ff8fa3; word-break: break-all; }
           .msg { white-space: pre-wrap; word-break: break-word; }
           .meta { font-size: 12px; color: #667; margin-top: 2px; }
           .empty { color: #667; text-align: center; padding: 40px 16px; }
-          .setup { display: block; text-align: center; color: #6ea2ff; font-size: 15px;
+          .setup { display: block; text-align: center; color: #ff8fa3; font-size: 15px;
             padding: 10px; text-decoration: none; }
         </style>
         </head>

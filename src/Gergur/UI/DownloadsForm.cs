@@ -284,7 +284,9 @@ public sealed class DownloadsForm : Form
         {
             double fraction = Math.Clamp(running.BytesReceived / (double)running.TotalBytes, 0, 1);
             var bar = e.Bounds with { Width = (int)(e.Bounds.Width * fraction) };
-            using var progress = new SolidBrush(Color.FromArgb(38, 61, 123, 250));
+            // The chrome accent at the same wash it always was, so a row in flight reads
+            // as the same colour as the rest of the browser rather than a leftover blue.
+            using var progress = new SolidBrush(Color.FromArgb(38, Theme.Accent));
             e.Graphics.FillRectangle(progress, bar);
         }
 
