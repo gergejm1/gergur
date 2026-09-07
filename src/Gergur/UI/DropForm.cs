@@ -22,7 +22,7 @@ public sealed class DropForm : Form
     private readonly ListView _list;
     private readonly TextBox _compose;
     private readonly Panel _footer;
-    private readonly Label _count;
+    private readonly LinkLabel _count;
     private readonly Button _sendButton;
     private readonly Button _openButton;
     private readonly Button _folderButton;
@@ -117,13 +117,20 @@ public sealed class DropForm : Form
         };
         composeHost.Controls.Add(_compose);
 
-        _count = new Label
+        // A link rather than a label, because the notice is the only route to the files
+        // that were set aside, and a Label takes no focus and has no accessible role:
+        // the way back to your own photos was mouse-only.
+        _count = new LinkLabel
         {
             ForeColor = Palette.TextDim,
+            LinkColor = Palette.TextDim,
+            ActiveLinkColor = Palette.Text,
+            LinkBehavior = LinkBehavior.HoverUnderline,
             TextAlign = ContentAlignment.MiddleLeft,
             // A hard cut with no ellipsis reads as a finished sentence that happens to
             // stop. If there is genuinely no room, say so with the dots.
             AutoEllipsis = true,
+            TabStop = false,
         };
         // Files are set aside under the profile, where nobody would ever find them.
         // Telling the user it happened is only half of it; this is the other half.
@@ -131,7 +138,7 @@ public sealed class DropForm : Form
         // The drop folder rather than the quarantine folder: what was set aside can be a
         // file in orphans or an index written beside items.json, and opening a folder
         // this handler had to create to have somewhere to point at is worse than useless.
-        _count.Click += (_, _) => OpenSetAsideFolder();
+        _count.LinkClicked += (_, _) => OpenSetAsideFolder();
         _sendButton = MakeButton("Send", (_, _) => Send());
         _openButton = MakeButton("Open", (_, _) => OpenSelected());
         _folderButton = MakeButton("Show in folder", (_, _) => ShowInFolder());
@@ -198,7 +205,8 @@ public sealed class DropForm : Form
             Reload();
     }
 
-    private void Reload()
+    /// <summary>Rebuilds the list and re-measures the footer. Internal for the layout test.</summary>
+    internal void Reload()
     {
         // Remember what was selected, not where it was. The list is newest first and the
         // phone can add a row at any moment, so restoring by position quietly moves the
@@ -243,7 +251,13 @@ public sealed class DropForm : Form
 
         int setAside = _drop.SetAsideCount;
         _count.Text = CountText(_drop.Items.Count, setAside);
-        _count.Cursor = setAside > 0 ? Cursors.Hand : Cursors.Default;
+        _count.TabStop = setAside > 0;
+
+        // The footer is measured from this text, and nothing else re-measures it: the
+        // reservation was sized from whatever the label said at the last resize, so the
+        // notice appearing mid-session (which is a supported event, a recovery file being
+        // written) got the width of "3 items" to say twenty words in.
+        LayoutFooter();
         UpdateButtons();
         LayoutColumns();
     }
@@ -368,8 +382,10 @@ public sealed class DropForm : Form
         // what they give up here is the tail of a caption, not the ability to be clicked.
         int row = _footer.ClientSize.Width - (pad * 2) - (gap * (buttons.Length - 1));
         int floor = Scale(40) * buttons.Length;
-        int countWanted = TextRenderer.MeasureText(_count.Text, _count.Font).Width + gap;
-        int countRoom = Math.Clamp(Math.Min(countWanted, Scale(200)), 0, Math.Max(0, row - floor));
+        // No spare gap in the ask: the label is placed with one gap already taken out
+        // below, so adding one here promised 200px and handed over 186.
+        int countWanted = TextRenderer.MeasureText(_count.Text, _count.Font).Width;
+        int countRoom = Math.Clamp(Math.Min(countWanted + gap, Scale(200) + gap), 0, Math.Max(0, row - floor));
 
         int available = row - countRoom;
         int needed = widths.Sum();
@@ -443,5 +459,5 @@ public sealed class DropForm : Form
         => (_footer, [_sendButton, _openButton, _folderButton, _removeButton]);
 
     /// <summary>The count label, for the test that it is not squeezed out of existence.</summary>
-    internal Label CountLabel => _count;
+    internal LinkLabel CountLabel => _count;
 }

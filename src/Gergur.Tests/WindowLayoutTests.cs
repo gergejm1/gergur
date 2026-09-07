@@ -183,6 +183,7 @@ public sealed class DropFooterLabelTests
                 form.CountLabel.Width >= 120,
                 $"at {width}px the set-aside notice had {form.CountLabel.Width}px and shows nothing");
             Assert.True(form.CountLabel.AutoEllipsis, "and what it cannot show needs a mark");
+            Assert.True(form.CountLabel.TabStop, "the way back to the files must be reachable by keyboard");
 
             foreach (var button in form.FooterControls.Buttons)
             {
@@ -198,13 +199,22 @@ public sealed class DropFooterLabelTests
         string root = Path.Combine(Path.GetTempPath(), $"gergur-label-{Guid.NewGuid():N}");
         try
         {
-            using var form = new Gergur.UI.DropForm(new Gergur.Data.DropStore(root), _ => { });
+            // The state the notice exists for, which is also the state that squeezes the
+            // row. Set up on disk so the real code path produces it: setting the label
+            // text and calling LayoutFooter by hand passed while the shipped window
+            // showed 93 pixels of it, because Reload never re-measured the footer.
+            Directory.CreateDirectory(Path.Combine(root, "orphans"));
+            File.WriteAllText(Path.Combine(root, "orphans", "a1.jpg"), "x");
+            File.WriteAllText(Path.Combine(root, "orphans", "a2.jpg"), "y");
+            var store = new Gergur.Data.DropStore(root);
+            store.AddText("one", from: "pc");
+            store.AddText("two", from: "pc");
+            store.AddText("three", from: "pc");
+
+            using var form = new Gergur.UI.DropForm(store, _ => { });
             _ = form.Handle;
             form.ClientSize = new Size(width, 560);
-            // The state the notice exists for, which is also the state that squeezes the
-            // row: an empty store leaves a short label and hides the problem.
-            form.CountLabel.Text = Gergur.UI.DropForm.CountText(items: 3, setAside: 2);
-            form.LayoutFooter();
+            form.Reload();
             check(form);
         }
         finally { try { Directory.Delete(root, recursive: true); } catch { } }

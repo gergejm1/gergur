@@ -61,6 +61,16 @@ public sealed class DropStore
     /// </summary>
     private bool _indexPartial;
 
+    /// <summary>
+    /// Where this session writes when it may not touch the index. Resolved once, so a
+    /// second session that also cannot read the index does not overwrite the first
+    /// session's work: that turned "your work is preserved, just not reloaded" into
+    /// "your work is gone".
+    /// </summary>
+    private string? _recoveryPath;
+
+    private string RecoveryPath => _recoveryPath ??= FreeName(IndexPath + ".recovered");
+
     /// <summary>Raised whenever the list changes, from either side.</summary>
     public event EventHandler<DropItem>? ItemAdded;
     public event EventHandler? Changed;
@@ -95,16 +105,22 @@ public sealed class DropStore
     {
         try
         {
+            // Anything already here is old enough to go before anything new arrives.
+            // Running this last let a file be set aside and pruned in the same pass, on
+            // the strength of a timestamp, which is how the ninth pass lost twenty photos.
+            PruneOrphans();
+
             // Every list that names a file, not only the one in memory. A session that
             // opened while the index was locked wrote its work to the recovery file, and
             // a photo that arrived during it is named there and nowhere else. Reading
             // only the current index made that photo unreferenced on the next launch and
             // set it aside: the mapping from file to name existed, and we threw it away.
+            //
+            // Found by enumeration rather than by a list of names. The names are chosen
+            // by FreeName, which numbers them when one is taken, and a hardcoded list of
+            // four missed every ".superseded-2" the moment a profile had two of them.
             var referenced = _items.Select(i => i.StoredName)
-                .Concat(NamesIn(IndexPath + ".recovered"))
-                .Concat(NamesIn(IndexPath + ".recovered.tmp"))
-                .Concat(NamesIn(IndexPath + ".superseded"))
-                .Concat(NamesIn(IndexPath + ".tmp"))
+                .Concat(IndexSiblings().SelectMany(NamesIn))
                 .Where(name => name.Length > 0)
                 .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
@@ -139,11 +155,58 @@ public sealed class DropStore
                     File.Delete(staging);
             }
 
-            PruneOrphans();
+            PruneIndexCopies();
         }
         catch
         {
             // Housekeeping. Never worth failing to open the drop over.
+        }
+    }
+
+    /// <summary>
+    /// Every file sitting beside the index: the staging file, and the copies kept when
+    /// one could not be read or could not be fully used. Enumerated rather than named,
+    /// because the names are numbered when one is already taken and a written-out list
+    /// stops being complete the second time anything goes wrong on a profile.
+    /// </summary>
+    private IEnumerable<string> IndexSiblings()
+    {
+        try
+        {
+            return Directory.EnumerateFiles(_root, Path.GetFileName(IndexPath) + ".*").ToArray();
+        }
+        catch
+        {
+            return [];
+        }
+    }
+
+    /// <summary>
+    /// Removes index copies that are old and no longer account for anything: every file
+    /// they named is gone from the drop. Without this they accumulate forever, and every
+    /// name in them is exempt from the sweep for as long as they sit there, so the footer
+    /// notice can never go back to saying nothing.
+    /// </summary>
+    private void PruneIndexCopies()
+    {
+        var cutoff = DateTime.UtcNow - OrphanLifetime;
+        foreach (string path in IndexSiblings())
+        {
+            // The staging file has its own rule above; leave it alone.
+            if (path.EndsWith(".tmp", StringComparison.OrdinalIgnoreCase))
+                continue;
+            try
+            {
+                if (File.GetLastWriteTimeUtc(path) >= cutoff)
+                    continue;
+                if (NamesIn(path).Any(n => n.Length > 0 && File.Exists(Path.Combine(FilesDir, n))))
+                    continue;
+                File.Delete(path);
+            }
+            catch
+            {
+                // Housekeeping only.
+            }
         }
     }
 
@@ -155,6 +218,9 @@ public sealed class DropStore
     /// there. Two files can carry the same stored name across a restore or a copied
     /// profile, and a function whose whole point is that tidying loses nothing cannot
     /// take one of them out on the way past.
+    ///
+    /// Numbered before the extension rather than after it, which is why this is not
+    /// <see cref="FreeName"/>: "a1-2.jpg" still opens, "a1.jpg-2" does not.
     /// </summary>
     private void SetAside(string path)
     {
@@ -657,9 +723,18 @@ public sealed class DropStore
         return preferred + "-" + Guid.NewGuid().ToString("N")[..8];
     }
 
-    private static void TryCopy(string from, string to)
+    private static bool TryCopy(string from, string to)
     {
-        try { File.Copy(from, to, overwrite: true); } catch { }
+        try
+        {
+            File.Copy(from, to, overwrite: true);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            DebugLog.Write($"could not keep a copy of the index: {ex.Message}");
+            return false;
+        }
     }
 
     /// <summary>
@@ -723,9 +798,20 @@ public sealed class DropStore
             // Gated on this session, not on whether a copy happens to exist already: an
             // on-disk latch meant the second partial index this profile ever saw was
             // overwritten with nothing kept, because round one had claimed the name.
+            //
+            // The flag is only cleared when the copy actually happened. Clearing it
+            // regardless spent the one chance on a copy that failed, and the write below
+            // then replaced the original with the reduced list and nothing kept: the same
+            // lock from a backup or a scanner that the rest of this method is written for.
             if (_indexPartial && File.Exists(IndexPath))
-                TryCopy(IndexPath, FreeName(IndexPath + ".superseded"));
-            _indexPartial = false;
+            {
+                if (TryCopy(IndexPath, FreeName(IndexPath + ".superseded")))
+                    _indexPartial = false;
+            }
+            else
+            {
+                _indexPartial = false;
+            }
 
             // An index we could not read is never written over. It reads as empty in
             // memory, so overwriting it replaces everything the user had with whatever
@@ -733,7 +819,10 @@ public sealed class DropStore
             // by a backup or a virus scanner as real corruption. Writing beside it keeps
             // both: the original for a later launch that can read it, and this session's
             // work in a file that is plainly named.
-            string target = _indexUnreadable ? IndexPath + ".recovered" : IndexPath;
+            //
+            // A partial index whose copy could not be made goes the same way: the list in
+            // memory is missing entries, so it is not allowed to become the index.
+            string target = _indexUnreadable || _indexPartial ? RecoveryPath : IndexPath;
 
             // Write beside it and move into place. A direct write that is interrupted
             // leaves a truncated index, which loads as an empty drop and orphans every

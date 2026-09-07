@@ -92,11 +92,18 @@ personal: read what the task requires, nothing more.
   Shortcut is one action for a GET, there is no ambient authority to forge, and the
   key is the only credential.
 - The drop moves files nothing refers to into `drop/orphans` when it opens, rather
-  than deleting them: this judgement has been wrong twice, both times costing a photo.
-  It also stands down entirely unless the index parsed and every entry survived, and
-  it counts the recovery index (`items.json.recovered`, written when the real one
-  could not be read) as referencing files too. The drop window says how many files
-  are set aside and opens the folder when you click it.
+  than deleting them: this judgement was wrong four separate times in review, each
+  time costing a photo. It stands down entirely unless the index parsed and every
+  entry survived, and before deciding anything is unreferenced it reads every file
+  sitting beside `items.json` (the staging file, and the copies kept when an index
+  could not be read or could not be fully used, which are numbered when a name is
+  already taken). Those are found by enumeration, never by a list of names: a written
+  out list is how a numbered copy stopped protecting anything. Quarantined files and
+  spent index copies are pruned after 60 days, dated from when they were set aside.
+  The drop window says how many things are set aside and opens the folder on click.
+- `items.json.recovered*` is a session's work written beside an index it was not
+  allowed to touch. Nothing reads it back into the list yet; it is preserved, counted
+  and pointed at, and merging it is the obvious next thing here.
 
 Agent actions are visualized: /click and /type animate a blue cursor to the
 target, ripple, and flash the element, so the user can watch the agent work.

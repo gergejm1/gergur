@@ -1177,3 +1177,180 @@ public sealed class DropStoreCompoundLossTests : IDisposable
             "photos were set aside even though a kept index still names them");
     }
 }
+
+/// <summary>
+/// The copies kept beside the index. Their names are numbered when one is taken, and the
+/// sweep used to look for four literal names, so the second copy a profile ever made
+/// protected nothing: every photo it accounted for was set aside on the next launch.
+/// </summary>
+public sealed class DropStoreIndexCopyTests : IDisposable
+{
+    private readonly string _root = Path.Combine(Path.GetTempPath(), $"gergur-copies-{Guid.NewGuid():N}");
+
+    public void Dispose()
+    {
+        try { Directory.Delete(_root, recursive: true); } catch { }
+    }
+
+    private string IndexPath => Path.Combine(_root, "items.json");
+    private string FilesDir => Path.Combine(_root, "files");
+    private string OrphansDir => Path.Combine(_root, "orphans");
+
+    private int OrphanCount => Directory.Exists(OrphansDir) ? Directory.GetFiles(OrphansDir).Length : 0;
+
+    /// <summary>An index this build cannot use, naming files that do exist.</summary>
+    private void GiveItAPartialIndex(string prefix, int count)
+    {
+        Directory.CreateDirectory(FilesDir);
+        var entries = Enumerable.Range(1, count).Select(n =>
+        {
+            File.WriteAllText(Path.Combine(FilesDir, $"{prefix}{n}.jpg"), $"photo {prefix}{n}");
+            return $$"""
+                {"Id":"{{prefix}}{{n}}","Kind":"file","Text":null,"StoredName":"{{prefix}}{{n}}.jpg",
+                 "Size":8,"From":"phone","AddedUtc":"2026-01-01T00:00:00Z"}
+                """;
+        });
+        File.WriteAllText(IndexPath, "[" + string.Join(",", entries) + "]");
+    }
+
+    [Fact]
+    public void TheSecondCopyProtectsItsPhotosJustLikeTheFirst()
+    {
+        GiveItAPartialIndex("a", 20);
+        new DropStore(_root).AddText("round one", from: "pc");
+
+        GiveItAPartialIndex("b", 20);
+        new DropStore(_root).AddText("round two", from: "pc");
+
+        // Round two's copy is numbered, because round one took the plain name.
+        Assert.Equal(2, Directory.GetFiles(_root, "items.json.superseded*").Length);
+
+        _ = new DropStore(_root);
+
+        Assert.Equal(40, Directory.GetFiles(FilesDir).Length);
+        Assert.Equal(0, OrphanCount);
+    }
+
+    [Fact]
+    public void APromotionOnAProfileThatAlreadyHasACopyDoesNotStrandItsPhotos()
+    {
+        // The promotion path numbers its copy too, and the sweep runs later in the same
+        // constructor: twenty photos went to orphans on that launch.
+        GiveItAPartialIndex("a", 20);
+        new DropStore(_root).AddText("round one", from: "pc");
+
+        // An ordinary readable index naming twenty photos, plus an interrupted save.
+        GiveItAPartialIndex("b", 20);
+        string readable = File.ReadAllText(IndexPath).Replace("\"Text\":null", "\"Text\":\"photo.jpg\"");
+        File.WriteAllText(IndexPath, readable);
+        string staging = IndexPath + ".tmp";
+        File.WriteAllText(staging, """
+            [{"Id":"n1","Kind":"text","Text":"a note","StoredName":"",
+              "Size":6,"From":"pc","AddedUtc":"2026-01-01T00:00:00Z"}]
+            """);
+        File.SetLastWriteTimeUtc(staging, DateTime.UtcNow.AddHours(1));
+
+        _ = new DropStore(_root);
+
+        Assert.Equal(40, Directory.GetFiles(FilesDir).Length);
+        Assert.Equal(0, OrphanCount);
+    }
+
+    [Fact]
+    public void ACopyThatCouldNotBeMadeDoesNotCountAsMade()
+    {
+        // The copy is the only thing standing between a reduced list and the original,
+        // and it gets one chance per session. Clearing the flag whether or not it
+        // succeeded spent that chance on a copy that never happened.
+        //
+        // The lock has to land after the load and before the save, which is the real
+        // window: a scanner or a backup taking the file while the drop is open.
+        GiveItAPartialIndex("a", 20);
+        string original = File.ReadAllText(IndexPath);
+
+        var drop = new DropStore(_root);
+        using (File.Open(IndexPath, FileMode.Open, FileAccess.Read, FileShare.None))
+        {
+            drop.AddText("while it was held", from: "pc");
+        }
+
+        // Released now. The next save must still keep a copy before it writes.
+        drop.AddText("after it was released", from: "pc");
+
+        var copies = Directory.GetFiles(_root, "items.json.superseded*");
+        Assert.Single(copies);
+        Assert.Equal(original, File.ReadAllText(copies[0]));
+        Assert.Equal(20, Directory.GetFiles(FilesDir).Length);
+    }
+
+    [Fact]
+    public void OneFileThatWillNotMoveDoesNotStopTheRest()
+    {
+        // Everything after the set-aside loop is housekeeping the drop depends on, and a
+        // single locked file used to throw out of the whole sweep.
+        Directory.CreateDirectory(FilesDir);
+        foreach (string name in new[] { "a1.jpg", "a2.jpg", "a3.jpg" })
+            File.WriteAllText(Path.Combine(FilesDir, name), name);
+        File.WriteAllText(IndexPath, "[]");
+
+        using (File.Open(Path.Combine(FilesDir, "a2.jpg"), FileMode.Open, FileAccess.Read, FileShare.None))
+        {
+            _ = new DropStore(_root);
+        }
+
+        // The two that could move did, and the one that could not is still in the drop
+        // rather than half moved or lost.
+        Assert.Equal(2, OrphanCount);
+        Assert.Equal("a2.jpg", Path.GetFileName(Directory.GetFiles(FilesDir).Single()));
+    }
+
+    [Fact]
+    public void ASecondSessionDoesNotOverwriteTheFirstSessionsRecoveryList()
+    {
+        new DropStore(_root).AddFile("holiday.jpg", new MemoryStream([1, 2, 3]), from: "phone");
+
+        foreach (string note in new[] { "first session", "second session" })
+        {
+            using var held = File.Open(IndexPath, FileMode.Open, FileAccess.Read, FileShare.None);
+            new DropStore(_root).AddText(note, from: "pc");
+        }
+
+        var lists = Directory.GetFiles(_root, "items.json.recovered*").Select(File.ReadAllText).ToList();
+
+        Assert.Equal(2, lists.Count);
+        Assert.Contains(lists, text => text.Contains("first session"));
+        Assert.Contains(lists, text => text.Contains("second session"));
+    }
+
+    [Fact]
+    public void AnIndexCopyIsRemovedOnceNothingItNamesIsLeft()
+    {
+        GiveItAPartialIndex("a", 2);
+        new DropStore(_root).AddText("round one", from: "pc");
+        string copy = Directory.GetFiles(_root, "items.json.superseded*").Single();
+
+        // The photos are gone from the drop, and the copy is old. It accounts for
+        // nothing now, and nothing else ever removes it.
+        foreach (string path in Directory.GetFiles(FilesDir))
+            File.Delete(path);
+        File.SetLastWriteTimeUtc(copy, DateTime.UtcNow.AddDays(-61));
+
+        var drop = new DropStore(_root);
+
+        Assert.False(File.Exists(copy));
+        Assert.Equal(0, drop.SetAsideCount);
+    }
+
+    [Fact]
+    public void AnIndexCopyIsKeptWhileItStillAccountsForAPhoto()
+    {
+        GiveItAPartialIndex("a", 2);
+        new DropStore(_root).AddText("round one", from: "pc");
+        string copy = Directory.GetFiles(_root, "items.json.superseded*").Single();
+        File.SetLastWriteTimeUtc(copy, DateTime.UtcNow.AddDays(-61));
+
+        _ = new DropStore(_root);
+
+        Assert.True(File.Exists(copy), "the only record of two photos still on disk was deleted");
+    }
+}
