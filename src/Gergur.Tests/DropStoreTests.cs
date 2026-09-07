@@ -1354,3 +1354,114 @@ public sealed class DropStoreIndexCopyTests : IDisposable
         Assert.True(File.Exists(copy), "the only record of two photos still on disk was deleted");
     }
 }
+
+/// <summary>
+/// The housekeeping that removes spent index copies, and the one file it must never
+/// touch. Windows treats a trailing ".*" as "extension optional", so the pattern that
+/// finds the copies also matches the index itself.
+/// </summary>
+public sealed class DropStoreIndexPruneTests : IDisposable
+{
+    private readonly string _root = Path.Combine(Path.GetTempPath(), $"gergur-prune-{Guid.NewGuid():N}");
+
+    public void Dispose()
+    {
+        try { Directory.Delete(_root, recursive: true); } catch { }
+    }
+
+    private string IndexPath => Path.Combine(_root, "items.json");
+
+    [Fact]
+    public void ADropOfNothingButMessagesSurvivesBeingLeftAlone()
+    {
+        // No entry names a file, so nothing the prune looks for is on disk, and after
+        // sixty days the index is older than the cutoff. It was deleted on open, and the
+        // whole drop went with it, silently.
+        var first = new DropStore(_root);
+        first.AddText("the wifi password is on the fridge", from: "phone");
+        first.AddText("https://example.com/flat-viewing", from: "phone");
+        File.SetLastWriteTimeUtc(IndexPath, DateTime.UtcNow.AddDays(-61));
+
+        _ = new DropStore(_root);
+        var reopened = new DropStore(_root);
+
+        Assert.True(File.Exists(IndexPath), "the live index was pruned as though it were a copy");
+        Assert.Equal(2, reopened.Items.Count);
+    }
+
+    [Fact]
+    public void ARecoveryListIsNotAgedOutWhileNothingReadsItBack()
+    {
+        // It is a session's own work and the only copy of it, so it is not ours to
+        // expire on a timer. CLAUDE.md says it is preserved; this is that promise.
+        new DropStore(_root).AddFile("holiday.jpg", new MemoryStream([1, 2, 3]), from: "phone");
+        using (File.Open(IndexPath, FileMode.Open, FileAccess.Read, FileShare.None))
+        {
+            new DropStore(_root).AddText("the address of the flat viewing", from: "pc");
+        }
+
+        string recovered = Directory.GetFiles(_root, "items.json.recovered*").Single();
+        File.SetLastWriteTimeUtc(recovered, DateTime.UtcNow.AddDays(-61));
+
+        _ = new DropStore(_root);
+
+        Assert.True(File.Exists(recovered), "a session's only record of its own work was aged out");
+    }
+
+    [Fact]
+    public void ACopyOfAnOldIndexIsNotBornExpired()
+    {
+        // Move and copy both keep the source's write time, so a copy of an index last
+        // touched two months ago was already past the cutoff the moment it was made.
+        //
+        // The entries name a file that is no longer on disk, which is the case where the
+        // copy is all that is left of it: its name, its date, and when it arrived. That
+        // is also the only case the prune will consider deleting, so it is the one that
+        // shows whether the copy was born expired.
+        Directory.CreateDirectory(Path.Combine(_root, "files"));
+        File.WriteAllText(IndexPath, """
+            [{"Id":"a1","Kind":"file","Text":null,"StoredName":"a1.jpg",
+              "Size":5,"From":"phone","AddedUtc":"2026-01-01T00:00:00Z"}]
+            """);
+        File.SetLastWriteTimeUtc(IndexPath, DateTime.UtcNow.AddDays(-61));
+
+        new DropStore(_root).AddText("a note", from: "pc");
+        Assert.Single(Directory.GetFiles(_root, "items.json.superseded*"));
+
+        // The prune only runs when a store opens, so the copy has to survive the launch
+        // after the one that made it. That is where an inherited write time kills it.
+        _ = new DropStore(_root);
+
+        Assert.Single(Directory.GetFiles(_root, "items.json.superseded*"));
+    }
+
+    [Fact]
+    public void ACopyThisBuildCannotReadStopsItDecidingWhatIsUnused()
+    {
+        // The copy is read by the same parser that failed on the entries it was kept for.
+        // Filtering those names out and then calling the rest unreferenced set twenty
+        // photos aside two launches after the build that could not read them.
+        // StoredName is the field the later build renamed, which is the case that bites:
+        // it is the one the copy is read for, so filtering those entries out leaves the
+        // copy naming nothing at all while still looking like a readable list.
+        Directory.CreateDirectory(Path.Combine(_root, "files"));
+        var entries = Enumerable.Range(1, 20).Select(n =>
+        {
+            File.WriteAllText(Path.Combine(_root, "files", $"a{n}.jpg"), $"photo {n}");
+            return $$"""
+                {"Id":"a{{n}}","Kind":"file","Text":"photo{{n}}.jpg","StoredName":null,
+                 "Size":8,"From":"phone","AddedUtc":"2026-01-01T00:00:00Z"}
+                """;
+        });
+        File.WriteAllText(IndexPath, "[" + string.Join(",", entries) + "]");
+
+        // Launch one keeps the copy and writes a small readable index beside it.
+        new DropStore(_root).AddText("a note", from: "pc");
+
+        // Launch two: the index is intact, so the sweep would ordinarily run.
+        _ = new DropStore(_root);
+
+        Assert.Equal(20, Directory.GetFiles(Path.Combine(_root, "files")).Length);
+        Assert.False(Directory.Exists(Path.Combine(_root, "orphans")));
+    }
+}

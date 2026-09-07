@@ -414,6 +414,59 @@ public sealed class DropServer
     /// the key is a fixed length, so that leaks nothing an attacker did not already send.
     /// </summary>
     /// <summary>
+    /// A name for something that arrived without one, from its first bytes and the time.
+    /// The alternative is a drop full of items called "file", which is what a photo
+    /// shared from the iPhone share sheet gives you: the Shortcut has no filename to put
+    /// in the url, so the only thing that knows what this is, is the content.
+    /// </summary>
+    internal static string NameFromContent(string path)
+    {
+        string extension = ".bin";
+        string kind = "File";
+        try
+        {
+            using var file = File.OpenRead(path);
+            Span<byte> head = stackalloc byte[16];
+            int read = file.ReadAtLeast(head, head.Length, throwOnEndOfStream: false);
+            (extension, kind) = Sniff(head[..read]);
+        }
+        catch
+        {
+            // Unreadable is not worth failing the upload over; it keeps the plain name.
+        }
+        return $"{kind} {DateTime.Now:yyyy-MM-dd HH.mm.ss}{extension}";
+    }
+
+    /// <summary>
+    /// What a file starts with, for the handful of things a phone actually sends. Only
+    /// signatures that are unambiguous: anything else keeps the neutral name, because a
+    /// wrong extension is worse than no extension.
+    /// </summary>
+    internal static (string Extension, string Kind) Sniff(ReadOnlySpan<byte> head)
+    {
+        if (head.Length >= 3 && head[0] == 0xFF && head[1] == 0xD8 && head[2] == 0xFF)
+            return (".jpg", "Photo");
+        if (head.StartsWith("\x89PNG\r\n\x1a\n"u8))
+            return (".png", "Photo");
+        if (head.StartsWith("GIF87a"u8) || head.StartsWith("GIF89a"u8))
+            return (".gif", "Photo");
+        if (head.Length >= 12 && head[..4].SequenceEqual("RIFF"u8) && head[8..12].SequenceEqual("WEBP"u8))
+            return (".webp", "Photo");
+        if (head.Length >= 12 && head[4..8].SequenceEqual("ftyp"u8))
+        {
+            // The same container carries both, and the brand is what separates them.
+            var brand = head[8..12];
+            return brand.SequenceEqual("heic"u8) || brand.SequenceEqual("heix"u8)
+                || brand.SequenceEqual("hevc"u8) || brand.SequenceEqual("mif1"u8)
+                ? (".heic", "Photo")
+                : (".mov", "Video");
+        }
+        if (head.StartsWith("%PDF-"u8))
+            return (".pdf", "Document");
+        return (".bin", "File");
+    }
+
+    /// <summary>
     /// Fixed-time comparison against the key, encoded once by the caller: a query can
     /// carry thousands of "k=" values and each one used to encode the key again.
     /// Length mismatch returns false by design; the key is a fixed length, so that leaks
@@ -593,7 +646,14 @@ public sealed class DropServer
                             """{"error":"transfer did not complete; nothing was saved"}"""u8.ToArray());
                         return;
                     }
-                    _store.AddFileFromPath(name ?? "file", staging, from: "phone");
+                    // A share-sheet Shortcut posting a photo has no filename to send:
+                    // Photos does not give one to the shortcut, and a url can only carry
+                    // what the Shortcut can put in it. Everything would land as "file",
+                    // so name it from what it turns out to be.
+                    _store.AddFileFromPath(
+                        string.IsNullOrWhiteSpace(name) ? NameFromContent(staging) : name,
+                        staging,
+                        from: "phone");
                 }
                 finally
                 {

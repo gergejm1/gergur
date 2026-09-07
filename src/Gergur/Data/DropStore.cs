@@ -124,8 +124,19 @@ public sealed class DropStore
                 .Where(name => name.Length > 0)
                 .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
+            // The copies are read by the same parser that could not read the entries they
+            // were kept for, so a name it filters out is not "no name": it is a name we
+            // could not read. Standing down over the index and then trusting a half read
+            // of its copy protected nothing in exactly the case the copy exists for, and
+            // twenty photos went to orphans two launches later. Same doctrine either way:
+            // if a list cannot be read in full, this launch cannot say what is unused.
+            //
+            // Only the deciding stops. The housekeeping below it is not a judgement about
+            // any file the user owns.
+            bool canDecide = IndexSiblings().All(FullyReadable);
+
             bool made = false;
-            foreach (string path in Directory.EnumerateFiles(FilesDir))
+            foreach (string path in canDecide ? Directory.EnumerateFiles(FilesDir) : [])
             {
                 if (referenced.Contains(Path.GetFileName(path)))
                     continue;
@@ -173,7 +184,15 @@ public sealed class DropStore
     {
         try
         {
-            return Directory.EnumerateFiles(_root, Path.GetFileName(IndexPath) + ".*").ToArray();
+            // The index itself is excluded by name, not by trusting the pattern. Windows
+            // treats a trailing ".*" as "extension optional", so "items.json.*" matches
+            // "items.json", and the prune below then read the live index as a spent copy
+            // and deleted it: a drop of nothing but messages, untouched for sixty days,
+            // emptied itself on open.
+            string mine = Path.GetFileName(IndexPath);
+            return Directory.EnumerateFiles(_root, mine + ".*")
+                .Where(p => !string.Equals(Path.GetFileName(p), mine, StringComparison.OrdinalIgnoreCase))
+                .ToArray();
         }
         catch
         {
@@ -192,9 +211,23 @@ public sealed class DropStore
         var cutoff = DateTime.UtcNow - OrphanLifetime;
         foreach (string path in IndexSiblings())
         {
+            // Said twice on purpose. IndexSiblings already excludes it, and this is the
+            // line that deletes, so it does not take that on trust.
+            if (string.Equals(Path.GetFileName(path), Path.GetFileName(IndexPath),
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
             // The staging file has its own rule above; leave it alone.
             if (path.EndsWith(".tmp", StringComparison.OrdinalIgnoreCase))
                 continue;
+
+            // A recovery list is a session's own work, and nothing merges it back yet,
+            // so it is the only copy of what that session did. Not ours to age out.
+            if (Path.GetFileName(path).Contains(".recovered", StringComparison.OrdinalIgnoreCase))
+                continue;
+
             try
             {
                 if (File.GetLastWriteTimeUtc(path) >= cutoff)
@@ -247,7 +280,7 @@ public sealed class DropStore
         {
             // One file that will not move must not stop the rest being set aside, and
             // must certainly not skip the prune and the staging cleanup below it.
-            DebugLog.Write($"could not set aside {name}: {ex.Message}");
+            DebugLog.WriteAlways($"could not set aside {name}: {ex.Message}");
         }
     }
 
@@ -280,6 +313,14 @@ public sealed class DropStore
     /// Stored names an index file mentions, or nothing when it is missing or unreadable.
     /// Used to decide what is referenced, so it errs towards naming more rather than less.
     /// </summary>
+    /// <summary>
+    /// Whether a list beside the index can be read all the way through. A staging file
+    /// caught mid write, or a copy from a build whose entries this one cannot parse,
+    /// both answer false: neither can be used to decide that a file is unreferenced.
+    /// </summary>
+    private static bool FullyReadable(string path)
+        => ReadIndex(path) is { } loaded && loaded.All(IsUsable);
+
     private static IEnumerable<string> NamesIn(string indexPath)
         => ReadIndex(indexPath)?.Where(i => i?.StoredName is not null).Select(i => i.StoredName) ?? [];
 
@@ -701,9 +742,19 @@ public sealed class DropStore
         try { File.Delete(path); } catch { }
     }
 
+    /// <summary>
+    /// Moves or copies an index aside, dated from now. A move keeps the source's write
+    /// time, so a copy of an index last touched two months ago was born already past
+    /// the prune cutoff and deleted in the same pass that made it.
+    /// </summary>
     private static void TryMove(string from, string to)
     {
-        try { File.Move(from, to, overwrite: true); } catch { }
+        try
+        {
+            File.Move(from, to, overwrite: true);
+            File.SetLastWriteTimeUtc(to, DateTime.UtcNow);
+        }
+        catch { }
     }
 
     /// <summary>
@@ -728,11 +779,12 @@ public sealed class DropStore
         try
         {
             File.Copy(from, to, overwrite: true);
+            File.SetLastWriteTimeUtc(to, DateTime.UtcNow);
             return true;
         }
         catch (Exception ex)
         {
-            DebugLog.Write($"could not keep a copy of the index: {ex.Message}");
+            DebugLog.WriteAlways($"could not keep a copy of the index: {ex.Message}");
             return false;
         }
     }

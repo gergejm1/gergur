@@ -69,6 +69,7 @@ internal static class DropPage
         }
 
         string url = $"http://{address}:{port}/share?k={key}&text=";
+        string upload = $"http://{address}:{port}/upload?k={key}";
         return """
             <!doctype html>
             <html lang="en"><head><meta charset="utf-8">
@@ -113,8 +114,30 @@ internal static class DropPage
               <li>Name it <strong>Send to Gergur</strong>.</li>
             </ol>
 
-            <p>Now Share from Safari, Photos or Notes, pick <strong>Send to Gergur</strong>, and it
+            <p>Now Share from Safari or Notes, pick <strong>Send to Gergur</strong>, and it
             lands on your PC.</p>
+
+            <h1>Photos need their own one</h1>
+            <p class="lead">That shortcut sends text, so sharing a photo with it gives you the
+            photo's name and not the photo. This one sends the picture itself.</p>
+
+            <div class="url" id="upload">__UPLOAD__</div>
+            <button id="copyupload">Copy the address</button>
+
+            <ol>
+              <li>Make a second shortcut, again with <strong>Get Contents of URL</strong>.</li>
+              <li>Paste this address into its URL field. Nothing goes on the end this time.</li>
+              <li>Tap the arrow to expand the action, and set <strong>Method</strong> to
+                  <strong>POST</strong>.</li>
+              <li>Set <strong>Request Body</strong> to <strong>File</strong>.</li>
+              <li>Tap the file field and choose <strong>Shortcut Input</strong>.</li>
+              <li>In its settings, turn on <strong>Show in Share Sheet</strong> and set it to
+                  accept <strong>Images</strong> and <strong>Files</strong>.</li>
+              <li>Name it <strong>Send photo to Gergur</strong>.</li>
+            </ol>
+
+            <p>Photos arrive named for what they are and when they landed, because the share
+            sheet does not hand the shortcut a filename to pass on.</p>
             <p><a href="__HOME__">Back to the drop</a></p>
             <p class="note">The address contains your pairing key, so treat it like a password.
             Anyone who has it can send to this PC while both are on your Wi-Fi.</p>
@@ -124,9 +147,12 @@ internal static class DropPage
             // served over plain http on a LAN address, so on the phone it is simply not
             // there. Saying "Copied" anyway sent people to Shortcuts to paste whatever
             // was on the clipboard before, then debug a shortcut that never had the url.
-            document.getElementById("copy").addEventListener("click", function () {
-              var button = document.getElementById("copy");
-              var block = document.getElementById("url");
+            // Both copy buttons share this: the second address is the one photos go to.
+            // The elements are passed in rather than looked up from an id argument, so
+            // every id this page binds to is still written out where it can be checked
+            // against the markup.
+            function wireCopy(button, block) {
+              button.addEventListener("click", function () {
               var ok = function () { button.textContent = "Copied"; };
               var no = function () { button.textContent = "Select the address above and copy it"; };
 
@@ -148,11 +174,16 @@ internal static class DropPage
               var copied = false;
               try { copied = document.execCommand("copy"); } catch (e) { copied = false; }
               if (copied) { ok(); } else { no(); }
-            });
+              });
+            }
+
+            wireCopy(document.getElementById("copy"), document.getElementById("url"));
+            wireCopy(document.getElementById("copyupload"), document.getElementById("upload"));
             </script>
             </body></html>
             """
             .Replace("__URL__", Escape(url))
+            .Replace("__UPLOAD__", Escape(upload))
             .Replace("__HOME__", Escape($"/?k={key}"));
     }
 

@@ -602,3 +602,81 @@ public sealed class DownloadFailurePartwayTests : IDisposable
         Assert.StartsWith("HTTP/1.1 500", Encoding.UTF8.GetString(sink.Delivered));
     }
 }
+
+/// <summary>
+/// Naming something that arrived without a name. A share-sheet Shortcut posting a photo
+/// has none to send: Photos does not hand the shortcut a filename, and a url can only
+/// carry what the shortcut can put in it, so everything landed in the drop as "file".
+/// </summary>
+public sealed class UploadNamingTests : IDisposable
+{
+    private readonly string _path = Path.Combine(Path.GetTempPath(), $"gergur-sniff-{Guid.NewGuid():N}");
+
+    public void Dispose()
+    {
+        try { File.Delete(_path); } catch { }
+    }
+
+    private static ReadOnlySpan<byte> Bytes(params byte[] head) => head;
+
+    [Fact]
+    public void AJpegIsRecognised()
+        => Assert.Equal((".jpg", "Photo"), DropServer.Sniff(Bytes(0xFF, 0xD8, 0xFF, 0xE0, 0, 0)));
+
+    [Fact]
+    public void APngIsRecognised()
+        => Assert.Equal((".png", "Photo"), DropServer.Sniff("\x89PNG\r\n\x1a\n"u8));
+
+    [Fact]
+    public void AGifIsRecognised()
+        => Assert.Equal((".gif", "Photo"), DropServer.Sniff("GIF89a-and-more"u8));
+
+    [Fact]
+    public void AWebpIsRecognised()
+        => Assert.Equal((".webp", "Photo"), DropServer.Sniff("RIFF....WEBP"u8));
+
+    [Theory]
+    [InlineData("heic")]
+    [InlineData("mif1")]
+    public void TheFormatAnIphoneActuallyShootsIsRecognised(string brand)
+        => Assert.Equal((".heic", "Photo"), DropServer.Sniff(Encoding.UTF8.GetBytes("....ftyp" + brand)));
+
+    [Fact]
+    public void TheSameContainerCarryingVideoIsNotCalledAPhoto()
+        => Assert.Equal((".mov", "Video"), DropServer.Sniff("....ftypqt  "u8));
+
+    [Fact]
+    public void APdfIsRecognised()
+        => Assert.Equal((".pdf", "Document"), DropServer.Sniff("%PDF-1.7"u8));
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("just some text")]
+    [InlineData("\0\0\0\0\0\0\0\0\0\0\0\0")]
+    public void AnythingUnrecognisedKeepsANeutralName(string content)
+        => Assert.Equal((".bin", "File"), DropServer.Sniff(Encoding.UTF8.GetBytes(content)));
+
+    [Fact]
+    public void APhotoWithNoNameIsNamedForWhatItIsAndWhenItLanded()
+    {
+        File.WriteAllBytes(_path, [0xFF, 0xD8, 0xFF, 0xE0, 1, 2, 3, 4]);
+
+        string name = DropServer.NameFromContent(_path);
+
+        Assert.StartsWith("Photo ", name);
+        Assert.EndsWith(".jpg", name);
+        // And it is a name the store will keep the extension of, not rewrite to .bin.
+        Assert.Equal(".jpg", Gergur.Data.DropStore.StorableExtension(name));
+    }
+
+    [Fact]
+    public void AFileTooShortToIdentifyStillGetsAName()
+    {
+        File.WriteAllBytes(_path, [0xFF]);
+
+        string name = DropServer.NameFromContent(_path);
+
+        Assert.StartsWith("File ", name);
+        Assert.EndsWith(".bin", name);
+    }
+}

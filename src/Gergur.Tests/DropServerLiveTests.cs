@@ -284,6 +284,39 @@ public sealed class DropServerLiveTests : IDisposable
     }
 
     [Fact]
+    public async Task APhotoPostedWithNoNameIsNamedForWhatItIs()
+    {
+        // What the photo shortcut sends: a POST with the picture as the body and nothing
+        // in the url to name it, because Photos does not give the shortcut a filename.
+        var jpeg = new byte[512];
+        jpeg[0] = 0xFF; jpeg[1] = 0xD8; jpeg[2] = 0xFF; jpeg[3] = 0xE0;
+
+        string response = await SendAsync(
+            $"POST /upload?k={Key} HTTP/1.1\r\nHost: x\r\nContent-Length: {jpeg.Length}\r\n\r\n",
+            jpeg);
+
+        Assert.StartsWith("HTTP/1.1 200 OK", response);
+        var item = Assert.Single(_store.Items);
+        Assert.StartsWith("Photo ", item.Text);
+        Assert.EndsWith(".jpg", item.Text);
+        Assert.EndsWith(".jpg", item.StoredName);
+        Assert.Equal(jpeg, File.ReadAllBytes(_store.PathFor(item)!));
+    }
+
+    [Fact]
+    public async Task ANameThatIsSentIsStillTheNameThatIsUsed()
+    {
+        var jpeg = new byte[64];
+        jpeg[0] = 0xFF; jpeg[1] = 0xD8; jpeg[2] = 0xFF;
+
+        await SendAsync(
+            $"POST /upload?k={Key}&name=holiday.jpg HTTP/1.1\r\nHost: x\r\nContent-Length: {jpeg.Length}\r\n\r\n",
+            jpeg);
+
+        Assert.Equal("holiday.jpg", Assert.Single(_store.Items).Text);
+    }
+
+    [Fact]
     public async Task AnExecutableIsStoredWhereAClickCannotRunIt()
     {
         // Refusing only at click time left the deny list load-bearing. The bytes are kept,
