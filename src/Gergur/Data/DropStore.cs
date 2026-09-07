@@ -1,5 +1,6 @@
 using System.Text.Json;
 using Gergur.App;
+using Gergur.Diagnostics;
 
 namespace Gergur.Data;
 
@@ -43,6 +44,23 @@ public sealed class DropStore
     /// </summary>
     private readonly object _gate = new();
 
+    /// <summary>
+    /// Set when the index exists but could not be read in full. While it is set the index
+    /// is never written over: see <see cref="SaveLocked"/>.
+    /// </summary>
+    private bool _indexUnreadable;
+
+    /// <summary>
+    /// Set when the index read but not every entry in it did. The list in memory is then
+    /// missing whatever we could not parse, and writing it back loses those entries for
+    /// good, so the first save keeps the original beside it. Cleared once that is done.
+    ///
+    /// This is not the same as refusing to write, which is what <see cref="_indexUnreadable"/>
+    /// does: refusing meant a deleted item came back on every launch and could not be
+    /// deleted again. Keeping a copy costs one file and loses nothing.
+    /// </summary>
+    private bool _indexPartial;
+
     /// <summary>Raised whenever the list changes, from either side.</summary>
     public event EventHandler<DropItem>? ItemAdded;
     public event EventHandler? Changed;
@@ -55,47 +73,73 @@ public sealed class DropStore
         _items = Load(out bool indexIntact);
         if (indexIntact)
             SweepOrphans();
+        CountSetAside();
     }
 
     /// <summary>
-    /// Deletes files under the drop that no entry refers to, and any half-written index
-    /// left by an interrupted save.
+    /// Moves files no entry refers to into <see cref="OrphansDir"/>, and removes a stale
+    /// staging file.
     ///
     /// Entries go away without their files in more than one way: an index that failed to
-    /// write, a save interrupted between the two, or an entry this build's stricter load
-    /// filter now drops. Those files are photos and documents from the phone sitting on
-    /// disk with nothing pointing at them and no way to reach them from either surface.
+    /// write, a save interrupted between the two, or an entry the load filter drops.
+    /// Those files are photos and documents from the phone sitting on disk with nothing
+    /// pointing at them and no way to reach them from either surface.
     ///
     /// Only from the constructor, before anything else can hold this store, so it cannot
     /// race an upload writing into the same directory, and only when the index was really
-    /// read. An index that would not parse also produces an empty list, and sweeping on
-    /// that would delete every file the drop holds on the one occasion they cannot be
-    /// listed: the corruption case this store already goes out of its way to survive.
+    /// read. An index that would not parse also produces an empty list, and acting on that
+    /// would treat every file the drop holds as unreferenced on the one occasion they
+    /// cannot be listed: the corruption case this store goes out of its way to survive.
     /// </summary>
     private void SweepOrphans()
     {
         try
         {
-            var referenced = _items
-                .Where(i => i.StoredName.Length > 0)
-                .Select(i => i.StoredName)
+            // Every list that names a file, not only the one in memory. A session that
+            // opened while the index was locked wrote its work to the recovery file, and
+            // a photo that arrived during it is named there and nowhere else. Reading
+            // only the current index made that photo unreferenced on the next launch and
+            // set it aside: the mapping from file to name existed, and we threw it away.
+            var referenced = _items.Select(i => i.StoredName)
+                .Concat(NamesIn(IndexPath + ".recovered"))
+                .Concat(NamesIn(IndexPath + ".recovered.tmp"))
+                .Concat(NamesIn(IndexPath + ".superseded"))
+                .Concat(NamesIn(IndexPath + ".tmp"))
+                .Where(name => name.Length > 0)
                 .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
+            bool made = false;
             foreach (string path in Directory.EnumerateFiles(FilesDir))
             {
-                if (!referenced.Contains(Path.GetFileName(path)))
-                    File.Delete(path);
+                if (referenced.Contains(Path.GetFileName(path)))
+                    continue;
+
+                // Moved, not deleted. Every guard above is a judgement about whether the
+                // list can be trusted, and this has already been wrong twice in ways that
+                // ended with the user's photos gone. Quarantine keeps the tidying and
+                // takes the whole class of mistake off the table: the worst a wrong
+                // judgement can now do is put a file in the next folder along.
+                if (!made)
+                {
+                    Directory.CreateDirectory(OrphansDir);
+                    made = true;
+                }
+                SetAside(path);
             }
 
-            // A staging file older than the index is left over from a save that finished;
-            // a newer one is a save that wrote it and did not get to the move, which makes
-            // it the more recent of the two indexes and not something to throw away.
+            // The staging file goes only when the current index already names everything
+            // it does. Consulting it to decide what is live and then deleting it in the
+            // same pass protected a file for exactly one launch, because the only list
+            // naming it was the one just destroyed.
             string staging = IndexPath + ".tmp";
-            if (File.Exists(staging)
-                && File.GetLastWriteTimeUtc(staging) <= File.GetLastWriteTimeUtc(IndexPath))
+            if (File.Exists(staging))
             {
-                File.Delete(staging);
+                var live = _items.Select(i => i.StoredName).ToHashSet(StringComparer.OrdinalIgnoreCase);
+                if (NamesIn(staging).Where(n => n.Length > 0).All(live.Contains))
+                    File.Delete(staging);
             }
+
+            PruneOrphans();
         }
         catch
         {
@@ -103,7 +147,116 @@ public sealed class DropStore
         }
     }
 
+    /// <summary>How long a set-aside file is kept before it really is deleted.</summary>
+    private static readonly TimeSpan OrphanLifetime = TimeSpan.FromDays(60);
+
+    /// <summary>
+    /// Moves one file into the quarantine folder without overwriting anything already
+    /// there. Two files can carry the same stored name across a restore or a copied
+    /// profile, and a function whose whole point is that tidying loses nothing cannot
+    /// take one of them out on the way past.
+    /// </summary>
+    private void SetAside(string path)
+    {
+        string name = Path.GetFileName(path);
+        string target = Path.Combine(OrphansDir, name);
+        for (int n = 2; File.Exists(target) && n < 1000; n++)
+        {
+            target = Path.Combine(
+                OrphansDir,
+                $"{Path.GetFileNameWithoutExtension(name)}-{n}{Path.GetExtension(name)}");
+        }
+
+        try
+        {
+            File.Move(path, target);
+
+            // Stamped on the way in, because a move keeps the original write time and
+            // the prune reads that. Without this a photo that arrived three months ago
+            // and became unreferenced today was set aside and deleted in the same pass:
+            // the exact loss this folder exists to prevent, with nothing shown for it.
+            File.SetLastWriteTimeUtc(target, DateTime.UtcNow);
+        }
+        catch (Exception ex)
+        {
+            // One file that will not move must not stop the rest being set aside, and
+            // must certainly not skip the prune and the staging cleanup below it.
+            DebugLog.Write($"could not set aside {name}: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Deletes set-aside files that have been there long enough to be sure. Without this
+    /// the folder only grows, and it grows with copies of the user's photos: a store that
+    /// misjudges repeatedly, which is what this whole guard exists for, would fill the
+    /// profile up. Two months is long past the point of noticing something went missing.
+    /// </summary>
+    private void PruneOrphans()
+    {
+        if (!Directory.Exists(OrphansDir))
+            return;
+        var cutoff = DateTime.UtcNow - OrphanLifetime;
+        foreach (string path in Directory.EnumerateFiles(OrphansDir))
+        {
+            try
+            {
+                if (File.GetLastWriteTimeUtc(path) < cutoff)
+                    File.Delete(path);
+            }
+            catch
+            {
+                // One stubborn file is not worth failing the open.
+            }
+        }
+    }
+
+    /// <summary>
+    /// Stored names an index file mentions, or nothing when it is missing or unreadable.
+    /// Used to decide what is referenced, so it errs towards naming more rather than less.
+    /// </summary>
+    private static IEnumerable<string> NamesIn(string indexPath)
+        => ReadIndex(indexPath)?.Where(i => i?.StoredName is not null).Select(i => i.StoredName) ?? [];
+
     public string FilesDir => Path.Combine(_root, "files");
+
+    /// <summary>
+    /// Where files nothing refers to are put, rather than deleting them: tidying up must
+    /// never be the thing that loses a photo. Counted in <see cref="SetAsideCount"/> so
+    /// the drop window can say it is there. Safe to empty by hand.
+    ///
+    /// Eviction at <see cref="MaxItems"/> still deletes outright: that one is the user's
+    /// own list overflowing, not us failing to account for a file.
+    /// </summary>
+    public string OrphansDir => Path.Combine(_root, "orphans");
+
+    /// <summary>The drop folder itself: files, orphans and any recovery index live here.</summary>
+    public string DropDir => _root;
+
+    /// <summary>
+    /// Files that were set aside because nothing referred to them, and any list this
+    /// store had to write beside an index it could not read. Both are recovery, and both
+    /// used to be invisible: written where nobody would look and never mentioned again.
+    ///
+    /// Counted when the store opens and after a save that writes one of those lists,
+    /// rather than on every read: the drop window asks for this on every item the phone
+    /// sends, and it was three filesystem calls on the UI thread each time.
+    /// </summary>
+    public int SetAsideCount { get; private set; }
+
+    private void CountSetAside()
+    {
+        try
+        {
+            SetAsideCount =
+                (Directory.Exists(OrphansDir) ? Directory.GetFiles(OrphansDir).Length : 0)
+                + Directory.GetFiles(_root, "items.json.recovered*").Length
+                + Directory.GetFiles(_root, "items.json.superseded*").Length;
+        }
+        catch
+        {
+            // Not worth failing anything over; the notice simply does not appear.
+        }
+    }
     private string IndexPath => Path.Combine(_root, "items.json");
 
     /// <summary>
@@ -392,11 +545,54 @@ public sealed class DropStore
         indexIntact = false;
         try
         {
-            if (!File.Exists(IndexPath))
+            // A staging file newer than the index is a save that wrote it and did not
+            // reach the move: a crash, or a sharing violation from a backup or a virus
+            // scanner, which SaveLocked swallows. It is then the more recent of the two
+            // indexes and the only record of everything added in that session. Reading
+            // the older one and sweeping against it deletes exactly those files, while
+            // carefully preserving a staging file that nothing ever reads.
+            //
+            // So finish the move the save did not get to, but only once the file has been
+            // proved good by parsing it: a write interrupted halfway leaves something
+            // that will not parse, and that must not replace a working index.
+            string staging = IndexPath + ".tmp";
+            if (File.Exists(staging)
+                && (!File.Exists(IndexPath)
+                    || File.GetLastWriteTimeUtc(staging) >= File.GetLastWriteTimeUtc(IndexPath)))
+            {
+                var staged = ReadIndex(staging);
+                if (staged is null)
+                {
+                    // Half a write. Not an index by any reading, so it is not evidence of
+                    // anything either, and leaving it meant the next save wrote over it
+                    // anyway while this launch stood down over it.
+                    TryDelete(staging);
+                }
+                else if (staged.All(IsUsable))
+                {
+                    // Finish the move the save did not get to, keeping what it replaces.
+                    if (File.Exists(IndexPath))
+                        TryMove(IndexPath, FreeName(IndexPath + ".superseded"));
+                    File.Move(staging, IndexPath, overwrite: true);
+                }
+                else
+                {
+                    // It parses but we cannot use all of it: most likely an index from a
+                    // later build than this one. Understanding it is not required, and
+                    // overwriting either file is not allowed.
+                    _indexUnreadable = true;
+                    return LoadUnswept();
+                }
+            }
+
+            if (ReadIndex(IndexPath) is not { } loaded)
+            {
+                // Missing is a new drop. Present but unreadable is a file we must not
+                // write over: a lock held by a backup or a scanner reads exactly like
+                // corruption from here, and the file is the only copy of what is in it.
+                _indexUnreadable = File.Exists(IndexPath);
                 return [];
-            var loaded = JsonSerializer.Deserialize<List<DropItem>>(File.ReadAllText(IndexPath));
-            if (loaded is null)
-                return [];
+            }
 
             // Locking the list closed one source of nulls; this is the other. A hand
             // edited or truncated index can deserialize entries that are null, or whose
@@ -406,21 +602,100 @@ public sealed class DropStore
             // Every string is checked, not the three that were obviously used: an entry
             // with a null StoredName passed the old filter and then threw inside PathFor,
             // reached from opening a file in the drop window, which takes the browser
-            // down with every tab. Listing fields by hand is what left the gap, so this
-            // asks the record for all of them.
+            // down with every tab. The list in IsUsable is still written out by hand, so
+            // a string added to DropItem has to be added there too.
             var kept = loaded.Where(IsUsable).ToList();
 
             // Only a list that lost nothing can say what is unreferenced. Every entry
             // dropped here is one whose file is still on disk and would otherwise be
             // swept, and the reason it was dropped is that we could not read it properly.
             indexIntact = kept.Count == loaded.Count;
+            _indexPartial = !indexIntact;
+
+            // Deliberately not tied to indexIntact. An index that read fine but had one
+            // unusable entry is still an index we understand, and refusing to write it
+            // again meant the user could never delete anything for the life of that
+            // install: Remove took the file away, the save went to a side file, and the
+            // item came back on the next launch as something that no longer opens.
+            // The sweep still stands down; that is what indexIntact is for.
             return kept;
         }
         catch
         {
-            // A corrupt index should not lose the browser; start the list empty.
+            // Whatever went wrong here was in the staging-file handling above, since the
+            // read itself no longer throws. Start empty, and leave the index alone.
+            _indexUnreadable = File.Exists(IndexPath);
         }
         return [];
+    }
+
+    /// <summary>Best effort housekeeping: never worth failing to open the drop over.</summary>
+    private static void TryDelete(string path)
+    {
+        try { File.Delete(path); } catch { }
+    }
+
+    private static void TryMove(string from, string to)
+    {
+        try { File.Move(from, to, overwrite: true); } catch { }
+    }
+
+    /// <summary>
+    /// The given name, or the first numbered variant that is free. Every one of these
+    /// files is the only copy of something, so none of them may take another's place.
+    /// </summary>
+    private static string FreeName(string preferred)
+    {
+        if (!File.Exists(preferred))
+            return preferred;
+        for (int n = 2; n < 1000; n++)
+        {
+            string candidate = $"{preferred}-{n}";
+            if (!File.Exists(candidate))
+                return candidate;
+        }
+        return preferred + "-" + Guid.NewGuid().ToString("N")[..8];
+    }
+
+    private static void TryCopy(string from, string to)
+    {
+        try { File.Copy(from, to, overwrite: true); } catch { }
+    }
+
+    /// <summary>
+    /// The current index, read for its contents only. Used when something about the files
+    /// on disk is unexplained, so the list is worth having but must not be used to decide
+    /// that anything is unreferenced.
+    /// </summary>
+    private List<DropItem> LoadUnswept()
+    {
+        if (ReadIndex(IndexPath) is { } loaded)
+            return loaded.Where(IsUsable).ToList();
+
+        // The same rule as the main path, and the reason this is not one line: leaving it
+        // out here left the whole guard bypassable. An index that exists but will not read
+        // must not be written over, whichever route reached that conclusion.
+        _indexUnreadable = File.Exists(IndexPath);
+        return [];
+    }
+
+    /// <summary>
+    /// Reads and parses an index file, or null when it is missing or will not parse. One
+    /// copy of this: three callers read the index, and two of them drifting apart is how
+    /// a file gets treated as unreferenced by one and referenced by the other.
+    /// </summary>
+    private static List<DropItem>? ReadIndex(string path)
+    {
+        try
+        {
+            return File.Exists(path)
+                ? JsonSerializer.Deserialize<List<DropItem>>(File.ReadAllText(path))
+                : null;
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     /// <summary>
@@ -439,12 +714,36 @@ public sealed class DropStore
         try
         {
             Directory.CreateDirectory(_root);
+
+            // An index we read but could not use all of is kept once, before the first
+            // write replaces it with only the entries this build understood. Twenty
+            // entries in and one out is a real sequence: a field renamed in a later
+            // build, opened by this one. The photos survive as files either way, but
+            // their names, dates and every message beside them live only in that file.
+            // Gated on this session, not on whether a copy happens to exist already: an
+            // on-disk latch meant the second partial index this profile ever saw was
+            // overwritten with nothing kept, because round one had claimed the name.
+            if (_indexPartial && File.Exists(IndexPath))
+                TryCopy(IndexPath, FreeName(IndexPath + ".superseded"));
+            _indexPartial = false;
+
+            // An index we could not read is never written over. It reads as empty in
+            // memory, so overwriting it replaces everything the user had with whatever
+            // this session happens to hold, and the cause is as likely to be a lock held
+            // by a backup or a virus scanner as real corruption. Writing beside it keeps
+            // both: the original for a later launch that can read it, and this session's
+            // work in a file that is plainly named.
+            string target = _indexUnreadable ? IndexPath + ".recovered" : IndexPath;
+
             // Write beside it and move into place. A direct write that is interrupted
             // leaves a truncated index, which loads as an empty drop and orphans every
             // file it referenced, with nothing to tell the user it happened.
-            string staging = IndexPath + ".tmp";
+            string staging = target + ".tmp";
             File.WriteAllText(staging, JsonSerializer.Serialize(_items, JsonOptions));
-            File.Move(staging, IndexPath, overwrite: true);
+            File.Move(staging, target, overwrite: true);
+
+            if (target != IndexPath)
+                CountSetAside();
         }
         catch
         {

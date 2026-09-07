@@ -94,12 +94,28 @@ public sealed class AppSession
         catch (Exception ex)
         {
             PhoneBridge = null;
-            PhoneBridgeError = ex is System.Net.Sockets.SocketException
-                ? $"Port {Settings.DropPort} is already in use. Change it in Settings."
-                : ex.Message;
+            PhoneBridgeError = BridgeErrorFor(ex, Settings.DropPort);
             Diagnostics.DebugLog.WriteAlways($"phone bridge did not start: {ex.Message}");
         }
     }
+
+    /// <summary>
+    /// What to tell the user when the bridge did not come up. Only an actual conflict is
+    /// worth sending them to the port setting: access denied and address not available
+    /// are SocketExceptions too, and changing a port that is not the problem wastes an
+    /// evening. Everything else says what happened and what it means here.
+    /// </summary>
+    internal static string BridgeErrorFor(Exception ex, int port) => ex switch
+    {
+        System.Net.Sockets.SocketException { SocketErrorCode: System.Net.Sockets.SocketError.AddressAlreadyInUse }
+            => $"Port {port} is already in use. Change it in Settings.",
+        System.Net.Sockets.SocketException { SocketErrorCode: System.Net.Sockets.SocketError.AccessDenied }
+            => $"Windows would not let Gergur listen on port {port}. Something may have "
+             + "reserved it, or a policy blocks it. Try a different port in Settings.",
+        System.Net.Sockets.SocketException { SocketErrorCode: System.Net.Sockets.SocketError.AddressNotAvailable }
+            => "This PC has no network address to listen on. Connect to Wi-Fi and turn the phone drop on again.",
+        _ => ex.Message,
+    };
 
     public void StopPhoneBridge()
     {

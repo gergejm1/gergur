@@ -449,13 +449,20 @@ public sealed class DropShareEndpointTests : IDisposable
     }
 
     [Fact]
-    public async Task TheSetupPageCarriesTheAddressToPasteIntoShortcuts()
+    public async Task TheSetupPageIsServedToAPairedRequest()
     {
+        // Only the status and which of the two pages came back. The request arrives on
+        // loopback, so HostFor falls back to this machine's own address, and a machine
+        // without a routable one (a container, an APIPA-only adapter) correctly gets the
+        // page that says so. What the page actually contains is pinned by
+        // SetupPageTests, which does not depend on the host it runs on.
         string response = await GetAsync($"/setup?k={Key}");
 
         Assert.StartsWith("HTTP/1.1 200 OK", response);
-        Assert.Contains("Show in Share Sheet", response);
-        Assert.Contains($"/share?k={Key}&amp;text=", response);
+        Assert.True(
+            response.Contains("Show in Share Sheet")
+            || response.Contains("Cannot tell what this PC&#39;s address is"),
+            "the setup page was served but is neither the instructions nor the explanation");
     }
 
     [Fact]
@@ -566,6 +573,35 @@ public sealed class DropShareEndpointTests : IDisposable
         Assert.DoesNotContain(Key, response[response.IndexOf("\r\n\r\n", StringComparison.Ordinal)..]);
     }
 
+    [Theory]
+    // The key first, the share appended, and the link brings its own "k=". Parsed
+    // last-wins, the link's parameter became the key and the share was refused as
+    // unpaired. These go through the socket on purpose: the gate reading the key the
+    // right way is what has to be pinned, not just the function that can.
+    [InlineData("https://maps.example.com/?q=cafe&k=abc123", true)]
+    [InlineData("https://www.amazon.com/s?i=electronics&k=laptop", true)]
+    // And the other Shortcut ordering, input first, key last: first-wins broke this one.
+    [InlineData("https://www.amazon.com/s?i=electronics&k=laptop", false)]
+    public async Task ALinkCarryingItsOwnKeyIsStillPaired(string shared, bool keyFirst)
+    {
+        string query = keyFirst ? $"?k={Key}&text={shared}" : $"?text={shared}&k={Key}";
+
+        string response = await GetAsync("/share" + query);
+
+        Assert.StartsWith("HTTP/1.1 200 OK", response);
+        Assert.Equal(shared, Assert.Single(_store.Items).Text);
+    }
+
+    [Fact]
+    public async Task AWrongKeyIsStillRefusedWhenTheLinkCarriesKeysOfItsOwn()
+    {
+        // Comparing every "k=" must not turn into accepting any of them.
+        string response = await GetAsync("/share?k=WRONGKEYWRONGKEYWRONGKEY&text=https://x/?k=alsowrong");
+
+        Assert.StartsWith("HTTP/1.1 403", response);
+        Assert.Empty(_store.Items);
+    }
+
     [Fact]
     public async Task ASharedLinkCarryingItsOwnTextParameterIsNotCutAtIt()
     {
@@ -576,5 +612,211 @@ public sealed class DropShareEndpointTests : IDisposable
 
         Assert.StartsWith("HTTP/1.1 200 OK", response);
         Assert.Equal(shared, Assert.Single(_store.Items).Text);
+    }
+}
+
+/// <summary>
+/// The paths that run after something has gone wrong. Each of these was a fix with no
+/// test: a reviewer reverted all of them at once and the suite stayed green.
+/// </summary>
+public sealed class DropServerFailurePathTests : IDisposable
+{
+    private readonly string _root = Path.Combine(Path.GetTempPath(), $"gergur-fail-{Guid.NewGuid():N}");
+    private readonly DropStore _store;
+    private readonly DropServer _server;
+    private readonly int _port;
+
+    public DropServerFailurePathTests()
+    {
+        _port = DropServerLiveTests.FreePort();
+        _store = new DropStore(_root);
+        _server = new DropServer(_store, new Settings { DropPort = _port, DropKey = Key });
+        _server.Start();
+    }
+
+    public void Dispose()
+    {
+        _server.Stop();
+        try { Directory.Delete(_root, recursive: true); } catch { }
+    }
+
+    private const string Key = "FEDCBA9876543210FEDCBA98";
+
+    private async Task<byte[]> RawAsync(string head)
+    {
+        using var client = new TcpClient();
+        await client.ConnectAsync(IPAddress.Loopback, _port);
+        using var stream = client.GetStream();
+        await stream.WriteAsync(Encoding.UTF8.GetBytes(head));
+        using var reader = new MemoryStream();
+        try { await stream.CopyToAsync(reader); } catch (IOException) { }
+        return reader.ToArray();
+    }
+
+    [Fact]
+    public async Task AFailureBeforeAnyReplyIsAnsweredRatherThanClosedOn()
+    {
+        // A stored file that exists but cannot be opened: a scanner or a backup holding
+        // it, which is the same shape as a permission problem. The route throws before
+        // writing anything, and closing silently there reaches the phone as a network
+        // error with nothing to say what happened.
+        var item = _store.AddFile("held.bin", new MemoryStream([1, 2, 3]), from: "pc");
+        using var held = File.Open(_store.PathFor(item)!, FileMode.Open, FileAccess.Read, FileShare.None);
+
+        string response = Encoding.UTF8.GetString(
+            await RawAsync($"GET /file/{item.Id}?k={Key} HTTP/1.1\r\nHost: x\r\n\r\n"));
+
+        Assert.StartsWith("HTTP/1.1 500", response);
+        Assert.Contains("could not finish", response);
+    }
+
+    [Fact]
+    public async Task ADownloadDeliversExactlyTheFileAndNothingElse()
+    {
+        // Named for what it checks: this one completes. The failure partway through a
+        // body cannot be arranged over a socket, because by then the peer has gone and
+        // cannot observe what is written after it; DownloadFailurePartwayTests drives
+        // the route over a stream that breaks on purpose instead.
+        var payload = new byte[512 * 1024];
+        Random.Shared.NextBytes(payload);
+        var item = _store.AddFile("big.bin", new MemoryStream(payload), from: "pc");
+
+        byte[] response = await RawAsync($"GET /file/{item.Id}?k={Key} HTTP/1.1\r\nHost: x\r\n\r\n");
+
+        int split = Encoding.UTF8.GetString(response).IndexOf("\r\n\r\n", StringComparison.Ordinal);
+        Assert.True(split > 0, "no head came back at all");
+        byte[] delivered = response[(split + 4)..];
+
+        // Whatever arrived must be a prefix of the file, and nothing else.
+        Assert.True(delivered.Length <= payload.Length, "more bytes came back than the file holds");
+        Assert.Equal(payload.AsSpan(0, delivered.Length).ToArray(), delivered);
+    }
+
+    [Fact]
+    public async Task ADownloadCarriesExactlyOneStatusLine()
+    {
+        var item = _store.AddFile("small.bin", new MemoryStream([1, 2, 3, 4, 5]), from: "pc");
+
+        byte[] response = await RawAsync($"GET /file/{item.Id}?k={Key} HTTP/1.1\r\nHost: x\r\n\r\n");
+        string text = Encoding.UTF8.GetString(response);
+
+        // Exactly one status line: the one at the start.
+        Assert.Equal(0, text.IndexOf("HTTP/1.1", StringComparison.Ordinal));
+        Assert.Equal(-1, text.IndexOf("HTTP/1.1", 1, StringComparison.Ordinal));
+    }
+}
+
+/// <summary>
+/// Peers that stop moving data. Every one of these used to hold a connection slot for the
+/// whole request budget, which this change widened from thirty seconds to ten minutes: the
+/// per-chunk stall bound is what makes that widening safe, so it is worth showing that it
+/// exists on each of the three paths rather than asserting it.
+/// </summary>
+public sealed class DropServerStallTests : IDisposable
+{
+    private readonly string _root = Path.Combine(Path.GetTempPath(), $"gergur-stall-{Guid.NewGuid():N}");
+    private readonly DropStore _store;
+    private readonly DropServer _server;
+    private readonly int _port;
+
+    private const string Key = "AAAABBBBCCCCDDDDEEEEFFFF";
+
+    public DropServerStallTests()
+    {
+        _port = DropServerLiveTests.FreePort();
+        _store = new DropStore(_root);
+        _server = new DropServer(_store, new Settings { DropPort = _port, DropKey = Key })
+        {
+            // The real values are 20 seconds and 10 minutes. The behaviour is the same
+            // shape at any scale, and a test that waits 20 seconds does not get run.
+            // The stall bound is short and the transfer budget is long on purpose: if the
+            // budget did the releasing, these tests would pass with every per-chunk bound
+            // removed, which is what the first version of them did.
+            StallTimeout = TimeSpan.FromMilliseconds(400),
+            TransferTimeout = TimeSpan.FromSeconds(30),
+        };
+        _server.Start();
+    }
+
+    public void Dispose()
+    {
+        _server.Stop();
+        try { Directory.Delete(_root, recursive: true); } catch { }
+    }
+
+    private async Task<TcpClient> ConnectAsync()
+    {
+        var client = new TcpClient();
+        await client.ConnectAsync(IPAddress.Loopback, _port);
+        return client;
+    }
+
+    /// <summary>Waits for the handler to finish, up to a budget generous enough not to flake.</summary>
+    private async Task<bool> ReleasedAsync()
+    {
+        var deadline = System.Diagnostics.Stopwatch.StartNew();
+        while (_server.InFlight > 0 && deadline.Elapsed < TimeSpan.FromSeconds(6))
+            await Task.Delay(20);
+        return _server.InFlight == 0;
+    }
+
+    [Fact]
+    public async Task AnUploadThatStopsSendingIsDropped()
+    {
+        using var client = await ConnectAsync();
+        var stream = client.GetStream();
+        await stream.WriteAsync(Encoding.UTF8.GetBytes(
+            $"POST /upload?k={Key}&name=slow.bin HTTP/1.1\r\nHost: x\r\nContent-Length: 8000000\r\n\r\n"));
+        await stream.WriteAsync(new byte[4096]);   // a little, then nothing
+
+        Assert.True(await ReleasedAsync(), "a stalled upload held its connection");
+        Assert.Empty(_store.Items);
+    }
+
+    [Fact]
+    public async Task AMessageThatStopsSendingIsDropped()
+    {
+        // The path that had no per-chunk bound at all, so it was held for the whole
+        // transfer budget: ten minutes, on a listener with sixteen slots.
+        using var client = await ConnectAsync();
+        var stream = client.GetStream();
+        await stream.WriteAsync(Encoding.UTF8.GetBytes(
+            $"POST /send?k={Key} HTTP/1.1\r\nHost: x\r\nContent-Length: 4000\r\n\r\n"));
+        await stream.WriteAsync("{\"text\":\"partial"u8.ToArray());
+
+        Assert.True(await ReleasedAsync(), "a stalled message held its connection");
+    }
+
+    [Fact]
+    public async Task ADownloadThePeerStopsReadingIsDropped()
+    {
+        var payload = new byte[6 * 1024 * 1024];   // bigger than any socket buffer
+        var item = _store.AddFile("big.bin", new MemoryStream(payload), from: "pc");
+
+        using var client = await ConnectAsync();
+        var stream = client.GetStream();
+        await stream.WriteAsync(Encoding.UTF8.GetBytes(
+            $"GET /file/{item.Id}?k={Key} HTTP/1.1\r\nHost: x\r\n\r\n"));
+
+        // And now never read a byte of it.
+        Assert.True(await ReleasedAsync(), "a download nobody is reading held its connection");
+    }
+
+    [Fact]
+    public async Task AResponseThePeerStopsReadingIsDropped()
+    {
+        // Not a file: an ordinary reply, which is the case that had no deadline at all
+        // because the route's writer was called without the request's token.
+        // Twelve of these overflow any socket buffer, and cost a fraction of what two
+        // hundred did: every add rewrites the whole index, so the big version wrote
+        // over a gigabyte and took a third of the suite's running time.
+        for (int i = 0; i < 12; i++)
+            _store.AddText(new string('x', 1_000_000), from: "pc");
+
+        using var client = await ConnectAsync();
+        var stream = client.GetStream();
+        await stream.WriteAsync(Encoding.UTF8.GetBytes($"GET /items?k={Key} HTTP/1.1\r\nHost: x\r\n\r\n"));
+
+        Assert.True(await ReleasedAsync(), "a reply nobody is reading held its connection");
     }
 }

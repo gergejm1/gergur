@@ -76,3 +76,42 @@ public sealed class SettingsTests
         Assert.All(Settings.RestartRequired, name => Assert.Contains(name, real));
     }
 }
+
+/// <summary>
+/// What the window tells you when the phone bridge does not start. Every failure used to
+/// read as "the port is in use", which sends you to change a setting that is not the
+/// problem.
+/// </summary>
+public sealed class BridgeErrorTests
+{
+    private static string For(System.Net.Sockets.SocketError code)
+        => Gergur.App.AppSession.BridgeErrorFor(new System.Net.Sockets.SocketException((int)code), 24003);
+
+    [Fact]
+    public void APortConflictSaysToChangeThePort()
+        => Assert.Equal(
+            "Port 24003 is already in use. Change it in Settings.",
+            For(System.Net.Sockets.SocketError.AddressAlreadyInUse));
+
+    [Fact]
+    public void AccessDeniedDoesNotClaimThePortIsInUse()
+    {
+        string message = For(System.Net.Sockets.SocketError.AccessDenied);
+
+        Assert.DoesNotContain("already in use", message);
+        Assert.Contains("24003", message);
+    }
+
+    [Fact]
+    public void NoAddressAtAllSaysToConnectToWifi()
+    {
+        string message = For(System.Net.Sockets.SocketError.AddressNotAvailable);
+
+        Assert.DoesNotContain("already in use", message);
+        Assert.Contains("Wi-Fi", message);
+    }
+
+    [Fact]
+    public void SomethingElseEntirelyIsPassedThroughRatherThanGuessedAt()
+        => Assert.Equal("disk on fire", Gergur.App.AppSession.BridgeErrorFor(new IOException("disk on fire"), 24003));
+}

@@ -107,3 +107,106 @@ public sealed class WindowLayoutTests
         finally { try { File.Delete(path); } catch { } }
     });
 }
+
+/// <summary>
+/// The drop window's footer. The store sets files aside instead of deleting them when it
+/// cannot account for them, and a recovery folder nobody is told about is not recovery.
+/// </summary>
+public sealed class DropFooterTextTests
+{
+    [Theory]
+    [InlineData(0, "Nothing here yet.")]
+    [InlineData(1, "1 item")]
+    [InlineData(4, "4 items")]
+    public void TheOrdinaryCountReadsAsBefore(int items, string expected)
+        => Assert.Equal(expected, Gergur.UI.DropForm.CountText(items, setAside: 0));
+
+    [Fact]
+    public void FilesSetAsideAreMentionedWhereTheUserWillSeeThem()
+    {
+        string text = Gergur.UI.DropForm.CountText(items: 3, setAside: 2);
+
+        Assert.Contains("3 items", text);
+        Assert.Contains("2 things set aside", text);
+        Assert.Contains("click to open", text);
+    }
+
+    [Fact]
+    public void OneSetAsideThingIsNotCalledThings()
+        => Assert.Contains("1 thing set aside", Gergur.UI.DropForm.CountText(items: 0, setAside: 1));
+}
+
+/// <summary>
+/// The drop window's count label. It carries the only notice the user ever gets that a
+/// file was set aside, and it used to be given whatever width the buttons did not want:
+/// measured at 0 pixels at the minimum window size and 75 at the default, against 239
+/// pixels of text.
+/// </summary>
+public sealed class DropFooterLabelTests
+{
+    private static void OnSta(Action body)
+    {
+        Exception? failure = null;
+        var thread = new Thread(() =>
+        {
+            try { body(); } catch (Exception ex) { failure = ex; }
+        });
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+        thread.Join();
+        if (failure is not null)
+            throw failure;
+    }
+
+    [Theory]
+    [InlineData(820)]    // the default window size
+    [InlineData(1100)]
+    public void TheSetAsideNoticeIsReadableAtOrdinaryWindowSizes(int width) => OnSta(() =>
+        WithForm(width, form =>
+        {
+            int wanted = TextRenderer.MeasureText(form.CountLabel.Text, form.CountLabel.Font).Width;
+            Assert.True(
+                form.CountLabel.Width >= Math.Min(wanted, 200),
+                $"at {width}px the notice had {form.CountLabel.Width}px for {wanted}px of text");
+        }));
+
+    [Theory]
+    [InlineData(520)]    // the minimum window size
+    [InlineData(600)]
+    public void TheNoticeIsStillVisibleWhenTheWindowIsSmall(int width) => OnSta(() =>
+        WithForm(width, form =>
+        {
+            // There is genuinely not room for everything here, and the notice used to be
+            // the thing that got nothing: measured at 0 pixels at this size. It now keeps
+            // a floor, and the buttons give up the tails of their captions instead.
+            Assert.True(
+                form.CountLabel.Width >= 120,
+                $"at {width}px the set-aside notice had {form.CountLabel.Width}px and shows nothing");
+            Assert.True(form.CountLabel.AutoEllipsis, "and what it cannot show needs a mark");
+
+            foreach (var button in form.FooterControls.Buttons)
+            {
+                Assert.True(
+                    button.Width >= 40 && form.FooterControls.Footer.ClientRectangle.Contains(button.Bounds),
+                    $"at {width}px '{button.Text}' is {button.Width}px at {button.Bounds}");
+                Assert.True(((Button)button).AutoEllipsis, $"'{button.Text}' would be cut with no mark");
+            }
+        }));
+
+    private static void WithForm(int width, Action<Gergur.UI.DropForm> check)
+    {
+        string root = Path.Combine(Path.GetTempPath(), $"gergur-label-{Guid.NewGuid():N}");
+        try
+        {
+            using var form = new Gergur.UI.DropForm(new Gergur.Data.DropStore(root), _ => { });
+            _ = form.Handle;
+            form.ClientSize = new Size(width, 560);
+            // The state the notice exists for, which is also the state that squeezes the
+            // row: an empty store leaves a short label and hides the problem.
+            form.CountLabel.Text = Gergur.UI.DropForm.CountText(items: 3, setAside: 2);
+            form.LayoutFooter();
+            check(form);
+        }
+        finally { try { Directory.Delete(root, recursive: true); } catch { } }
+    }
+}

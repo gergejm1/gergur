@@ -24,8 +24,13 @@ public sealed class DropServer
     /// <summary>Refused above this, so a phone cannot fill the disk in one request.</summary>
     private const long MaxUploadBytes = 100L * 1024 * 1024;
 
-    /// <summary>A single request may not hold a connection longer than this.</summary>
-    private static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(30);
+    /// <summary>
+    /// The outside edge for one request, once its head has been read. Generous, because
+    /// the cap on a single item is 100 MB and a phone across the house does not move that
+    /// in thirty seconds. What actually ends a dead transfer is <see cref="StallTimeout"/>,
+    /// applied per chunk; this only stops one that trickles forever.
+    /// </summary>
+    internal TimeSpan TransferTimeout { get; init; } = TimeSpan.FromMinutes(10);
 
     /// <summary>
     /// A peer gets far less time to send its request line and headers than to finish a
@@ -33,10 +38,20 @@ public sealed class DropServer
     /// for the full request timeout, which made the connection cap a cheaper denial than
     /// having no cap at all: sixteen idle sockets locked out a correctly paired phone.
     /// </summary>
-    private static readonly TimeSpan HeadTimeout = TimeSpan.FromSeconds(5);
+    internal TimeSpan HeadTimeout { get; init; } = TimeSpan.FromSeconds(5);
 
     /// <summary>Uploads stream to disk in chunks this size, never sized from a declared length.</summary>
     private const int CopyChunkBytes = 64 * 1024;
+
+    /// <summary>
+    /// How long a transfer may make no progress at all. Applies per chunk rather than to
+    /// the whole body, so a slow phone finishes a large photo and a stalled one does not
+    /// hold its connection for the full request budget.
+    /// </summary>
+    internal TimeSpan StallTimeout { get; init; } = TimeSpan.FromSeconds(20);
+
+    /// <summary>The default, for the static copy helpers that take it as a parameter.</summary>
+    private static readonly TimeSpan DefaultStall = TimeSpan.FromSeconds(20);
 
     private readonly DropStore _store;
     private readonly Settings _settings;
@@ -278,7 +293,7 @@ public sealed class DropServer
             try
             {
                 using var busy = client.GetStream();
-                await WriteAsync(busy, 503, "text/plain", "Busy, try again."u8.ToArray());
+                await WriteRawAsync(busy, 503, "text/plain", "Busy, try again."u8.ToArray());
                 await busy.FlushAsync();
                 await CloseGracefullyAsync(client, busy);
             }
@@ -293,13 +308,15 @@ public sealed class DropServer
         NetworkStream? stream = null;
         CancellationTokenSource? timeout = null;
         DropRequest? request = null;
-        var bodyRead = new BodyRead();
+        var exchange = new Exchange();
         try
         {
             timeout = LinkedTimeout(_cts);
-            // Belt and braces with the token: these bound a blocking socket too.
-            client.ReceiveTimeout = (int)RequestTimeout.TotalMilliseconds;
-            client.SendTimeout = (int)RequestTimeout.TotalMilliseconds;
+            // These bound blocking socket calls only, and every path here is async, so
+            // they are a backstop for nothing in practice. Left set because they cost
+            // nothing and a future synchronous call would otherwise have no bound at all.
+            client.ReceiveTimeout = (int)TransferTimeout.TotalMilliseconds;
+            client.SendTimeout = (int)TransferTimeout.TotalMilliseconds;
 
             stream = client.GetStream();
 
@@ -308,7 +325,7 @@ public sealed class DropServer
             timeout.CancelAfter(HeadTimeout);
             var (parsed, error, buffered) = await ReadHeadAsync(stream, timeout.Token);
             request = parsed;
-            timeout.CancelAfter(RequestTimeout); // a real transfer gets the full budget
+            timeout.CancelAfter(TransferTimeout); // a real transfer gets the full budget
             if (request is null)
             {
                 int status = error switch
@@ -317,7 +334,7 @@ public sealed class DropServer
                     HeadError.Incomplete => 431,
                     _ => 400,
                 };
-                await WriteAsync(stream, status, "text/plain", Encoding.UTF8.GetBytes(error.ToString()));
+                await WriteAsync(stream, exchange, status, "text/plain", Encoding.UTF8.GetBytes(error.ToString()));
                 return;
             }
 
@@ -327,28 +344,30 @@ public sealed class DropServer
             // last-wins: the share sheet appends a link to the end of the address, and a
             // link with its own "k=" (a maps or search url) then replaced the pairing key
             // with the site's parameter and the share came back "Not paired".
-            if (KeyFrom(request.RawQuery) is not { } key || !KeyMatches(key))
+            var expected = Encoding.UTF8.GetBytes(_settings.DropKey);
+            if (!KeysFrom(request.RawQuery).Any(k => Matches(k, expected)))
             {
-                await WriteAsync(stream, 403, "text/plain", "Not paired."u8.ToArray());
+                await WriteAsync(stream, exchange, 403, "text/plain", "Not paired."u8.ToArray());
                 return;
             }
 
-            await RouteAsync(stream, request, buffered, bodyRead, timeout.Token);
+            await RouteAsync(stream, request, buffered, exchange, timeout.Token);
         }
         catch (OperationCanceledException)
         {
             // Ran out of time. Say so rather than closing silently: an empty read is
             // indistinguishable from a crash, and the phone has no way to tell why.
-            try
-            {
-                if (stream is not null)
-                    await WriteAsync(stream, 408, "text/plain", "Request timed out."u8.ToArray());
-            }
-            catch { }
+            await TryFailAsync(stream, exchange, 408, "text/plain", "Request timed out."u8.ToArray());
         }
         catch (Exception ex)
         {
             DebugLog.Write($"drop request failed: {ex.Message}");
+            // Say something. A full disk or a permission error inside the store used to
+            // close the connection with no answer at all, which the phone shows as a
+            // network failure: the same "an empty read is indistinguishable from a crash"
+            // the 408 above exists for.
+            await TryFailAsync(stream, exchange, 500, "application/json",
+                """{"error":"the PC could not finish that"}"""u8.ToArray());
         }
         finally
         {
@@ -363,7 +382,7 @@ public sealed class DropServer
             // every ordinary request, which is a slot off the cap for nothing.
             if (stream is not null)
             {
-                if (request is null || (request.ContentLength > 0 && !bodyRead.Done))
+                if (request is null || (request.ContentLength > 0 && !exchange.BodyRead))
                     await CloseGracefullyAsync(client, stream);
                 stream.Dispose();
             }
@@ -394,27 +413,75 @@ public sealed class DropServer
     /// Fixed-time comparison of the pairing key. Length mismatch returns false by design;
     /// the key is a fixed length, so that leaks nothing an attacker did not already send.
     /// </summary>
-    private bool KeyMatches(string supplied)
-        => CryptographicOperations.FixedTimeEquals(
-            Encoding.UTF8.GetBytes(supplied), Encoding.UTF8.GetBytes(_settings.DropKey));
-
     /// <summary>
-    /// Whether the route read the body the request declared. The close path needs to know:
-    /// a body left unread is what turns a close into a reset, and draining when there is
-    /// nothing to drain costs a connection slot the full drain deadline for no reason.
+    /// Fixed-time comparison against the key, encoded once by the caller: a query can
+    /// carry thousands of "k=" values and each one used to encode the key again.
+    /// Length mismatch returns false by design; the key is a fixed length, so that leaks
+    /// nothing an attacker did not already send.
     /// </summary>
-    private sealed class BodyRead
+    private static bool Matches(string supplied, byte[] expected)
+        => CryptographicOperations.FixedTimeEquals(Encoding.UTF8.GetBytes(supplied), expected);
+
+    /// <summary>What happened to one request, for the paths that run after it.</summary>
+    internal sealed class Exchange
     {
-        public bool Done;
+        /// <summary>
+        /// Whether the route read the body the request declared. A body left unread is
+        /// what turns a close into a reset, and draining when there is nothing to drain
+        /// costs a connection slot the full drain deadline for no reason.
+        /// </summary>
+        public bool BodyRead;
+
+        /// <summary>
+        /// Whether any bytes of a response have gone out. Once they have, this connection
+        /// can no longer carry an error: a download that fails halfway is already a
+        /// stream of file bytes, and writing "HTTP/1.1 408" onto the end of it puts a
+        /// response header inside the photo the phone is saving. A truncated file is
+        /// honest; a corrupted one is not.
+        /// </summary>
+        public bool Responded;
     }
 
-    private async Task RouteAsync(
-        NetworkStream stream, DropRequest request, byte[] buffered, BodyRead bodyRead, CancellationToken ct)
+    /// <summary>
+    /// Reports a failure, but only while the connection can still carry one.
+    ///
+    /// Once a response has started there is no way to say "actually that failed": the
+    /// bytes already sent are a file, and appending a status line writes an HTTP header
+    /// into the middle of it. Closing on the phone mid-download leaves a short file,
+    /// which every client can tell is short. That is the better of the two.
+    ///
+    /// The write gets a deadline of its own. The failure this most often follows is a
+    /// peer that stopped reading, and writing to one of those blocks until the operating
+    /// system gives up, which is minutes with a connection held the whole time.
+    /// </summary>
+    internal static async Task TryFailAsync(
+        Stream? stream, Exchange exchange, int status, string contentType, byte[] body)
+    {
+        if (stream is null || exchange.Responded)
+            return;
+        try
+        {
+            using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+            await WriteRawAsync(stream, status, contentType, body, deadline.Token);
+        }
+        catch
+        {
+            // The peer is gone or will not read. There is nothing left to tell it.
+        }
+    }
+
+    /// <summary>
+    /// Internal so a test can drive it over a stream that fails partway through a body,
+    /// which is the one thing a socket test cannot arrange: by the time a real download
+    /// fails, the peer is usually gone and cannot observe what is written after it.
+    /// </summary>
+    internal async Task RouteAsync(
+        Stream stream, DropRequest request, byte[] buffered, Exchange exchange, CancellationToken ct)
     {
         switch (request.Method, request.Path)
         {
             case ("GET", "/"):
-                await WriteAsync(stream, 200, "text/html; charset=utf-8", Encoding.UTF8.GetBytes(DropPage.Html));
+                await Respond(200, "text/html; charset=utf-8", Encoding.UTF8.GetBytes(DropPage.Html));
                 return;
 
             case ("GET", "/share"):
@@ -431,19 +498,19 @@ public sealed class DropServer
 
                 if (string.IsNullOrWhiteSpace(shared))
                 {
-                    await WriteAsync(stream, 400, "text/html; charset=utf-8",
+                    await Respond(400, "text/html; charset=utf-8",
                         Encoding.UTF8.GetBytes(DropPage.Result("Nothing to send", "The share arrived empty.")));
                     return;
                 }
                 var item = _store.AddText(shared, from: "phone");
-                await WriteAsync(stream, 200, "text/html; charset=utf-8",
+                await Respond(200, "text/html; charset=utf-8",
                     Encoding.UTF8.GetBytes(DropPage.Result(
                         item.Kind == "link" ? "Link sent" : "Message sent", Preview(item.Text))));
                 return;
             }
 
             case ("GET", "/setup"):
-                await WriteAsync(stream, 200, "text/html; charset=utf-8",
+                await Respond(200, "text/html; charset=utf-8",
                     Encoding.UTF8.GetBytes(DropPage.Setup(
                         _settings.DropKey, HostFor(request.Host, LocalAddress), _settings.DropPort)));
                 return;
@@ -459,17 +526,17 @@ public sealed class DropServer
                     from = i.From,
                     at = i.AddedUtc,
                 }).ToArray();
-                await WriteAsync(stream, 200, "application/json", JsonSerializer.SerializeToUtf8Bytes(items));
+                await Respond(200, "application/json", JsonSerializer.SerializeToUtf8Bytes(items));
                 return;
             }
 
             case ("POST", "/send"):
             {
-                var body = await ReadBodyAsync(stream, request.ContentLength, 64 * 1024, buffered, ct);
-                bodyRead.Done = body is not null;
+                var body = await ReadBodyAsync(stream, request.ContentLength, 64 * 1024, buffered, ct, StallTimeout);
+                exchange.BodyRead = body is not null;
                 if (body is null)
                 {
-                    await WriteAsync(stream, 400, "application/json", """{"error":"incomplete request"}"""u8.ToArray());
+                    await Respond(400, "application/json", """{"error":"incomplete request"}"""u8.ToArray());
                     return;
                 }
                 string text = "";
@@ -483,11 +550,11 @@ public sealed class DropServer
 
                 if (text.Trim().Length == 0)
                 {
-                    await WriteAsync(stream, 400, "application/json", """{"error":"empty"}"""u8.ToArray());
+                    await Respond(400, "application/json", """{"error":"empty"}"""u8.ToArray());
                     return;
                 }
                 _store.AddText(text, from: "phone");
-                await WriteAsync(stream, 200, "application/json", """{"ok":true}"""u8.ToArray());
+                await Respond(200, "application/json", """{"ok":true}"""u8.ToArray());
                 return;
             }
 
@@ -497,13 +564,13 @@ public sealed class DropServer
                 {
                     // Folding this into the size check told the phone a zero byte file
                     // was too large, which is not a thing anyone can act on.
-                    await WriteAsync(stream, 400, "application/json",
+                    await Respond(400, "application/json",
                         """{"error":"that file is empty"}"""u8.ToArray());
                     return;
                 }
                 if (request.ContentLength > MaxUploadBytes)
                 {
-                    await WriteAsync(stream, 413, "application/json", """{"error":"too large"}"""u8.ToArray());
+                    await Respond(413, "application/json", """{"error":"too large"}"""u8.ToArray());
                     return;
                 }
                 // The body is the raw file. The page posts it directly rather than as
@@ -516,13 +583,13 @@ public sealed class DropServer
                 try
                 {
                     bool complete = await CopyBodyToFileAsync(
-                        stream, request.ContentLength, MaxUploadBytes, buffered, staging, ct);
-                    bodyRead.Done = complete;
+                        stream, request.ContentLength, MaxUploadBytes, buffered, staging, ct, StallTimeout);
+                    exchange.BodyRead = complete;
                     if (!complete)
                     {
                         // A phone that walked out of Wi-Fi range mid-transfer used to leave
                         // a truncated file recorded as a complete one, with a 200 to match.
-                        await WriteAsync(stream, 400, "application/json",
+                        await Respond(400, "application/json",
                             """{"error":"transfer did not complete; nothing was saved"}"""u8.ToArray());
                         return;
                     }
@@ -532,7 +599,7 @@ public sealed class DropServer
                 {
                     try { File.Delete(staging); } catch { }
                 }
-                await WriteAsync(stream, 200, "application/json", """{"ok":true}"""u8.ToArray());
+                await Respond(200, "application/json", """{"ok":true}"""u8.ToArray());
                 return;
             }
 
@@ -544,12 +611,30 @@ public sealed class DropServer
                     if (_store.Find(id) is { IsFile: true } item
                         && _store.PathFor(item) is { } path && File.Exists(path))
                     {
-                        await WriteFileAsync(stream, path, item.Text);
+                        await SendFile(path, item.Text);
                         return;
                     }
                 }
-                await WriteAsync(stream, 404, "text/plain", "Not found."u8.ToArray());
+                await Respond(404, "text/plain", "Not found."u8.ToArray());
                 return;
+        }
+
+        // Every write in this method goes through one of these two, so that the handler
+        // above knows whether this connection still has room for an error response. The
+        // two replies it writes before reaching here set the flag themselves.
+        // With the token: without it every response wrote under no deadline at all, so a
+        // keyed peer that stopped reading a large /items answer wedged a connection slot.
+        Task Respond(int status, string contentType, byte[] body)
+            => WriteAsync(stream, exchange, status, contentType, body, ct, StallTimeout);
+
+        async Task SendFile(string path, string downloadName)
+        {
+            // Opened before the flag is set, because opening is what fails when a scanner
+            // or a backup is holding the file, and nothing has gone out at that point:
+            // this request can still be answered with an error.
+            using var file = File.OpenRead(path);
+            exchange.Responded = true;
+            await WriteFileAsync(stream, file, downloadName, StallTimeout, ct);
         }
     }
 
@@ -707,7 +792,16 @@ public sealed class DropServer
         {
             return fallback();
         }
-        return host;
+
+        // Back into brackets if it needs them: an IPv6 address written bare turns
+        // "http://{host}:{port}/" into something no browser can parse.
+        // A zone id ("fe80::1%12") needs percent escaping to survive in a url, and the
+        // phone is not on this machine's link-local scope anyway, so it is dropped.
+        if (address.AddressFamily != AddressFamily.InterNetworkV6)
+            return host;
+        string bare6 = host.Trim('[', ']');
+        int zone = bare6.IndexOf('%');
+        return $"[{(zone < 0 ? bare6 : bare6[..zone])}]";
     }
 
     /// <summary>Every unicast address on this machine, as text.</summary>
@@ -740,10 +834,10 @@ public sealed class DropServer
     /// that do not: "context=" ends in "text=" without being it, and stopping at the
     /// first match threw away the real share that followed it.
     /// </summary>
-    internal static int MarkerIndex(string rawQuery, string name)
+    internal static int MarkerIndex(string rawQuery, string name, int start = 0)
     {
         string marker = name + "=";
-        for (int from = 0; from + marker.Length <= rawQuery.Length; )
+        for (int from = start; from + marker.Length <= rawQuery.Length; )
         {
             int mark = rawQuery.IndexOf(marker, from, StringComparison.OrdinalIgnoreCase);
             if (mark < 0)
@@ -756,18 +850,35 @@ public sealed class DropServer
     }
 
     /// <summary>
-    /// The pairing key as sent: the first "k=" that starts a parameter, up to the next
-    /// "&amp;". Not from the parsed query, because that is last-wins and the shared item
-    /// is appended raw, so a shared link carrying its own "k=" would decide who is paired.
+    /// Every "k=" that starts a parameter, in order.
+    ///
+    /// All of them, because there is no position that is reliably ours. The share sheet
+    /// appends the shared item to the address raw, and a shared link can carry a "k=" of
+    /// its own: an Amazon search url does. Whether that one lands before or after the
+    /// pairing key depends only on which end of the address the Shortcut puts the input,
+    /// so taking the last matched the link and taking the first matched the link in the
+    /// other ordering. Both were wrong; only comparing them all is not.
+    ///
+    /// It does not weaken the gate. A caller still has to send the real key somewhere,
+    /// and extra values that are not it buy nothing. It does turn one request into as
+    /// many guesses as fit in a 16 KB head, on the order of five thousand, where before
+    /// it was one. Against 96 bits of key that is not a number that matters.
     /// </summary>
-    internal static string? KeyFrom(string rawQuery)
+    internal static IEnumerable<string> KeysFrom(string rawQuery)
     {
-        int mark = MarkerIndex(rawQuery, "k");
-        if (mark < 0)
-            return null;
-        int start = mark + 2;
-        int end = rawQuery.IndexOf('&', start);
-        return Decode(end < 0 ? rawQuery[start..] : rawQuery[start..end]);
+        for (int from = 0; from < rawQuery.Length; )
+        {
+            int mark = MarkerIndex(rawQuery, "k", from);
+            if (mark < 0)
+                yield break;
+
+            int start = mark + 2;
+            int end = rawQuery.IndexOf('&', start);
+            yield return Decode(end < 0 ? rawQuery[start..] : rawQuery[start..end]);
+            if (end < 0)
+                yield break;
+            from = end + 1;
+        }
     }
 
     /// <summary>
@@ -833,7 +944,8 @@ public sealed class DropServer
     /// Returns false when the transfer did not complete, and the caller keeps nothing.
     /// </summary>
     internal static async Task<bool> CopyBodyToFileAsync(
-        Stream stream, long length, long cap, byte[] alreadyRead, string path, CancellationToken ct = default)
+        Stream stream, long length, long cap, byte[] alreadyRead, string path,
+        CancellationToken ct = default, TimeSpan? stallAfter = null)
     {
         if (length <= 0 || length > cap)
             return false;
@@ -852,7 +964,11 @@ public sealed class DropServer
         while (written < length)
         {
             int want = (int)Math.Min(chunk.Length, length - written);
-            int read = await stream.ReadAsync(chunk.AsMemory(0, want), ct);
+            // Per chunk, not per transfer: a large photo from a slow phone is allowed to
+            // take its time, and one that has stopped moving is not.
+            using var stall = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            stall.CancelAfter(stallAfter ?? DefaultStall);
+            int read = await stream.ReadAsync(chunk.AsMemory(0, want), stall.Token);
             if (read == 0)
                 return false; // peer stopped before sending what it promised
             await file.WriteAsync(chunk.AsMemory(0, read), ct);
@@ -867,7 +983,8 @@ public sealed class DropServer
     /// than stored as a complete one and answered with success.
     /// </summary>
     internal static async Task<byte[]?> ReadBodyAsync(
-        Stream stream, long length, long cap, byte[]? alreadyRead = null, CancellationToken ct = default)
+        Stream stream, long length, long cap, byte[]? alreadyRead = null,
+        CancellationToken ct = default, TimeSpan? stallAfter = null)
     {
         if (length <= 0 || length > cap)
             return null;
@@ -885,7 +1002,12 @@ public sealed class DropServer
 
         while (filled < buffer.Length)
         {
-            int read = await stream.ReadAsync(buffer.AsMemory(filled), ct);
+            // The same per-read bound the file paths have. Without it this loop was held
+            // open by the whole transfer budget, which is ten minutes and a connection
+            // slot, for a peer that sent a Content-Length and then went quiet.
+            using var stall = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            stall.CancelAfter(stallAfter ?? DefaultStall);
+            int read = await stream.ReadAsync(buffer.AsMemory(filled), stall.Token);
             if (read == 0)
                 return null; // peer went away before sending what it promised
             filled += read;
@@ -893,13 +1015,37 @@ public sealed class DropServer
         return buffer;
     }
 
-    private static async Task WriteAsync(NetworkStream stream, int status, string contentType, byte[] body)
+    /// <summary>
+    /// Writes a response and records that one has begun.
+    ///
+    /// The recording happens here rather than at the call sites because three of them
+    /// forgot: the flag is what stops an error being appended to a reply already in
+    /// flight, and a reply written without setting it is exactly the case that puts an
+    /// HTTP header inside the photo the phone is saving. There is one way to write, and
+    /// it cannot be used without saying so.
+    /// </summary>
+    internal static async Task WriteAsync(
+        Stream stream, Exchange exchange, int status, string contentType, byte[] body,
+        CancellationToken ct = default, TimeSpan? stallAfter = null)
+    {
+        exchange.Responded = true;
+        await WriteRawAsync(stream, status, contentType, body, ct, stallAfter);
+    }
+
+    /// <summary>
+    /// The bytes only, for the one caller that has already decided whether writing is
+    /// allowed. Everything else goes through <see cref="WriteAsync"/>.
+    /// </summary>
+    private static async Task WriteRawAsync(
+        Stream stream, int status, string contentType, byte[] body, CancellationToken ct = default,
+        TimeSpan? stallAfter = null)
     {
         string reason = status switch
         {
             200 => "OK", 400 => "Bad Request", 403 => "Forbidden",
             404 => "Not Found", 408 => "Request Timeout", 413 => "Payload Too Large",
-            431 => "Request Header Fields Too Large", 501 => "Not Implemented",
+            431 => "Request Header Fields Too Large", 500 => "Internal Server Error",
+            501 => "Not Implemented",
             503 => "Service Unavailable", _ => "Error",
         };
         // no-referrer keeps the pairing key out of any Referer a future link might send.
@@ -915,17 +1061,67 @@ public sealed class DropServer
             + "style-src 'unsafe-inline'; connect-src 'self'; form-action 'none'; "
             + "frame-ancestors 'none'\r\n"
             + "Connection: close\r\n\r\n");
-        await stream.WriteAsync(head);
-        await stream.WriteAsync(body);
+        // Stall bounded like a file body: /items can be megabytes, and a peer that stops
+        // reading one used to hold its connection for the whole transfer budget.
+        //
+        // Small replies, which is nearly all of them, go out in one write. Sending a
+        // twelve byte {"ok":true} through the chunked copy cost two streams and two
+        // 64 KB buffers, on the path the phone takes for every item it sends.
+        TimeSpan stall = stallAfter ?? DefaultStall;
+        await WriteBoundedAsync(stream, head, stall, ct);
+        if (body.Length > 0)
+            await WriteBoundedAsync(stream, body, stall, ct);
     }
 
-    private static async Task WriteFileAsync(NetworkStream stream, string path, string downloadName)
+    /// <summary>One write for anything that fits a chunk, the chunked copy above that.</summary>
+    private static async Task WriteBoundedAsync(
+        Stream stream, byte[] bytes, TimeSpan stallAfter, CancellationToken ct)
     {
-        // Open before measuring and before writing headers. Taking the length from a
-        // FileInfo and then opening leaves a window where eviction deletes the file, and
-        // the phone has already been promised that many bytes.
-        using var file = File.OpenRead(path);
+        if (bytes.Length > CopyChunkBytes)
+        {
+            using var source = new MemoryStream(bytes);
+            await CopyWithStallTimeoutAsync(source, stream, stallAfter, ct);
+            return;
+        }
+        using var stall = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        stall.CancelAfter(stallAfter);
+        await stream.WriteAsync(bytes, stall.Token);
+    }
 
+    /// <summary>
+    /// Sends a file, giving up only when it stops making progress.
+    ///
+    /// The request deadline is a total, and a total is the wrong shape for a body: the
+    /// cap on one item is 100 MB, which needs a sustained 27 Mbps to finish inside thirty
+    /// seconds, and a phone at the far end of the house does not have that. What deserves
+    /// to be cut off is a transfer that has stalled, not one that is merely slow, so each
+    /// chunk gets its own window and finishing one earns the next.
+    /// </summary>
+    private static async Task CopyWithStallTimeoutAsync(
+        Stream file, Stream stream, TimeSpan stallAfter, CancellationToken ct)
+    {
+        var chunk = new byte[CopyChunkBytes];
+        while (true)
+        {
+            int read = await file.ReadAsync(chunk, ct);
+            if (read == 0)
+                return;
+
+            using var stall = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            stall.CancelAfter(stallAfter);
+            await stream.WriteAsync(chunk.AsMemory(0, read), stall.Token);
+        }
+    }
+
+    /// <param name="file">
+    /// Already open, and measured from the handle. Taking the length from a FileInfo and
+    /// then opening leaves a window where eviction deletes the file after the phone has
+    /// been promised that many bytes. Opening it is also the step that fails when the
+    /// file is locked, and the caller needs that to happen before it commits to a reply.
+    /// </param>
+    private static async Task WriteFileAsync(
+        Stream stream, FileStream file, string downloadName, TimeSpan stallAfter, CancellationToken ct)
+    {
         // Strip anything that could break out of the header value or forge a new one.
         string safe = new string(downloadName
             .Where(c => c is not ('"' or '\r' or '\n' or '\0') && !char.IsControl(c))
@@ -935,7 +1131,7 @@ public sealed class DropServer
             + $"Content-Disposition: attachment; filename=\"{safe}\"\r\n"
             + $"Content-Length: {file.Length}\r\nReferrer-Policy: no-referrer\r\n"
             + "X-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n");
-        await stream.WriteAsync(head);
-        await file.CopyToAsync(stream);
+        await WriteBoundedAsync(stream, head, stallAfter, ct);
+        await CopyWithStallTimeoutAsync(file, stream, stallAfter, ct);
     }
 }

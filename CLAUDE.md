@@ -91,9 +91,12 @@ personal: read what the task requires, nothing more.
   the Shortcut. `/share` is a GET that changes state, which is deliberate: an iOS
   Shortcut is one action for a GET, there is no ambient authority to forge, and the
   key is the only credential.
-- The drop deletes files it thinks are unreferenced when it opens, so anything that
-  makes `Load` drop an entry can cost the user a photo. It stands down unless the
-  index parsed and every entry in it survived.
+- The drop moves files nothing refers to into `drop/orphans` when it opens, rather
+  than deleting them: this judgement has been wrong twice, both times costing a photo.
+  It also stands down entirely unless the index parsed and every entry survived, and
+  it counts the recovery index (`items.json.recovered`, written when the real one
+  could not be read) as referencing files too. The drop window says how many files
+  are set aside and opens the folder when you click it.
 
 Agent actions are visualized: /click and /type animate a blue cursor to the
 target, ripple, and flash the element, so the user can watch the agent work.

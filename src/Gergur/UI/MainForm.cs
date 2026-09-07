@@ -1128,6 +1128,23 @@ public sealed class MainForm : Form
         _settings.DropEnabled = true;
         _settings.Save();
         _session.StartPhoneBridge();
+
+        // A failed start used to leave the setting on with nothing listening, so the next
+        // launch would try again, fail again and say nothing, while the setting claimed
+        // the feature was on. Turning it back off makes the state match what happened.
+        if (_session.PhoneBridge is null)
+        {
+            _settings.DropEnabled = false;
+            _settings.Save();
+            // A box, not the status bar. This answers a question the user was just asked
+            // in a dialog, and the status label shares one line with five others, so the
+            // half that says what to do is the half that gets clipped.
+            MessageBox.Show(
+                this,
+                $"Phone drop could not start.\n\n{_session.PhoneBridgeError}",
+                "Gergur", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
         ShowPairingLink();
     }
 

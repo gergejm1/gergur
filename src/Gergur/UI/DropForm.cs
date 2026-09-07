@@ -117,7 +117,21 @@ public sealed class DropForm : Form
         };
         composeHost.Controls.Add(_compose);
 
-        _count = new Label { ForeColor = Palette.TextDim, TextAlign = ContentAlignment.MiddleLeft };
+        _count = new Label
+        {
+            ForeColor = Palette.TextDim,
+            TextAlign = ContentAlignment.MiddleLeft,
+            // A hard cut with no ellipsis reads as a finished sentence that happens to
+            // stop. If there is genuinely no room, say so with the dots.
+            AutoEllipsis = true,
+        };
+        // Files are set aside under the profile, where nobody would ever find them.
+        // Telling the user it happened is only half of it; this is the other half.
+        //
+        // The drop folder rather than the quarantine folder: what was set aside can be a
+        // file in orphans or an index written beside items.json, and opening a folder
+        // this handler had to create to have somewhere to point at is worse than useless.
+        _count.Click += (_, _) => OpenSetAsideFolder();
         _sendButton = MakeButton("Send", (_, _) => Send());
         _openButton = MakeButton("Open", (_, _) => OpenSelected());
         _folderButton = MakeButton("Show in folder", (_, _) => ShowInFolder());
@@ -137,6 +151,20 @@ public sealed class DropForm : Form
         Load += (_, _) => { Reload(); _compose.Focus(); };
     }
 
+    private void OpenSetAsideFolder()
+    {
+        if (_drop.SetAsideCount == 0)
+            return;
+        try
+        {
+            Process.Start(new ProcessStartInfo(_drop.DropDir) { UseShellExecute = true });
+        }
+        catch
+        {
+            // Explorer refusing to open is not worth an error dialog here.
+        }
+    }
+
     private static Button MakeButton(string text, EventHandler onClick)
     {
         var button = new Button
@@ -148,6 +176,9 @@ public sealed class DropForm : Form
             ForeColor = Palette.Text,
             Padding = new Padding(10, 3, 10, 3),
             UseVisualStyleBackColor = false,
+            // Buttons do not ellipsize on their own, so a squeezed row used to hard cut
+            // "Show in folder" to "Show in fo" and read as a different action.
+            AutoEllipsis = true,
         };
         button.FlatAppearance.BorderColor = Palette.Border;
         button.FlatAppearance.MouseOverBackColor = Palette.ButtonHover;
@@ -210,11 +241,25 @@ public sealed class DropForm : Form
             }
         }
 
-        _count.Text = _drop.Items.Count == 0
-            ? "Nothing here yet."
-            : $"{_drop.Items.Count} item{(_drop.Items.Count == 1 ? "" : "s")}";
+        int setAside = _drop.SetAsideCount;
+        _count.Text = CountText(_drop.Items.Count, setAside);
+        _count.Cursor = setAside > 0 ? Cursors.Hand : Cursors.Default;
         UpdateButtons();
         LayoutColumns();
+    }
+
+    /// <summary>
+    /// What the footer says. The second half exists because the store now sets things
+    /// aside rather than deleting them when it cannot account for a file, and a recovery
+    /// folder nobody is told about is not recovery: it is a folder quietly filling up
+    /// with the user's photos in a place they will never look.
+    /// </summary>
+    internal static string CountText(int items, int setAside)
+    {
+        string counted = items == 0 ? "Nothing here yet." : $"{items} item{(items == 1 ? "" : "s")}";
+        return setAside == 0
+            ? counted
+            : $"{counted}   ·   {setAside} thing{(setAside == 1 ? "" : "s")} set aside, click to open";
     }
 
     private static string When(DateTime utc)
@@ -311,12 +356,28 @@ public sealed class DropForm : Form
         var widths = buttons
             .Select(b => Math.Max(Scale(64), b.GetPreferredSize(Size.Empty).Width + gap))
             .ToArray();
-        int available = _footer.ClientSize.Width - (pad * 2) - (gap * (buttons.Length - 1));
+        // The label on the left is not leftovers. It is the only place the user is told
+        // that a file was set aside, and taking whatever the buttons did not want left it
+        // 0 pixels wide at the minimum window size and 75 at the default: the sentence was
+        // cut off before it said anything.
+        //
+        // Taken off the top, before the buttons are sized. Reserving only what was spare
+        // was arithmetic that cancelled out: the buttons always got their preferred width
+        // first, so the label came out 0 pixels wide at the minimum window size, which is
+        // where it most needs to be readable. The buttons ellipsize (see MakeButton), so
+        // what they give up here is the tail of a caption, not the ability to be clicked.
+        int row = _footer.ClientSize.Width - (pad * 2) - (gap * (buttons.Length - 1));
+        int floor = Scale(40) * buttons.Length;
+        int countWanted = TextRenderer.MeasureText(_count.Text, _count.Font).Width + gap;
+        int countRoom = Math.Clamp(Math.Min(countWanted, Scale(200)), 0, Math.Max(0, row - floor));
+
+        int available = row - countRoom;
         int needed = widths.Sum();
         if (needed > available && available > 0)
         {
             // Shrink the row to fit rather than let one escape the footer. Captions
-            // ellipsize, which is a better failure than a button nobody can click.
+            // ellipsize (see MakeButton), which is a better failure than a button that
+            // has slid off the edge and cannot be clicked at all.
             for (int i = 0; i < widths.Length; i++)
                 widths[i] = Math.Max(Scale(40), widths[i] * available / needed);
         }
@@ -380,4 +441,7 @@ public sealed class DropForm : Form
     /// <summary>The footer and its buttons, for the layout test that guards against clipping.</summary>
     internal (Control Footer, IReadOnlyList<Control> Buttons) FooterControls
         => (_footer, [_sendButton, _openButton, _folderButton, _removeButton]);
+
+    /// <summary>The count label, for the test that it is not squeezed out of existence.</summary>
+    internal Label CountLabel => _count;
 }

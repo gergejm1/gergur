@@ -1,5 +1,6 @@
 using System.Text;
 using Gergur.App;
+using Gergur.Data;
 using Xunit;
 
 namespace Gergur.Tests;
@@ -187,6 +188,10 @@ public sealed class SharedValueTests
     [InlineData("k=KEY&text=https://x/?a=1&url=hi", "https://x/?a=1&url=hi")]
     // the share can come first
     [InlineData("text=hello&k=KEY", "hello&k=KEY")]
+    // a Shortcut set to accept both Text and URLs sends both and leaves one empty
+    [InlineData("k=KEY&text=&url=https://example.com/x", "https://example.com/x")]
+    [InlineData("k=KEY&url=&text=my note", "my note")]
+    [InlineData("k=KEY&url=&text=https://x/?a=1&b=2", "https://x/?a=1&b=2")]
     // percent escapes decode; "+" is a space; a malformed escape stays as written
     [InlineData("k=KEY&text=my%20note", "my note")]
     [InlineData("k=KEY&text=a+b", "a b")]
@@ -218,7 +223,7 @@ public sealed class SharedValueTests
         => Assert.Equal("a&k=other", DropServer.StripKey("a&k=other", "0123456789ABCDEF01234567"));
 
     /// <summary>The addresses this machine is pretending to have, for HostFor.</summary>
-    private static IEnumerable<string> Mine() => ["192.168.0.20", "10.1.2.3", "fe80::1"];
+    private static IEnumerable<string> Mine() => ["192.168.0.20", "10.1.2.3", "fe80::1", "fe80::1%12"];
 
     [Theory]
     [InlineData("192.168.0.20:24003", "192.168.0.20")]
@@ -226,7 +231,8 @@ public sealed class SharedValueTests
     [InlineData("10.1.2.3:24003", "10.1.2.3")]
     [InlineData("[fe80::1]:24003", "[fe80::1]")]
     [InlineData("[fe80::1]", "[fe80::1]")]
-    [InlineData("fe80::1", "fe80::1")]     // bracketless, and the colons are the address
+    [InlineData("fe80::1", "[fe80::1]")]   // bracketless in, bracketed out, or no url parses
+    [InlineData("[fe80::1%12]:24003", "[fe80::1]")]   // the zone id would need escaping
     public void TheSetupPageUsesTheAddressThePhoneReachedUsOn(string header, string expected)
         => Assert.Equal(expected, DropServer.HostFor(header, () => "guessed", Mine));
 
@@ -354,21 +360,36 @@ public sealed class DropServerGateTests
     [Theory]
     [InlineData("k=KEY", "KEY")]
     [InlineData("k=KEY&text=hello", "KEY")]
-    // the share is appended raw, so a shared link brings its own parameters with it
+    // The share is appended raw, so a shared link brings its own parameters with it, and
+    // an Amazon search url really does carry "&k=". Whether it lands before or after the
+    // pairing key depends only on which end the Shortcut puts the input, so neither the
+    // first nor the last is reliably ours: all of them are compared.
     [InlineData("k=KEY&text=https://maps.example.com/?q=cafe&k=abc123", "KEY")]
     [InlineData("k=KEY&url=https://x/?k=other&z=1", "KEY")]
+    [InlineData("text=https://www.amazon.com/s?i=electronics&k=laptop&k=KEY", "KEY")]
+    [InlineData("text=https://x/?k=a&k=b&k=KEY", "KEY")]
     // a name merely ending in "k" is not the key
     [InlineData("bk=no&k=KEY", "KEY")]
     [InlineData("k=KEY%20spaced", "KEY spaced")]
-    public void TheKeyIsTheOneWeWereSentAndNotTheOneTheLinkCarries(string rawQuery, string expected)
-        => Assert.Equal(expected, DropServer.KeyFrom(rawQuery));
+    public void TheRealKeyIsFoundWhereverTheLinkPutItsOwn(string rawQuery, string expected)
+        => Assert.Contains(expected, DropServer.KeysFrom(rawQuery));
 
     [Theory]
-    [InlineData("")]
-    [InlineData("text=hello")]
-    [InlineData("bk=no")]
-    public void NoKeyMeansNoKey(string rawQuery)
-        => Assert.Null(DropServer.KeyFrom(rawQuery));
+    [InlineData("", new string[0])]
+    [InlineData("text=hello", new string[0])]
+    [InlineData("bk=no", new string[0])]
+    // Asserting the whole sequence, because a KeysFrom that returned nothing at all
+    // would satisfy "does not contain the key" while refusing every real request.
+    //
+    // The link's own "k=" here follows a "?", so it does not start a parameter and is
+    // never even a candidate. Only one that follows an "&" is.
+    [InlineData("k=wrong&text=https://x/?k=alsowrong", new[] { "wrong" })]
+    [InlineData("k=one&k=two", new[] { "one", "two" })]
+    public void EveryCandidateIsOfferedAndNoneOfTheseIsTheKey(string rawQuery, string[] expected)
+    {
+        Assert.Equal(expected, DropServer.KeysFrom(rawQuery));
+        Assert.DoesNotContain("KEY", DropServer.KeysFrom(rawQuery));
+    }
 
     [Fact]
     public void ARequestArrivingAsTheServerStopsStillGetsAWorkingDeadline()
@@ -401,5 +422,183 @@ public sealed class DropServerGateTests
     {
         using var timeout = DropServer.LinkedTimeout(null);
         Assert.False(timeout.IsCancellationRequested);
+    }
+}
+
+/// <summary>
+/// Whether a failure can still be reported. The end of a download cannot be tested
+/// through a socket, because by then the peer has usually gone and cannot observe what
+/// is written after it: the guard has to be checked where it is made.
+/// </summary>
+public sealed class DropServerFailureReportingTests
+{
+    [Fact]
+    public async Task NothingIsWrittenOnceAResponseHasStarted()
+    {
+        // The defect this exists for: a download that fails halfway is already a stream
+        // of file bytes, so "HTTP/1.1 408 Request Timeout" written after it lands inside
+        // the photo the phone is saving. Measured on a real transfer as 2,883,584 bytes
+        // of image followed by a response header.
+        var sink = new MemoryStream();
+
+        await DropServer.TryFailAsync(
+            sink, new DropServer.Exchange { Responded = true }, 500, "text/plain", "boom"u8.ToArray());
+
+        Assert.Empty(sink.ToArray());
+    }
+
+    [Fact]
+    public async Task AFailureBeforeAnythingWentOutIsStillReported()
+    {
+        // The other half: closing silently reaches the phone as a network error with
+        // nothing to say what happened.
+        var sink = new MemoryStream();
+
+        await DropServer.TryFailAsync(
+            sink, new DropServer.Exchange(), 500, "application/json", """{"error":"nope"}"""u8.ToArray());
+
+        string written = Encoding.UTF8.GetString(sink.ToArray());
+        Assert.StartsWith("HTTP/1.1 500 Internal Server Error", written);
+        Assert.EndsWith("""{"error":"nope"}""", written);
+    }
+
+    [Fact]
+    public async Task WritingAResponseRecordsThatOneHasBegun()
+    {
+        // The flag lives inside the writer rather than at the call sites because three
+        // call sites forgot it. This is what makes that structural rather than a habit.
+        var sink = new MemoryStream();
+        var exchange = new DropServer.Exchange();
+
+        await DropServer.WriteAsync(sink, exchange, 200, "text/plain", "ok"u8.ToArray());
+
+        Assert.True(exchange.Responded, "a reply went out without recording that it had");
+        Assert.StartsWith("HTTP/1.1 200 OK", Encoding.UTF8.GetString(sink.ToArray()));
+    }
+
+    [Fact]
+    public async Task AMissingStreamIsNotAnError()
+        => await DropServer.TryFailAsync(null, new DropServer.Exchange(), 500, "text/plain", "x"u8.ToArray());
+}
+
+/// <summary>
+/// A download that fails after the body has started. Driven over a stream that breaks on
+/// purpose, because a socket cannot arrange this: by the time a real transfer fails the
+/// peer has usually gone, and what is written after it lands in nobody's file.
+/// </summary>
+public sealed class DownloadFailurePartwayTests : IDisposable
+{
+    private readonly string _root = Path.Combine(Path.GetTempPath(), $"gergur-partway-{Guid.NewGuid():N}");
+    private readonly DropStore _store;
+    private readonly DropServer _server;
+
+    public DownloadFailurePartwayTests()
+    {
+        _store = new DropStore(_root);
+        _server = new DropServer(_store, new Settings { DropPort = 24999, DropKey = "0123456789ABCDEF01234567" });
+    }
+
+    public void Dispose()
+    {
+        try { Directory.Delete(_root, recursive: true); } catch { }
+    }
+
+    /// <summary>Accepts a fixed number of bytes and then behaves like a peer that vanished.</summary>
+    private sealed class BreaksAfter(int limit) : Stream
+    {
+        private readonly MemoryStream _written = new();
+
+        public byte[] Delivered => _written.ToArray();
+
+        public override void Write(byte[] buffer, int offset, int count)
+            => WriteAsync(buffer.AsMemory(offset, count)).AsTask().GetAwaiter().GetResult();
+
+        public override ValueTask WriteAsync(
+            ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            if (_written.Length + buffer.Length > limit)
+                throw new IOException("the peer went away");
+            _written.Write(buffer.Span);
+            return ValueTask.CompletedTask;
+        }
+
+        public override Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken ct)
+            => WriteAsync(buffer.AsMemory(offset, count), ct).AsTask();
+
+        public override bool CanRead => false;
+        public override bool CanSeek => false;
+        public override bool CanWrite => true;
+        public override long Length => _written.Length;
+        public override long Position { get => _written.Position; set => throw new NotSupportedException(); }
+        public override void Flush() { }
+        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+    }
+
+    private DropServer.DropRequest Get(string path)
+        => new("GET", path, new Dictionary<string, string>(), 0, "k=KEY", "x");
+
+    [Fact]
+    public async Task AnOrdinaryReplyAlsoRecordsThatItHappened()
+    {
+        // Not only the download path: every route has to leave the exchange saying a
+        // reply went out, or an error can still be appended to one.
+        _store.AddText("something", from: "pc");
+        var sink = new BreaksAfter(64 * 1024);
+        var exchange = new DropServer.Exchange();
+
+        await _server.RouteAsync(sink, Get("/items"), [], exchange, default);
+
+        Assert.True(exchange.Responded);
+        Assert.StartsWith("HTTP/1.1 200 OK", Encoding.UTF8.GetString(sink.Delivered));
+    }
+
+    [Fact]
+    public async Task AFailedDownloadIsNotFollowedByAnErrorResponse()
+    {
+        // The defect: the bytes already sent are a photo, so a status line written after
+        // them lands inside the file the phone is saving. Measured on a real transfer as
+        // 2,753,104 bytes of image whose tail was "HTTP/1.1 408 Request Timeout".
+        var payload = new byte[256 * 1024];
+        Random.Shared.NextBytes(payload);
+        var item = _store.AddFile("big.bin", new MemoryStream(payload), from: "pc");
+
+        // Big enough that the head and at least one body chunk land before it breaks,
+        // so the failure really is partway through a body.
+        var sink = new BreaksAfter(96 * 1024);
+        var exchange = new DropServer.Exchange();
+
+        await Assert.ThrowsAsync<IOException>(
+            () => _server.RouteAsync(sink, Get($"/file/{item.Id}"), [], exchange, default));
+
+        // The handler's error paths both run through this, and both must now write nothing.
+        Assert.True(exchange.Responded, "the route did not record that a reply had begun");
+        await DropServer.TryFailAsync(sink, exchange, 408, "text/plain", "Request timed out."u8.ToArray());
+        await DropServer.TryFailAsync(sink, exchange, 500, "text/plain", "boom"u8.ToArray());
+
+        string delivered = Encoding.UTF8.GetString(sink.Delivered);
+        Assert.Equal(0, delivered.IndexOf("HTTP/1.1", StringComparison.Ordinal));
+        Assert.Equal(-1, delivered.IndexOf("HTTP/1.1", 1, StringComparison.Ordinal));
+        Assert.DoesNotContain("Request timed out", delivered);
+    }
+
+    [Fact]
+    public async Task AFailureBeforeTheBodyStartsIsStillReportable()
+    {
+        // Opening the file is what fails when something else is holding it, and nothing
+        // has gone out at that point, so this one must still be answerable.
+        var item = _store.AddFile("held.bin", new MemoryStream([1, 2, 3]), from: "pc");
+        using var held = File.Open(_store.PathFor(item)!, FileMode.Open, FileAccess.Read, FileShare.None);
+
+        var sink = new BreaksAfter(1024);
+        var exchange = new DropServer.Exchange();
+
+        await Assert.ThrowsAnyAsync<Exception>(
+            () => _server.RouteAsync(sink, Get($"/file/{item.Id}"), [], exchange, default));
+
+        Assert.False(exchange.Responded, "nothing was written, so the reply is still open");
+        await DropServer.TryFailAsync(sink, exchange, 500, "text/plain", "boom"u8.ToArray());
+        Assert.StartsWith("HTTP/1.1 500", Encoding.UTF8.GetString(sink.Delivered));
     }
 }

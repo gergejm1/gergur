@@ -233,7 +233,14 @@ internal static class DropPage
         var empty = document.getElementById("empty");
         var status = document.getElementById("status");
 
-        function say(text, hold) { status.textContent = text; if (text) setTimeout(function () { status.textContent = ""; }, hold || 2500); }
+        // The pending timer is cleared first: without that a second message inherits the
+        // first one's countdown and can vanish almost immediately.
+        var sayTimer = null;
+        function say(text, hold) {
+          status.textContent = text;
+          if (sayTimer) { clearTimeout(sayTimer); sayTimer = null; }
+          if (text) sayTimer = setTimeout(function () { status.textContent = ""; }, hold || 2500);
+        }
         function url(path) { return path + (path.indexOf("?") < 0 ? "?" : "&") + "k=" + encodeURIComponent(KEY); }
 
         function when(iso) {
@@ -250,6 +257,8 @@ internal static class DropPage
 
         function render(items) {
           list.textContent = "";
+          // Put the ordinary wording back: the error path in refresh() rewrites it.
+          empty.textContent = "Nothing here yet.";
           empty.hidden = items.length > 0;
           items.forEach(function (item) {
             var li = document.createElement("li");
@@ -302,7 +311,17 @@ internal static class DropPage
             .then(ok)
             .then(function (r) { return r.json(); })
             .then(render)
-            .catch(function (err) { say(err.message || "offline"); });
+            .catch(function (err) {
+              var why = err.message || "offline";
+              say(why);
+              // The status line clears itself after a couple of seconds, and the list is
+              // hidden until a render happens, so without this the first failed load
+              // leaves a blank page with nothing on it at all.
+              if (list.children.length === 0) {
+                empty.textContent = why + ". Reopen this page from the pairing link.";
+                empty.hidden = false;
+              }
+            });
         }
 
         // fetch only rejects on a network failure, so without this every refusal the
