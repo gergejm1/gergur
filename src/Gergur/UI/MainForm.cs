@@ -265,7 +265,12 @@ public sealed class MainForm : Form
         }));
 
         var blocker = _session?.Blocker;
-        var blocking = new ToolStripMenuItem($"Ad/tracker blocking ({(blocker?.Enabled == true ? "on" : "off")}, {blocker?.RuleCount ?? 0:N0} rules)")
+        // "no host list" rather than a count, because the built-in path rules mean the
+        // count is never zero now, and "5 rules" would read like a list had loaded.
+        string rules = blocker?.HasHostList == true
+            ? $"{blocker.RuleCount:N0} rules"
+            : "no host list";
+        var blocking = new ToolStripMenuItem($"Ad/tracker blocking ({(blocker?.Enabled == true ? "on" : "off")}, {rules})")
         {
             Checked = blocker?.Enabled == true,
         };
@@ -374,7 +379,7 @@ public sealed class MainForm : Form
         _session.Drop.ItemAdded += OnDropItemArrived;
 
         // First run with blocking on but no list yet: fetch one quietly.
-        if (_session.Blocker.Enabled && _session.Blocker.RuleCount == 0)
+        if (_session.Blocker.Enabled && !_session.Blocker.HasHostList)
             _ = UpdateBlocklistAsync(silent: true);
     }
 

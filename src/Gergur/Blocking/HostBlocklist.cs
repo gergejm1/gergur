@@ -48,6 +48,10 @@ public sealed class HostBlocklist
             };
             if (host is null || HostsFileNoise.Contains(host) || !host.Contains('.'))
                 continue;
+            // Same normalisation the lookup does, so the two agree: a line written
+            // "ads.example.com." would otherwise be stored in a form nothing can match.
+            if (host[^1] == '.')
+                host = host[..^1];
             yield return host;
         }
     }
@@ -58,6 +62,11 @@ public sealed class HostBlocklist
         if (_hosts.Count == 0 || string.IsNullOrEmpty(host))
             return false;
         ReadOnlySpan<char> span = host;
+        // "ads.example.com." is the same host as "ads.example.com", and a list of the
+        // second does not contain the first. Without this, every entry on both
+        // downloaded lists is reachable by appending one character to the name.
+        if (span[^1] == '.')
+            span = span[..^1];
         while (true)
         {
             if (_lookup.Contains(span))

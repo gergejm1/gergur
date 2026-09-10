@@ -1,9 +1,11 @@
 # Gergur
 
 Personal WebView2 browser (C#/.NET 10 WinForms). Build `dotnet build src\Gergur`,
-test `dotnet test`, run the published exe in `src\Gergur\bin\Release\net10.0-windows\publish\`.
-Always close Gergur before `dotnet publish` (the running exe locks the output),
-and let its engine processes exit before relaunching or new engine flags no-op.
+test `dotnet test`, run `src\Gergur\bin\Release\net10.0-windows\Gergur.exe` after
+`dotnet build src\Gergur -c Release`. There is a `publish\` beside it only once you
+have run `dotnet publish`, which nothing here needs. Always close Gergur before
+building Release (the running exe locks the output), and let its engine processes
+exit before relaunching or new engine flags no-op.
 
 ## Driving the browser (agent API)
 
@@ -104,6 +106,26 @@ personal: read what the task requires, nothing more.
 - `items.json.recovered*` is a session's work written beside an index it was not
   allowed to touch. Nothing reads it back into the list yet; it is preserved, counted
   and pointed at, and merging it is the obvious next thing here.
+- A YouTube ad can only be taken away **before the player commits to the break**.
+  Pruning the payload as `ytInitialPlayerResponse` and `ytInitialData` are assigned
+  works, and was measured over repeated loads where YouTube had actually scheduled an
+  ad. Pruning a *fetched* youtubei response instead hangs the player: the video never
+  starts at all. That held for a fetch wrapper, a global `JSON.parse` hook and a
+  `Response.prototype.json` hook alike, and whether they removed every ad key, only ad
+  renderers, or a single key. Hiding player furniture does the same: `#player-ads`
+  under `display: none` cost the video every run (three of three), and started every
+  run without it. So anything added to `adblock.js` has to be tried against a real ad,
+  in the browser, several times. Reading it cannot tell you, and neither can a single
+  run: YouTube only schedules an ad on some loads, so a load it offered nothing on
+  looks exactly like a load the blocker handled. Read whether an ad was scheduled out
+  of the page's own script text, which nothing here rewrites, and only compare loads
+  that were served one. `adblock.test.js` covers the pruning and drives the skip timer
+  against a stub page; what has never run in a browser is the skip itself, because on
+  every verified load the ad was gone before anything rendered. Green loads are
+  evidence for the pruning and say nothing about the skip.
+- YouTube stops starting playback through the WARP exit once it has seen enough
+  traffic from it, and it looks exactly like a broken ad blocker: permanent buffering,
+  no error. Turn the VPN off before suspecting anything else.
 
 Agent actions are visualized: /click and /type animate a blue cursor to the
 target, ripple, and flash the element, so the user can watch the agent work.

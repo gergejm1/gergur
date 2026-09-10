@@ -41,7 +41,7 @@ if ($Install) {
     throw "Close Gergur first: its running exe locks the files being copied."
   }
   if (-not (Test-Path (Join-Path $buildDir 'Gergur.exe'))) {
-    throw "No Release build found. Run: dotnet publish src\Gergur -c Release"
+    throw "No Release build found. Run: dotnet build src\Gergur -c Release"
   }
   New-Item -ItemType Directory -Force $installDir | Out-Null
   Copy-Item (Join-Path $buildDir '*') $installDir -Recurse -Force

@@ -17,11 +17,31 @@ public sealed class HostBlocklistTests
             "0.0.0.0 ads.example.com",
             "0.0.0.0 tracker.example.net # trailing comment",
             "bare-entry.example.org",
+            // A fully qualified line. Stored with its dot it would match nothing, since
+            // the lookup strips the dot off the host it is asked about.
+            "0.0.0.0 fqdn.example.com.",
             "",
             "   ",
         ];
         var hosts = HostBlocklist.ParseLines(lines).ToList();
-        Assert.Equal(["ads.example.com", "tracker.example.net", "bare-entry.example.org"], hosts);
+        Assert.Equal(
+            ["ads.example.com", "tracker.example.net", "bare-entry.example.org", "fqdn.example.com"],
+            hosts);
+    }
+
+    [Fact]
+    public void AFullyQualifiedNameMatchesEitherWayRound()
+    {
+        // The name and the list can each carry the trailing dot or not, and all four
+        // pairings are the same host. Normalising only one side left half of them open.
+        var plain = new HostBlocklist(["ads.example.com"]);
+        var dotted = new HostBlocklist(HostBlocklist.ParseLines(["ads.example.com."]));
+
+        Assert.True(plain.IsBlocked("ads.example.com"));
+        Assert.True(plain.IsBlocked("ads.example.com."));
+        Assert.True(dotted.IsBlocked("ads.example.com"));
+        Assert.True(dotted.IsBlocked("ads.example.com."));
+        Assert.False(plain.IsBlocked("notads.example.com"));
     }
 
     [Fact]
