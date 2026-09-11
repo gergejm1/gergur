@@ -123,6 +123,36 @@ personal: read what the task requires, nothing more.
   against a stub page; what has never run in a browser is the skip itself, because on
   every verified load the ad was gone before anything rendered. Green loads are
   evidence for the pruning and say nothing about the skip.
+- `home.html` asks for its icon at `favicon.png?v=<token>`, where the token is the first
+  eight hex of that icon's sha256, and `HomePageIconTests` fails when the two disagree.
+  The engine caches favicons per profile keyed on the icon url, and that cache sits
+  beside the profile rather than the build, so recolouring `favicon.png` in place changed
+  nothing anyone could see: the logo on the page went crimson, the tab strip went on
+  drawing the blue icon, and every check stayed green. Nothing renders `favicon.png`
+  except the strip, which is why it was the only place the old colour survived. What the
+  tab strip *draws* is the one thing nothing automated looks at (`ThemeContrastTests`
+  checks its colours, not its pixels), so anything that shows up only there needs a
+  guard like that one. Another bundled page with its own icon would need its own.
+  Confirmed in the browser on 2026-09-11, against the profile that was already holding
+  the blue icon: a new tab drew the old one before the change and the crimson one after
+  it. The cache key is the whole url, and
+  `HomePage.Url` is a `file://` path into the build output, so what the token retires is
+  an entry under `file:///.../Assets/favicon.png`.
+- The screenshots in the README were never captured from a committed build. Their title
+  bars separate the page from the app name with a long dash, and `MainForm.UpdateChrome`
+  has written `{Title} - Gergur` with a hyphen since `cc80de6`, which is the same commit
+  that added the images, so they were mocked or edited rather than taken. They are also
+  the pre-crimson artwork. Recapturing them is not a quick job and it is not free:
+  `RestoreStartupAsync` reopens every window and tab from last time, so a relaunched
+  window comes back carrying whatever the user had, and photographing that would commit
+  their tab titles. `home.png` wants exactly one tab and `browsing.png` exactly two, so
+  everything else has to be closed first, and `AppSession` saves the survivors on exit,
+  which is how closing them costs the session for real. The caption "Browsing with a
+  parked tab" is already untrue of the shipped picture, whose status bar reads "0/2 tabs
+  asleep", so leave the second tab alone long enough to park before taking the new one.
+  Nothing here captures chrome either: `Tab.CaptureScreenshotAsync` goes through the
+  engine's own `CapturePreviewAsync` and gets the page alone, so the shot itself is a
+  Win32 `PrintWindow` call from outside the app.
 - YouTube stops starting playback through the WARP exit once it has seen enough
   traffic from it, and it looks exactly like a broken ad blocker: permanent buffering,
   no error. Turn the VPN off before suspecting anything else.

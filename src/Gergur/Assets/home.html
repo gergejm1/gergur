@@ -3,7 +3,14 @@
 <head>
 <meta charset="utf-8">
 <title>New tab</title>
-<link rel="icon" href="favicon.png">
+<!-- The ?v is not decoration, and it is not a number anyone has to remember. Favicons
+     are cached per profile by the engine, keyed on the icon url, and that cache outlives
+     a rebuild because it lives beside the profile: recolouring favicon.png in place left
+     every existing profile still showing the old blue G in the tab while the page itself
+     was crimson, and nothing the build runs could see it. So the token is the first eight
+     hex of the icon's own sha256, and HomePageIconTests fails when the two disagree. To
+     change the icon, change the file, then paste the token the test asks for. -->
+<link rel="icon" href="favicon.png?v=235fd424">
 <style>
   html, body { margin: 0; height: 100%; background: #0a0406; overflow: hidden; }
   body { display: grid; place-items: center; }
