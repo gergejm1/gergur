@@ -15,14 +15,20 @@ fi
 ROOT="$(dirname "$SLN")"
 cd "$ROOT" || exit 1
 
-echo "checks: building (warnings are errors)"
-if ! dotnet build "$SLN" -c Debug --nologo -v q -warnaserror; then
+# -t:Rebuild, not an incremental build. Incremental skips CoreCompile when the binaries
+# look up to date, so a file that does not compile under -warnaserror reported clean
+# because an earlier build without the flag had already produced the output. That is not
+# a gate, it is a cached opinion, and it shipped an error into a Release build.
+echo "checks: building (warnings are errors, from scratch)"
+if ! dotnet build "$SLN" -c Debug --nologo -v q -warnaserror -t:Rebuild; then
   echo "checks: build failed or produced warnings"
   exit 1
 fi
 
 echo "checks: running tests"
-if ! dotnet test "$SLN" -c Debug --nologo -v q; then
+# The trx names the failure. A run of this suite failed once in ten without saying
+# which test, and "green on most runs" is not a thing worth knowing.
+if ! dotnet test "$SLN" -c Debug --nologo -v q --logger "trx;LogFileName=checks.trx"; then
   echo "checks: tests failed"
   exit 1
 fi

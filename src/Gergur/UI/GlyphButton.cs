@@ -37,6 +37,8 @@ public sealed class GlyphButton : Control
         BackColor = Theme.ToolbarBg;
         Cursor = Cursors.Hand;
         TabStop = false;
+        // Painted by hand, so nothing else tells a screen reader what it is.
+        AccessibleRole = AccessibleRole.PushButton;
     }
 
     protected override void OnPaint(PaintEventArgs e)

@@ -93,6 +93,7 @@ public static class Glyphs
     public const string StarOutline = "\uE734";
     public const string StarFilled = "\uE735";
     public const string Menu = "\uE700";
+    public const string Download = "\uE896";
     public const string ChevronUp = "\uE70E";
     public const string ChevronDown = "\uE70D";
     public const string Cancel = "\uE711";

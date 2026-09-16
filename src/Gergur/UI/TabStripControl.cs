@@ -23,7 +23,8 @@ public sealed class TabStripControl : Control
 
     // Drag-to-reorder state.
     private int _pressIndex = -1;     // tab the left button went down on
-    private int _pressX;              // where it went down (to detect drag threshold)
+    private int _pressX;
+    private int _pressY;              // where it went down (to detect drag threshold)
     private bool _dragging;
     private int _dragX;               // current cursor x while dragging
     private int _dropIndex = -1;      // where the dragged tab would land
@@ -264,15 +265,21 @@ public sealed class TabStripControl : Control
         // Drag-to-reorder: once the press has moved past a small threshold, track it.
         if (e.Button == MouseButtons.Left && _pressIndex >= 0)
         {
-            if (!_dragging && Math.Abs(e.X - _pressX) > S(6))
+            if (!_dragging && TabDrag.HasBegun(new Point(_pressX, _pressY), e.Location, S(6)))
                 _dragging = true;
             if (_dragging)
             {
                 _dragX = e.X;
                 // Pulled clear of the strip: stop offering a drop slot here, because
                 // releasing lands the tab in another window or makes a new one.
-                _dragOutside = e.Y < -S(28) || e.Y > Height + S(28);
-                _dropIndex = _dragOutside ? -1 : DropIndexFor(e.X);
+                _dragOutside = TabDrag.IsClearOfStrip(e.Y, Height, S(28));
+                // No slot unless releasing would actually reorder, or the bar promises a
+                // move that mouse-up refuses: a drift straight down inside the strip arms
+                // the drag for tear-off but is still a click.
+                _dropIndex = _dragOutside
+                    || !TabDrag.ShouldReorder(new Point(_pressX, _pressY), e.Location, S(6))
+                    ? -1
+                    : DropIndexFor(e.X);
                 Cursor = _dragOutside ? Cursors.Hand : Cursors.SizeAll;
                 TabDragMoved?.Invoke(this, PointToScreen(e.Location));
                 Invalidate();
@@ -335,6 +342,7 @@ public sealed class TabStripControl : Control
             }
             _pressIndex = index;
             _pressX = e.X;
+            _pressY = e.Y;
         }
     }
 
@@ -349,7 +357,8 @@ public sealed class TabStripControl : Control
 
             if (_dragging && _dragOutside && _pressIndex < tabs.Count)
                 TabTornOff?.Invoke(this, (tabs[_pressIndex], PointToScreen(e.Location)));
-            else if (_dragging && _dropIndex >= 0 && _dropIndex != _pressIndex)
+            else if (_dragging && _dropIndex >= 0 && _dropIndex != _pressIndex
+                && TabDrag.ShouldReorder(new Point(_pressX, _pressY), e.Location, S(6)))
                 TabReordered?.Invoke(this, (_pressIndex, _dropIndex));
             else if (_pressIndex < tabs.Count)
                 TabClicked?.Invoke(this, tabs[_pressIndex]); // it was a plain click

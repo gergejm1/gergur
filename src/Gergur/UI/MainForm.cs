@@ -42,6 +42,7 @@ public sealed class MainForm : Form
     private GlyphButton _backButton = null!;
     private GlyphButton _forwardButton = null!;
     private GlyphButton _reloadButton = null!;
+    private GlyphButton _downloadsButton = null!;
     private GlyphButton _bookmarkButton = null!;
     private GlyphButton _menuButton = null!;
     private AddressBar _addressBar = null!;
@@ -135,14 +136,19 @@ public sealed class MainForm : Form
             Tabs?.ActiveTab?.FocusPage();
         };
 
+        _downloadsButton = MakeToolButton(Glyphs.Download, 0);
         _bookmarkButton = MakeToolButton(Glyphs.StarOutline, 0);
         _menuButton = MakeToolButton(Glyphs.Menu, 0);
+        _downloadsButton.Anchor = AnchorStyles.Top | AnchorStyles.Right;
         _bookmarkButton.Anchor = AnchorStyles.Top | AnchorStyles.Right;
         _menuButton.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+        _downloadsButton.Click += (_, _) => OpenDownloads();
         _bookmarkButton.Click += (_, _) => ToggleBookmark();
-        _menuButton.Click += (_, _) => _menu.Show(_menuButton, new Point(0, _menuButton.Height));
+        _menuButton.Click += (_, _) => ShowMainMenu();
 
-        _toolbar.Controls.AddRange([_backButton, _forwardButton, _reloadButton, _addressBar, _bookmarkButton, _menuButton]);
+        _toolbar.Controls.AddRange(
+            [_backButton, _forwardButton, _reloadButton, _addressBar,
+             _downloadsButton, _bookmarkButton, _menuButton]);
         _toolbar.Resize += (_, _) => LayoutToolbar();
 
         _statusStrip = new StatusStrip
@@ -198,24 +204,115 @@ public sealed class MainForm : Form
     private GlyphButton MakeToolButton(string glyph, int x)
         => new(glyph) { Location = new Point(x, 5) };
 
+    private void OnDownloadsChanged(object? sender, EventArgs e)
+    {
+        if (InvokeRequired)
+        {
+            BeginInvoke(UpdateDownloadsButton);
+            return;
+        }
+        UpdateDownloadsButton();
+    }
+
+    /// <summary>The running count the button is currently painted for.</summary>
+    private int _downloadsShown = -1;
+
+    /// <summary>
+    /// The button carries the accent while something is downloading. A dedicated button
+    /// is only worth the room it takes if it says something the menu could not, and what
+    /// it says is that a download is running: the window that lists them is somewhere
+    /// else, and a download you have forgotten about is the one you wanted to watch.
+    /// </summary>
+    private void UpdateDownloadsButton()
+    {
+        // Changed fires on every progress report of every download, so this runs many
+        // times a second while one is running. Setting GlyphColor invalidates the button
+        // whether or not the colour differs, and resetting AccessibleName re-announces it
+        // to a screen reader, so the early exit is what keeps a download from repainting
+        // the toolbar and interrupting a reader for the whole of its length.
+        int running = _session?.Downloads.RunningCount ?? 0;
+        if (running == _downloadsShown)
+            return;
+        _downloadsShown = running;
+
+        _downloadsButton.GlyphColor = running > 0 ? Theme.Accent : Theme.Text;
+        _downloadsButton.AccessibleName = running > 0
+            ? $"Downloads, {running} in progress"
+            : "Downloads";
+    }
+
+    /// <summary>
+    /// Re-lay the toolbar when the window moves to a differently scaled monitor. The
+    /// only other trigger is the toolbar's own Resize, which fires while the buttons are
+    /// still at their old size, so the positions it works out then are for widths that
+    /// are about to change.
+    /// </summary>
+    protected override void OnDpiChanged(DpiChangedEventArgs e)
+    {
+        base.OnDpiChanged(e);
+        LayoutToolbar();
+    }
+
+    /// <summary>Scales a design-time pixel count to this window's dpi.</summary>
+    private int Scaled(int atNinetySix) => (int)Math.Round(atNinetySix * DeviceDpi / 96.0);
+
     private void LayoutToolbar()
     {
-        _menuButton.Location = new Point(_toolbar.Width - 40, 5);
-        _bookmarkButton.Location = new Point(_toolbar.Width - 76, 5);
-        _addressBar.Location = new Point(120, (_toolbar.Height - _addressBar.Height) / 2);
-        _addressBar.Width = Math.Max(100, _bookmarkButton.Left - 8 - _addressBar.Left);
+        // Right to left, off the widths the buttons actually have rather than the ones
+        // they had at 96 dpi. See ToolbarLayout for what that cost.
+        GlyphButton[] rightHand = [_menuButton, _bookmarkButton, _downloadsButton];
+        int gap = Scaled(4);
+        int[] lefts = ToolbarLayout.RightToLeft(
+            _toolbar.Width, rightHand.Select(b => b.Width).ToArray(), gap, Scaled(8));
+        for (int i = 0; i < rightHand.Length; i++)
+            rightHand[i].Location = new Point(lefts[i], (_toolbar.Height - rightHand[i].Height) / 2);
+
+        _addressBar.Location = new Point(Scaled(120), (_toolbar.Height - _addressBar.Height) / 2);
+        _addressBar.Width = Math.Max(Scaled(100), lefts[^1] - gap - _addressBar.Left);
+    }
+
+    /// <summary>
+    /// Opens the main menu against the screen the button is actually on.
+    ///
+    /// Left to itself the drop-down slides onto the neighbouring monitor rather than
+    /// opening the other way, and on a desktop with monitors either side it lands on a
+    /// different screen from the window. Measured with three monitors side by side: a
+    /// button 48px from a monitor's right edge put the menu at x=0, on the next screen
+    /// along. Asking for the other direction only moves the problem to the left edge,
+    /// so the position is worked out here and kept inside the button's own screen.
+    ///
+    /// The items have to exist before they can be measured, so they are built here, and
+    /// only here. Building them again from an Opening handler was not free: each build
+    /// walks the VPN profile directory several times over, so a second one put a dozen
+    /// synchronous directory reads on the UI thread every time the menu was opened.
+    /// </summary>
+    private void ShowMainMenu()
+    {
+        RebuildMenuItems();
+        var button = new Rectangle(_menuButton.PointToScreen(Point.Empty), _menuButton.Size);
+        // FromRectangle, not FromControl: a window straddling two monitors is mostly on
+        // one of them while this button is on the other, and the button is what matters.
+        _menu.Show(MenuPlacement.For(
+            button, _menu.GetPreferredSize(Size.Empty), Screen.FromRectangle(button).WorkingArea));
     }
 
     private void BuildMenu()
     {
         _menu = new ContextMenuStrip();
-        _menu.Opening += (_, _) => RebuildMenuItems();
         RebuildMenuItems();
     }
 
     private void RebuildMenuItems()
     {
+        // Snapshot, clear, then dispose. Disposing an item removes it from Items, so
+        // disposing them in a loop over Items throws on the second one and leaves the
+        // menu half torn down: MenuRebuildTests keeps that fact. Without this every
+        // submenu the viewer has opened keeps its window handle for the life of the
+        // process, and an undisposed control with a handle is never collected.
+        var replaced = _menu.Items.Cast<ToolStripItem>().ToArray();
         _menu.Items.Clear();
+        foreach (var item in replaced)
+            item.Dispose();
         _menu.Items.Add(new ToolStripMenuItem("New tab\tCtrl+T", null, (_, _) => _ = NewTabAsync()));
         _menu.Items.Add(new ToolStripMenuItem("Reopen closed tab\tCtrl+Shift+T", null, (_, _) => _ = ReopenClosedTabAsync()));
         _menu.Items.Add(new ToolStripSeparator());
@@ -315,6 +412,12 @@ public sealed class MainForm : Form
                 await StartSharedServicesAsync();
             var session = _session!;
             session.AddWindow(this);
+
+            // Here rather than in StartSharedServicesAsync, which only the first window
+            // runs: the downloads are shared across windows, so the button that reports
+            // them has to be live in every one of them.
+            session.Downloads.Changed += OnDownloadsChanged;
+            UpdateDownloadsButton();
 
             Tabs = new TabManager(session.Env, _hostPanel, session.Blocker);
             Tabs.Changed += (_, _) => UpdateChrome();
@@ -580,6 +683,16 @@ public sealed class MainForm : Form
         });
     }
 
+    protected override void OnFormClosed(FormClosedEventArgs e)
+    {
+        // Not a child of this form, so closing the window does not take it with it, and
+        // it owns a window handle from the first time it is shown. Here rather than in
+        // OnFormClosing, because that one can still be cancelled, and a live window with
+        // a disposed menu would throw on the next click of the button.
+        _menu.Dispose();
+        base.OnFormClosed(e);
+    }
+
     protected override void OnFormClosing(FormClosingEventArgs e)
     {
         _closing = true;
@@ -596,7 +709,11 @@ public sealed class MainForm : Form
             _tray = null;
         }
         if (_session is not null)
+        {
             _session.Drop.ItemAdded -= OnDropItemArrived;
+            _session.Downloads.Changed -= OnDownloadsChanged;
+        }
+
         Tabs?.DisposeAll(); // engine processes exit promptly once the last WebView is gone
         _session?.RemoveWindow(this); // stops the agent and tunnel when this was the last
         if (_session is null || _session.Windows.Count == 0)

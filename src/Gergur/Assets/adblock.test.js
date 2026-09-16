@@ -470,13 +470,19 @@ test("an ad wrapper is recognised and a video is not", () => {
 const vm = require("node:vm");
 const fs = require("node:fs");
 
-function loadInBrowser() {
+function loadInBrowser(options) {
+    const on = Object.assign({ hostname: "www.youtube.com", href: "https://www.youtube.com/", topFrame: true }, options || {});
     const page = {
         players: [],
         ticks: [],
         styles: [],
         lookups: [],
         delays: [],
+        clicks: [],          // capture-phase click listeners the script installed
+        navigations: [],     // where it asked the browser to go, and how
+        pushed: [],          // what reached the real history API
+        storage: (options && options.storageMap) || new Map(),
+        replaced: [],   // the ones that asked to replace rather than push
     };
     // Match the way a browser does: every class in the selector has to be on the
     // element. Checking one at a time would let the shipped file drop the
@@ -495,7 +501,9 @@ function loadInBrowser() {
         head: { appendChild: (s) => page.styles.push(s) },
         documentElement: { appendChild: (s) => page.styles.push(s) },
         createElement: () => ({}),
-        addEventListener: () => { },
+        addEventListener: (type, fn, capture) => {
+            if (type === "click" && capture) page.clicks.push(fn);
+        },
         querySelectorAll: () => [],
         querySelector(selector) {
             page.lookups.push(selector);
@@ -513,17 +521,38 @@ function loadInBrowser() {
     const context = {
         window: {},
         document,
-        location: { hostname: "www.youtube.com", search: "" },
+        location: {
+            hostname: on.hostname,
+            search: "",
+            href: on.href,
+            assign: (url) => page.navigations.push(url),
+            replace: (url) => { page.navigations.push(url); page.replaced.push(url); },
+        },
+        sessionStorage: {
+            getItem: (k) => (page.storage.has(k) ? page.storage.get(k) : null),
+            setItem: (k, v) => page.storage.set(k, String(v)),
+        },
+        setTimeout: () => 0,
+        history: {
+            pushState: (...args) => page.pushed.push(["pushState", ...args]),
+            replaceState: (...args) => page.pushed.push(["replaceState", ...args]),
+        },
+        URL,
         setInterval: (fn, delay) => { page.ticks.push(fn); page.delays.push(delay); return 1; },
         WeakSet, JSON, Object, Array, RegExp, Math, performance: { now: () => 0 },
     };
     context.window = context;
+    context.window.top = on.topFrame ? context : {};
+    // window.name survives a same-tab navigation, so the harness carries it the way a
+    // tab does when one is handed in.
+    context.name = on.windowName || "";
     vm.createContext(context);
     vm.runInContext(fs.readFileSync(path.join(__dirname, "adblock.js"), "utf8"), context);
 
     if (page.ticks.length !== 1) throw new Error("expected one timer, got " + page.ticks.length);
     page.tick = () => { page.lookups.length = 0; page.ticks[0](); };
     page.context = context;
+    Object.defineProperty(page, "windowName", { get: () => context.name });
     return page;
 }
 
@@ -828,6 +857,278 @@ test("a payload that cannot be pruned is still handed over", () => {
     const held = page.context.ytInitialData;
     assert.strictEqual(held, hostile, "the payload was dropped rather than handed over");
     assert.strictEqual(held.videoDetails.videoId, "abc");
+});
+
+// ------------------------------------------- in-page navigation to a video
+
+/// A click the way the script reads one: composedPath first, then the target.
+function clickOn(page, anchor, extra) {
+    let preventedDefault = false;
+    const event = Object.assign({
+        defaultPrevented: false,
+        button: 0,
+        ctrlKey: false, shiftKey: false, altKey: false, metaKey: false,
+        composedPath: () => (anchor ? [anchor] : []),
+        target: anchor,
+        preventDefault: () => { preventedDefault = true; },
+        stopPropagation: () => { },
+    }, extra || {});
+    page.clicks.forEach(fn => fn(event));
+    return preventedDefault;
+}
+
+const anchorTo = (href) => ({ tagName: "A", href, target: "" });
+
+test("clicking a video is turned into a real navigation", () => {
+    // The whole reason this exists: an in-page navigation never reassigns the payload,
+    // so the pruning never runs and the ad arrives whole. Measured on a real click from
+    // the feed, the window payload had no videoId at all while a 15 second ad played.
+    const page = loadInBrowser();
+
+    const prevented = clickOn(page, anchorTo("https://www.youtube.com/watch?v=abc"));
+
+    assert.ok(prevented, "the in-page navigation was allowed to proceed");
+    assert.deepStrictEqual(page.navigations, ["https://www.youtube.com/watch?v=abc"]);
+});
+
+test("a click meant for a new tab is left alone", () => {
+    // Ctrl, shift, middle button: each of those is asking for a new tab, and answering
+    // with a navigation in this one would be answering a different question.
+    for (const extra of [{ ctrlKey: true }, { shiftKey: true }, { metaKey: true },
+                         { altKey: true }, { button: 1 }, { defaultPrevented: true }]) {
+        const page = loadInBrowser();
+        const prevented = clickOn(page, anchorTo("https://www.youtube.com/watch?v=abc"), extra);
+        assert.ok(!prevented, `${JSON.stringify(extra)} was taken over`);
+        assert.deepStrictEqual(page.navigations, [], `${JSON.stringify(extra)} navigated`);
+    }
+});
+
+test("only a watch link is taken over", () => {
+    const page = loadInBrowser();
+
+    for (const href of [
+        "https://www.youtube.com/",                       // the feed
+        "https://www.youtube.com/results?search_query=x", // search
+        "https://www.youtube.com/@someone",               // a channel
+        "https://example.com/watch?v=abc",                // another site entirely
+        "https://www.youtube.com/watchlist",              // merely starts the same
+        "http://www.youtube.com/watch?v=abc",             // not over https
+        "https://www.youtube.com@evil.example/watch?v=a", // a host that only reads right
+        "https://youtube.com.evil.example/watch?v=abc",
+        // Shorts and live are in-page navigations too, and deliberately left alone: see
+        // the note in adblock.js. Their ads are not handled, and pretending otherwise
+        // here would hide that.
+        "https://www.youtube.com/shorts/abc",
+        "https://www.youtube.com/live/abc",
+    ]) {
+        assert.ok(!clickOn(page, anchorTo(href)), href + " was taken over");
+    }
+    assert.deepStrictEqual(page.navigations, []);
+
+    // And a link aimed at a new tab stays the browser's business.
+    const newTab = anchorTo("https://www.youtube.com/watch?v=abc");
+    newTab.target = "_blank";
+    assert.ok(!clickOn(page, newTab), "a target=_blank link was taken over");
+});
+
+test("a routed navigation with no click is caught too", () => {
+    // The player's own next-video call goes straight through the history API.
+    const page = loadInBrowser();
+
+    page.context.history.pushState({}, "", "/watch?v=def");
+
+    assert.deepStrictEqual(page.navigations, ["https://www.youtube.com/watch?v=def"]);
+    assert.deepStrictEqual(page.pushed, [], "the in-page navigation went ahead as well");
+});
+
+test("history calls that are not a new video still work", () => {
+    const page = loadInBrowser();
+
+    page.context.history.pushState({}, "", "/results?search_query=x");
+    page.context.history.replaceState({}, "", "/");
+    page.context.history.pushState({}, "");                     // no url at all
+
+    assert.deepStrictEqual(page.navigations, [], "an ordinary route was hijacked");
+    assert.strictEqual(page.pushed.length, 3, "an ordinary route was swallowed");
+});
+
+test("a second click while the first load is in flight supersedes it", () => {
+    // location.assign does not take effect at once, so a click a moment later arrives
+    // while the page is still the old one. Dropping it handed the click back to the
+    // app's own router, which routed to the new video in-page with its ad intact, and
+    // then the older load landed underneath and replaced it: an ad, and the wrong video.
+    const page = loadInBrowser();
+
+    assert.ok(clickOn(page, anchorTo("https://www.youtube.com/watch?v=abc")));
+    assert.ok(clickOn(page, anchorTo("https://www.youtube.com/watch?v=xyz")),
+        "the second click was handed back to the page's own router");
+
+    assert.deepStrictEqual(page.navigations, [
+        "https://www.youtube.com/watch?v=abc",
+        "https://www.youtube.com/watch?v=xyz",
+    ]);
+});
+
+test("a route to the page we are already on is not a navigation", () => {
+    // YouTube replaces state with the current url on a fresh load. Treating that as a
+    // navigation would reload the page it just finished loading, forever.
+    const page = loadInBrowser();
+    page.context.location.href = "https://www.youtube.com/watch?v=abc";
+
+    page.context.history.replaceState({}, "", "/watch?v=abc");
+
+    assert.deepStrictEqual(page.navigations, [], "the page reloaded itself");
+    assert.strictEqual(page.pushed.length, 1);
+});
+
+test("music, studio and the rest of youtube.com are left alone", () => {
+    // Everything under youtube.com uses the /watch?v= shape, and on music.youtube.com
+    // that shape is every track in a queue: forcing a load there turns a song change
+    // into an app reload. Only the watch site gets this.
+    for (const hostname of ["music.youtube.com", "studio.youtube.com", "tv.youtube.com",
+                            "www.youtube-nocookie.com"]) {
+        const page = loadInBrowser({ hostname, href: `https://${hostname}/` });
+        assert.strictEqual(page.clicks.length, 0, hostname + " installed the click hook");
+
+        page.context.history.pushState({}, "", "/watch?v=abc");
+        assert.deepStrictEqual(page.navigations, [], hostname + " was sent away");
+        assert.strictEqual(page.pushed.length, 1, hostname + " had its router swallowed");
+    }
+});
+
+test("an embed in a frame is left alone", () => {
+    // The script is injected into subframes too. An embed that navigated itself to a
+    // watch page would be refused by frame-ancestors, and the video the reader came for
+    // becomes a "refused to connect" box.
+    const page = loadInBrowser({ topFrame: false });
+
+    assert.strictEqual(page.clicks.length, 0, "a subframe installed the click hook");
+    page.context.history.pushState({}, "", "/watch?v=abc");
+    assert.deepStrictEqual(page.navigations, [], "a subframe navigated itself");
+});
+
+test("a timestamp on the video already playing is a seek, not a reload", () => {
+    // Chapter marks, comment timestamps, the description's own chapter list: all of them
+    // point at the current video with a different query. The player seeks for those, and
+    // reloading would throw away the buffer to arrive back at the same place.
+    const page = loadInBrowser({ href: "https://www.youtube.com/watch?v=abc" });
+
+    clickOn(page, anchorTo("https://www.youtube.com/watch?v=abc&t=612"));
+    page.context.history.pushState({}, "", "/watch?v=abc&t=900");
+
+    assert.deepStrictEqual(page.navigations, [], "a seek reloaded the page");
+
+    // A different video from the same page is still a navigation.
+    clickOn(page, anchorTo("https://www.youtube.com/watch?v=xyz"));
+    assert.deepStrictEqual(page.navigations, ["https://www.youtube.com/watch?v=xyz"]);
+});
+
+test("a link aimed at another frame or window is left alone", () => {
+    const page = loadInBrowser();
+
+    for (const target of ["_blank", "_top", "_parent", "somewindow"]) {
+        const anchor = anchorTo("https://www.youtube.com/watch?v=abc");
+        anchor.target = target;
+        assert.ok(!clickOn(page, anchor), `target=${target} was taken over`);
+    }
+    assert.deepStrictEqual(page.navigations, []);
+});
+
+test("replaceState is answered by replacing, not by pushing", () => {
+    // Otherwise the history gains a step the viewer never took, and Back lands on it.
+    const page = loadInBrowser();
+
+    page.context.history.replaceState({}, "", "/watch?v=abc");
+
+    assert.deepStrictEqual(page.navigations, ["https://www.youtube.com/watch?v=abc"]);
+    assert.deepStrictEqual(page.replaced, ["https://www.youtube.com/watch?v=abc"],
+        "it pushed a history entry where the page asked to replace one");
+});
+
+test("a ping-pong between two videos is stopped", () => {
+    // A reload loop from the inside: force a load, the document that arrives routes
+    // somewhere, and that route asks to force another. Two ids alternating is the shape
+    // the same-url and same-video rules cannot catch, so this is what the storage guard
+    // is actually for. An earlier version of this test used one id, which the same-video
+    // rule answered first, so the guard was never reached and deleting it changed nothing.
+    const tab = new Map();          // one tab's sessionStorage, shared across its documents
+    const shared = () => ({ storageMap: tab });
+
+    const first = loadInBrowser({ ...shared(), href: "https://www.youtube.com/" });
+    first.context.history.pushState({}, "", "/watch?v=abc");
+    assert.deepStrictEqual(first.navigations, ["https://www.youtube.com/watch?v=abc"]);
+
+    const second = loadInBrowser({ ...shared(), href: "https://www.youtube.com/watch?v=abc" });
+    second.context.history.pushState({}, "", "/watch?v=xyz");
+    assert.deepStrictEqual(second.navigations, ["https://www.youtube.com/watch?v=xyz"]);
+
+    // Back to the first video: this is the second lap, and it has to stop here.
+    const third = loadInBrowser({ ...shared(), href: "https://www.youtube.com/watch?v=xyz" });
+    third.context.history.pushState({}, "", "/watch?v=abc");
+    assert.deepStrictEqual(third.navigations, [], "the tab went round the loop again");
+});
+
+test("an old entry is dropped rather than kept for the session", () => {
+    // One key holding a map, pruned on every write. Without the pruning the map grows
+    // for the life of the tab, and the write that finally hits the quota throws.
+    const tab = new Map();
+    tab.set("gg.fv", JSON.stringify({ stale: Date.now() - 60000, fresh: Date.now() - 1000 }));
+    const page = loadInBrowser({ storageMap: tab });
+
+    page.context.history.pushState({}, "", "/watch?v=new");
+
+    const stored = JSON.parse(tab.get("gg.fv"));
+    assert.ok(!("stale" in stored), "an entry well past the window was kept");
+    assert.ok("fresh" in stored, "an entry inside the window was dropped");
+    assert.ok("new" in stored, "the video just forced was not recorded");
+});
+
+test("a video forced longer ago than the window is forced again", () => {
+    const tab = new Map();
+    tab.set("gg.fv", JSON.stringify({ abc: Date.now() - 60000 }));
+    const page = loadInBrowser({ storageMap: tab });
+
+    page.context.history.pushState({}, "", "/watch?v=abc");
+
+    assert.deepStrictEqual(page.navigations, ["https://www.youtube.com/watch?v=abc"],
+        "a video from earlier in the session was refused as if it were a loop");
+});
+
+test("changing your mind back to a superseded video still works", () => {
+    // Click a, change to b before a lands, then change back. The mark goes on when the
+    // navigation is issued, so without releasing the superseded one, a would be refused
+    // for ten seconds and route in-page with its ad.
+    const tab = new Map();
+    const first = loadInBrowser({ storageMap: tab });
+    clickOn(first, anchorTo("https://www.youtube.com/watch?v=abc"));
+    clickOn(first, anchorTo("https://www.youtube.com/watch?v=xyz"));
+
+    // xyz is the one that lands.
+    const landed = loadInBrowser({ storageMap: tab, href: "https://www.youtube.com/watch?v=xyz" });
+    assert.ok(clickOn(landed, anchorTo("https://www.youtube.com/watch?v=abc")),
+        "going back to the superseded video was handed to the page's own router");
+    assert.deepStrictEqual(landed.navigations, ["https://www.youtube.com/watch?v=abc"]);
+});
+
+test("watching several videos in a row keeps working", () => {
+    // The shape of an ordinary session, and the one a bound on "forced navigations"
+    // cannot tell from a loop: every video clicked is also a video forced. A counter in
+    // window.name was tried here and stopped taking navigations over after the third,
+    // so the ads came back for the rest of the tab's life with nothing to show why.
+    // Storage and window.name both carry across, because a tab carries both: a counter
+    // that lives in either one is what this has to be able to see.
+    const tab = new Map();
+    let at = "https://www.youtube.com/";
+    let name = "";
+
+    for (let n = 1; n <= 6; n++) {
+        const page = loadInBrowser({ storageMap: tab, href: at, windowName: name });
+        const next = "https://www.youtube.com/watch?v=v" + n;
+        assert.ok(clickOn(page, anchorTo(next)), "video " + n + " was handed to the router");
+        assert.deepStrictEqual(page.navigations, [next]);
+        at = next;
+        name = page.windowName;
+    }
 });
 
 test("a viewer who unmutes an ad is left alone", () => {

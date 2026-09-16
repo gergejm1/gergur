@@ -350,11 +350,9 @@
     // this used to do, is too late: the player reads the object as soon as it is
     // assigned, so the ad break was already scheduled and deleting the keys afterwards
     // changed nothing. Taking the assignment itself is the only point that is early
-    // enough, and it also covers the reassignment on in-page navigation, which a
-    // DOMContentLoaded handler never sees at all. Only where there is a reassignment,
-    // though: navigating to a video reassigns and is covered, while scrolling the feed
-    // brings its next page in through a fetched /youtubei/v1/browse response, and those
-    // are deliberately left alone for the reason below.
+    // enough. In-page navigation does not reassign it at all, which is what the section
+    // below is for: measured by watching a click from the feed, the payload on window
+    // still had no videoId while a 15 second ad ran.
     //
     // This is the whole of it, and the narrowness is the point. Removing the ad
     // payload from a *fetched* youtubei response instead was measured against real
@@ -397,6 +395,187 @@
                 // with it.
             }
         });
+
+    // ------------------------------------------------- in-page navigation to a video
+    //
+    // Clicking a video from the feed never reloads the document. YouTube fetches the
+    // next player response instead, and that is the one response nothing here may touch:
+    // pruning a fetched response hangs the player, for the reason set out above. So the
+    // ad arrives whole, and watching anything meant reloading the page by hand first.
+    //
+    // Make the navigation a real one. The payload then comes back inline, the hook above
+    // prunes it before the player is given it, and the video starts clean. It costs a
+    // document load per video, which is exactly what reloading by hand was costing.
+    //
+    // Narrowly, though, because a forced reload is a heavy thing to do to a page:
+    //
+    //   - the watch site only. Everything under youtube.com shares the /watch?v= shape,
+    //     and on music.youtube.com that shape is every track in a queue: forcing there
+    //     would reload the whole app between songs. Studio and TV are no better.
+    //   - the top frame only. This script is injected into subframes as well, and an
+    //     embed that navigated itself to /watch would be refused by frame-ancestors and
+    //     leave a "refused to connect" box where the video was.
+    //   - plain left clicks only. A middle click or ctrl-click is asking for a new tab,
+    //     and a link aimed at another frame or window is not ours to answer.
+    //   - a different video only. A chapter or comment timestamp points at the video
+    //     already playing, and the player seeks for those. Reloading instead would throw
+    //     away the buffer to arrive at the same place.
+    //   - "/watch" only. Shorts and /live/ route in-page the same way and their ads are
+    //     therefore still not handled, which is a real gap and not an oversight: Shorts
+    //     is a swipe feed, and a document load per short would be the music problem
+    //     again. Closing it needs a different idea, not a wider match here.
+    // Scoped to a function rather than returning from the script: the skip below still
+    // has work to do on music and inside an embed, where an ad that renders is just as
+    // unwelcome as one here.
+    var WATCH_SITE = /^(www\.|m\.)?youtube\.com$/;
+    if (WATCH_SITE.test(location.hostname) && window.top === window) forceRealNavigation();
+
+    function forceRealNavigation() {
+        // How long a video stays remembered as "just forced". Long enough to catch the
+        // load-rewrite-load ping-pong, short enough that coming back to a video later in
+        // the session is still handled.
+        var FORCED_WINDOW_MS = 10000;
+        var FORCED_KEY = "gg.fv";
+
+        /// The url to load instead, or null to leave the navigation alone.
+        function watchUrl(url) {
+            try {
+                var parsed = new URL(url, location.href);
+                if (parsed.protocol !== "https:") return null;
+                if (!WATCH_SITE.test(parsed.hostname) || parsed.pathname !== "/watch") return null;
+
+                // The same video is a seek, whatever else changed in the query.
+                var here = new URL(location.href);
+                if (here.pathname === "/watch"
+                    && here.searchParams.get("v") === parsed.searchParams.get("v")) return null;
+
+                return parsed.href;
+            } catch (e) {
+                return null;
+            }
+        }
+
+        /// The videos this tab has forced a load of lately, oldest entries dropped.
+        /// One key rather than one per video: an entry per video for the life of a tab
+        /// grows without limit, and the write that finally hits the quota would throw,
+        /// be swallowed, and take the loop guard down with it in silence.
+        function recentlyForced() {
+            try {
+                var raw = sessionStorage.getItem(FORCED_KEY);
+                var all = raw ? JSON.parse(raw) : {};
+                var cutoff = Date.now() - FORCED_WINDOW_MS;
+                var live = {};
+                for (var id in all) {
+                    if (Object.prototype.hasOwnProperty.call(all, id) && all[id] > cutoff)
+                        live[id] = all[id];
+                }
+                return live;
+            } catch (e) {
+                return {};
+            }
+        }
+
+        /// Whether this video has just been forced, which is how a reload loop looks from
+        /// the inside: load, the page rewrites its own url, load again. YouTube does
+        /// rewrite watch urls on arrival, and not always to the same string, so matching
+        /// the whole url is not enough to bound it.
+        ///
+        /// The mark goes on when the navigation is issued rather than when it arrives,
+        /// which would strand a video the viewer changed their mind about: click a, click
+        /// b before a lands, then click a again and it would be refused for ten seconds
+        /// with the ad intact. So issuing a navigation releases the one it supersedes.
+        var lastIssued = null;
+
+        function justForced(url) {
+            try {
+                var id = new URL(url, location.href).searchParams.get("v");
+                // A watch url with no video id, a playlist landing page. Nothing to
+                // remember it by, and nothing needs to: one no-id url routing to another
+                // is refused by the same-video rule above, both being null, and in a
+                // no-id/id alternation the id side is refused on its next lap by its own
+                // record here.
+                if (!id) return false;
+
+                var live = recentlyForced();
+                if (live[id]) return true;
+                if (lastIssued && lastIssued !== id) delete live[lastIssued];
+                live[id] = Date.now();
+                lastIssued = id;
+                sessionStorage.setItem(FORCED_KEY, JSON.stringify(live));
+            } catch (e) {
+                // No storage to remember with, so no guard against a two-video
+                // ping-pong. That is a loop nothing has been seen to produce: the
+                // rewrite YouTube actually does is to the same video, and watchUrl
+                // refuses that with no storage at all. If one ever does appear it looks
+                // like a tab reloading between two videos and never settling. A counter
+                // in window.name was
+                // tried here and was worse than the thing it guarded, because it
+                // counted every video a tab ever forced rather than a run of them, so
+                // the blocking switched itself off after the third video and stayed off.
+            }
+            return false;
+        }
+
+        /// Takes the navigation over. A second click while the first load is still in
+        /// flight supersedes it rather than being dropped: handing that click back to the
+        /// router would let the app route to the new video in-page, with its ad intact,
+        /// and then the older load would land underneath and replace it.
+        function leaveFor(url, replacing) {
+            // No same-url check here: watchUrl has already refused anything that resolves
+            // to the video this page is showing, which is the only way url could equal
+            // location.href by the time it gets this far.
+            if (justForced(url)) return false;
+            // replaceState asked to replace an entry, so replace one. Pushing instead puts a
+            // step in the history the viewer never took, and Back then goes somewhere odd.
+            if (replacing) location.replace(url);
+            else location.assign(url);
+            return true;
+        }
+
+        document.addEventListener("click", function (event) {
+            try {
+                if (event.defaultPrevented || event.button !== 0) return;
+                if (event.ctrlKey || event.shiftKey || event.altKey || event.metaKey) return;
+
+                // composedPath first, because the anchor is often inside a shadow root and
+                // the event target is then the host rather than the link.
+                var anchor = null;
+                var path = typeof event.composedPath === "function" ? event.composedPath() : [];
+                for (var i = 0; i < path.length; i++) {
+                    if (path[i] && path[i].tagName === "A" && path[i].href) { anchor = path[i]; break; }
+                }
+                if (!anchor && event.target && event.target.closest)
+                    anchor = event.target.closest("a[href]");
+                if (!anchor) return;
+                // Anything aimed elsewhere belongs to the browser, not to us.
+                if (anchor.target && anchor.target !== "_self") return;
+
+                var url = watchUrl(anchor.href);
+                if (url && leaveFor(url, false)) {
+                    event.preventDefault();
+                    event.stopPropagation();
+                }
+            } catch (e) { }
+        }, true);
+
+        // The backstop, for a navigation nothing clicked: the player's own next-video call,
+        // a keyboard shortcut, anything routed straight through the history API.
+        ["pushState", "replaceState"].forEach(function (name) {
+            var native = history[name];
+            if (typeof native !== "function") return;
+            try {
+                history[name] = function (state, title, url) {
+                    try {
+                        if (url !== undefined && url !== null) {
+                            var target = watchUrl(url);
+                            if (target && leaveFor(target, name === "replaceState")) return;
+                        }
+                    } catch (e) { }
+                    return native.apply(this, arguments);
+                };
+            } catch (e) { }
+        });
+    }
 
     // Last resort, for an ad that renders anyway: press skip the moment it appears,
     // and otherwise run the break out silently. Only touches the page while the
