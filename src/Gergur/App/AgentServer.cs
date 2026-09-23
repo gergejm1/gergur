@@ -336,11 +336,22 @@ public sealed class AgentServer
                 // needed the browser closed, the file edited and the browser relaunched.
                 // That is three restarts to try a thing twice, and it is how a session
                 // got lost here.
-                var current = await OnUiAsync(() => Task.FromResult(SettingsPatch.Snapshot(_session.Settings)));
+                // Read together on the UI thread, which owns the tunnel's process, so the
+                // answer is one snapshot rather than two reads a restart could fall between.
+                var (current, tunnelUp) = await OnUiAsync(() =>
+                    Task.FromResult((SettingsPatch.Snapshot(_session.Settings), _session.Vpn.IsRunning)));
                 return (200, "application/json", Json(new
                 {
                     settings = current,
                     restartRequired = Settings.RestartRequired.ToArray(),
+                    // Outside "settings", so they read as facts about this run and cannot be
+                    // sent back as a patch. VpnEnabled is the choice, and says on while a
+                    // tunnel that failed at startup has the engine running without it.
+                    // vpnInForce: this engine points at the tunnel. tunnelRunning: the tunnel's
+                    // process is running. Traffic goes through the vpn only when both are true;
+                    // in force with no tunnel running, requests fail rather than go around it.
+                    vpnInForce = _session.Env.ProxyInForce,
+                    tunnelRunning = tunnelUp,
                 }));
             }
 
@@ -390,7 +401,11 @@ public sealed class AgentServer
                             // Named, not quoted: the exception text carries the full
                             // profile path, account name included, and this answer goes
                             // into a transcript.
-                            DebugLog.Write($"Settings not persisted: {ex}");
+                            // The message for the expected write failures; everything for anything
+                            // else, whose stack is the only clue. The log is local either way.
+                            DebugLog.WriteAlways(ex is IOException or UnauthorizedAccessException
+                                ? $"Settings not persisted: {ex.Message}"
+                                : $"Settings not persisted: {ex}");
                             persisted = false;
                             whyNotPersisted = ex is UnauthorizedAccessException
                                 ? "the settings file could not be written to"
@@ -1159,7 +1174,7 @@ public sealed class AgentServer
             },
             []),
         Tool("gergur_read_settings",
-            "Read every Gergur setting and its current value, plus which ones only take effect after a restart.",
+            "Read every Gergur setting and its current value, which ones only take effect after a restart, and two facts about this run: vpnInForce (the engine points at the vpn tunnel) and tunnelRunning (the tunnel's process is running). Traffic goes through the vpn only when both are true; VpnEnabled alone does not say.",
             new { }, []),
         Tool("gergur_change_settings",
             "Change Gergur settings. Names come from gergur_read_settings; anything unrecognised is reported back rather than ignored, and a value of the wrong type changes nothing at all.",

@@ -105,9 +105,14 @@ public sealed class Settings
     [JsonIgnore]
     internal bool VpnDownThisRun { get; set; }
 
-    /// <summary>Whether traffic goes through the tunnel this run: chosen, and it came up.</summary>
+    /// <summary>
+    /// Whether an engine started now should point at the tunnel: chosen, and it came up.
+    /// Only for starting one. What the running engine was actually given is
+    /// <see cref="BrowserEnvironment.ProxyInForce"/>, which VpnEnabled changing later does
+    /// not move.
+    /// </summary>
     [JsonIgnore]
-    internal bool VpnInForce => VpnEnabled && !VpnDownThisRun;
+    internal bool StartWithProxy => VpnEnabled && !VpnDownThisRun;
 
     [Category(Vpn), DisplayName("Local SOCKS5 port")]
     [Description("Port wireproxy listens on.")]

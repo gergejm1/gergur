@@ -169,10 +169,16 @@ try {
     # not do: after a restart they come back asleep, and that is refused earlier and for a
     # different reason (no frame at all), which is right but is not this check.
     $bgTab = Made (Post '/open' @{ url = 'about:blank'; window = $myWindow; background = $true })
-    Post '/activate' @{ id = $bgTab.id } | Out-Null
-    Start-Sleep -Milliseconds 400
-    Post '/activate' @{ id = $mine } | Out-Null
-    Start-Sleep -Milliseconds 400
+    # Shown once and switched back, through screenshot's activate, which changes the tab
+    # inside the window and nothing else. POST /activate raises the window too, which put
+    # this window over the person's and made it the window their links from other apps
+    # opened in.
+    # Checked, not bare: a refusal here would otherwise end the run instead of saying which
+    # step failed, and the check after it depends on both.
+    $shown = Status { Invoke-WebRequest -Uri ($base + '/screenshot?id=' + $bgTab.id + '&activate=1') -Headers $H -UseBasicParsing }
+    Check 'screenshot activate=1 switches to a tab and photographs it' ($shown.code -eq 200) ("" + $shown.code)
+    $back = Status { Invoke-WebRequest -Uri ($base + '/screenshot?id=' + $mine + '&activate=1') -Headers $H -UseBasicParsing }
+    Check '  and switches back' ($back.code -eq 200) ("" + $back.code)
     $wrong = Status { Invoke-WebRequest -Uri ($base + '/screenshot?id=' + $bgTab.id + '&chrome=1') -Headers $H -UseBasicParsing }
     Check 'chrome=1 for a tab its window is not showing is refused' ($wrong.code -eq 400) ("" + $wrong.code)
     # A tab of the script's own that has never been on screen, so has painted nothing. Not one
@@ -227,7 +233,10 @@ try {
 
 } finally {
     Write-Host "`n--- cleaning up"
-    $open = (Tabs) | ForEach-Object { $_.id }
+    # Guarded: with the browser gone this read would throw from inside finally and bury
+    # the error that ended the run. Nothing can be closed then anyway.
+    $open = @()
+    try { $open = (Tabs) | ForEach-Object { $_.id } } catch { Write-Host "  could not list tabs to clean up: $($_.Exception.Message)" }
     foreach ($id in $script:created) {
         if ($open -contains $id) { try { Post '/close' @{ id = $id } | Out-Null } catch {} }
     }

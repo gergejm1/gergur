@@ -12,10 +12,21 @@ public sealed class BrowserEnvironment
     public CoreWebView2Environment Core { get; }
     public Settings Settings { get; }
 
-    private BrowserEnvironment(CoreWebView2Environment core, Settings settings)
+    /// <summary>
+    /// Whether this engine was started pointing at the tunnel. Fixed for its life, because the
+    /// proxy is a browser-process flag: VpnEnabled can change underneath it (the settings
+    /// window with its restart declined, or its save refused or failed), and anything
+    /// that worked "is the vpn on" out from the setting then said off with every request
+    /// still going through the tunnel, or on with none of them doing so. The menu, the
+    /// status bar, GET /settings and whether a profile can be switched live all read this.
+    /// </summary>
+    public bool ProxyInForce { get; }
+
+    private BrowserEnvironment(CoreWebView2Environment core, Settings settings, bool proxyInForce)
     {
         Core = core;
         Settings = settings;
+        ProxyInForce = proxyInForce;
     }
 
     public static async Task<BrowserEnvironment> CreateAsync(Settings settings)
@@ -23,13 +34,16 @@ public sealed class BrowserEnvironment
         string userDataFolder = Path.Combine(Settings.DataDir, "Profile");
         Directory.CreateDirectory(userDataFolder);
 
+        // Read beside the arguments, which read the same property, so what is recorded is
+        // what the engine was given.
+        bool proxied = settings.StartWithProxy;
         var options = new CoreWebView2EnvironmentOptions
         {
             AdditionalBrowserArguments = BuildBrowserArguments(settings),
         };
         var core = await CoreWebView2Environment.CreateAsync(
             browserExecutableFolder: null, userDataFolder, options);
-        return new BrowserEnvironment(core, settings);
+        return new BrowserEnvironment(core, settings, proxied);
     }
 
     internal static string BuildBrowserArguments(Settings settings)
@@ -49,7 +63,7 @@ public sealed class BrowserEnvironment
             enableFeatures.Add("msWebView2SimulateMemoryPressureWhenInactive");
         if (settings.V8ScavengerMaxMb > 0)
             flags.Add($"--js-flags=--scavenger_max_new_space_capacity_mb={settings.V8ScavengerMaxMb}");
-        if (settings.VpnInForce)
+        if (settings.StartWithProxy)
         {
             flags.Add($"--proxy-server=socks5://127.0.0.1:{settings.VpnLocalPort}");
 

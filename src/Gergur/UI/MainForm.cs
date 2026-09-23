@@ -840,16 +840,30 @@ public sealed class MainForm : Form
         base.OnFormClosing(e);
     }
 
+    /// <summary>Whether this run's engine routes through the tunnel. See <see cref="BrowserEnvironment.ProxyInForce"/>.</summary>
+    private bool ProxyInForce => _session?.Env.ProxyInForce ?? false;
+
     /// <summary>
     /// VPN submenu: off, then one entry per WireGuard profile. WARP is whatever
     /// datacenter is nearest, so extra .conf files are how you choose an exit country.
     /// </summary>
     private ToolStripMenuItem BuildVpnMenu()
     {
-        string active = _settings.VpnInForce
-            ? _session?.Vpn.ActiveProfileName ?? VpnTunnel.ResolveProfile(_settings.VpnProfile)?.Name ?? "on"
-            : "off";
-        var menu = new ToolStripMenuItem($"VPN ({active})") { Checked = _settings.VpnInForce };
+        // Before the session exists the engine has not started, so there is nothing to
+        // report and nothing a choice could apply to. The tunnel may still be coming up
+        // (it gets twelve seconds), and a restart then closed the only window and left
+        // that tunnel running with nobody to stop it.
+        if (_session is null)
+            return new ToolStripMenuItem("VPN (not ready yet)") { Enabled = false };
+
+        // What the engine was started with, not what the setting says now: the two part
+        // whenever a change is waiting for a restart. Likewise the profile the tunnel is
+        // actually running, since the settings window can name another without switching.
+        bool proxied = ProxyInForce;
+        string? running = proxied ? _session.Vpn.ActiveProfileName : null;
+        string? chosen = VpnTunnel.ResolveProfile(_settings.VpnProfile)?.Name;
+        string active = proxied ? running ?? chosen ?? "on" : "off";
+        var menu = new ToolStripMenuItem($"VPN ({active})") { Checked = proxied };
 
         var profiles = VpnTunnel.ListProfiles();
         if (!VpnTunnel.IsProvisioned)
@@ -858,13 +872,13 @@ public sealed class MainForm : Form
         }
         else
         {
-            var off = new ToolStripMenuItem("Off", null, (_, _) => SetVpnEnabled(false)) { Checked = !_settings.VpnInForce };
+            var off = new ToolStripMenuItem("Off", null, (_, _) => TurnVpnOff()) { Checked = !proxied };
             menu.DropDownItems.Add(off);
             menu.DropDownItems.Add(new ToolStripSeparator());
             foreach (var profile in profiles)
             {
-                bool current = _settings.VpnInForce
-                    && string.Equals(profile.Name, VpnTunnel.ResolveProfile(_settings.VpnProfile)?.Name, StringComparison.OrdinalIgnoreCase);
+                bool current = proxied
+                    && string.Equals(profile.Name, running ?? chosen, StringComparison.OrdinalIgnoreCase);
                 var item = new ToolStripMenuItem(profile.Name) { Checked = current };
                 string name = profile.Name;
                 item.Click += (_, _) => _ = UseVpnProfileAsync(name);
@@ -901,19 +915,76 @@ public sealed class MainForm : Form
         return menu;
     }
 
-    private void SetVpnEnabled(bool enabled)
+    /// <summary>What the vpn menu's Off has to do.</summary>
+    public enum VpnOff
     {
-        if (_settings.VpnEnabled == enabled)
-            return;
-        _settings.VpnEnabled = enabled;
-        if (!SaveSettingsOrSay(Undone))
-        {
-            // No restart: it would read the old value back from the file.
-            _settings.VpnEnabled = !enabled;
-            return;
-        }
-        RestartForNewEngineFlags(); // the proxy is a browser-process flag
+        /// <summary>Already off, and the engine already runs without the tunnel.</summary>
+        Nothing,
+        /// <summary>The engine already runs without it (the tunnel failed at startup); only the choice needs writing down.</summary>
+        SaveOnly,
+        /// <summary>The engine runs through the tunnel, and the proxy is a browser-process flag.</summary>
+        SaveAndRestart,
     }
+
+    /// <summary>
+    /// The decision, apart from the window. It went wrong twice by being worked out from
+    /// the setting alone: once restarting every window when the engine already ran without
+    /// the tunnel, and once doing nothing at all when the setting already said off and the
+    /// engine still used the tunnel, which is what the settings window leaves behind when
+    /// its restart is declined. Off only: turning the vpn on is picking a profile, which
+    /// UseVpnProfileAsync decides for itself.
+    /// </summary>
+    /// <param name="chosen">What the setting says now.</param>
+    /// <param name="proxied">What the running engine was started with.</param>
+    internal static VpnOff DecideVpnOff(bool chosen, bool proxied)
+        => proxied ? VpnOff.SaveAndRestart   // saved even when chosen is off: the file may still say on
+            : chosen ? VpnOff.SaveOnly
+            : VpnOff.Nothing;
+
+    /// <summary>
+    /// Everything the menu's Off does, with the save, the restart and the message passed in
+    /// so a test can run it with a save that fails. Deciding correctly was not enough on
+    /// its own: what was done with the decision could put the vpn back on after a failed
+    /// save, or restart every window for nothing, with every test still green.
+    /// </summary>
+    /// <param name="saveOrSay">Saves, or says why not with the given outcome, and returns whether it saved.</param>
+    internal static VpnOff TurnVpnOff(Settings settings, bool proxied, Func<string, bool> saveOrSay, Action restart, Action<string> tell)
+    {
+        var change = DecideVpnOff(settings.VpnEnabled, proxied);
+        if (change == VpnOff.Nothing)
+            return change;
+        bool previous = settings.VpnEnabled;
+        settings.VpnEnabled = false;
+        if (!saveOrSay(change == VpnOff.SaveAndRestart ? Undone : StillInForce))
+        {
+            // No restart: it would read the old value back from the file. Put back exactly
+            // what was there. Kept off when no restart was needed, since then the engine
+            // already runs the way it was just set.
+            if (change == VpnOff.SaveAndRestart)
+                settings.VpnEnabled = previous;
+            return change;
+        }
+        if (change == VpnOff.SaveAndRestart)
+            restart(); // the proxy is a browser-process flag
+        else
+            tell("VPN off. This run was already browsing without it.");
+        return change;
+    }
+
+    private void TurnVpnOff()
+    {
+        var change = TurnVpnOff(_settings, ProxyInForce, SaveSettingsOrSay, RestartForNewEngineFlags, ShowMessage);
+        if (change == VpnOff.SaveOnly)
+        {
+            // Nothing routes through it this run, so nothing should be left running for it.
+            _session?.Vpn.Stop();
+            UpdateStatus();
+        }
+    }
+
+    // Profile picks across every window, so a pick can tell whether a later one has
+    // superseded it. Every pick runs on the UI thread, so a plain counter is enough.
+    private static int _vpnPicks;
 
     /// <summary>
     /// Switching between profiles while the VPN is already on only restarts wireproxy:
@@ -922,12 +993,18 @@ public sealed class MainForm : Form
     /// </summary>
     private async Task UseVpnProfileAsync(string profileName)
     {
-        // In force, not merely chosen: with the tunnel down this run the engine started
-        // without its proxy flag, so switching profile live would route nothing.
-        bool wasOn = _settings.VpnInForce;
-        bool sameProfile = string.Equals(VpnTunnel.ResolveProfile(_settings.VpnProfile)?.Name, profileName,
-            StringComparison.OrdinalIgnoreCase);
+        // What the engine was started with, not merely chosen: with the tunnel down this run,
+        // or a change waiting for a restart, switching profile live would route nothing.
+        if (_session is null)
+            return;   // the menu is disabled until then; this is belt and braces
+        bool wasOn = ProxyInForce;
+        // Against the profile the tunnel is running, not the setting: the settings window
+        // can change the setting without switching the tunnel, and then picking the one
+        // it named said nothing and switched nothing.
+        bool sameProfile = _session.Vpn.IsRunning
+            && string.Equals(_session.Vpn.ActiveProfileName, profileName, StringComparison.OrdinalIgnoreCase);
         string previousProfile = _settings.VpnProfile;
+        bool previousEnabled = _settings.VpnEnabled;
         _settings.VpnProfile = profileName;
         _settings.VpnEnabled = true;
         bool saved = SaveSettingsOrSay(wasOn ? StillInForce : Undone);
@@ -936,9 +1013,11 @@ public sealed class MainForm : Form
         {
             if (!saved)
             {
-                // Turning it on takes a restart, which would read the old values back.
+                // Turning it on takes a restart, which would read the old values back. Put
+                // back exactly what was there: forcing it off here turned a vpn that was
+                // chosen but down this run into one chosen off, which the next save kept.
                 _settings.VpnProfile = previousProfile;
-                _settings.VpnEnabled = false;
+                _settings.VpnEnabled = previousEnabled;
                 return;
             }
             RestartForNewEngineFlags();
@@ -946,11 +1025,25 @@ public sealed class MainForm : Form
         }
         // Already on: switching profile happens live, so it works for this run even
         // unsaved, and the box has said it will not last.
-        if (_session is null || (sameProfile && _session.Vpn.IsRunning))
+        if (sameProfile)
             return;
 
-        ShowMessage($"Switching VPN to {profileName}…");
+        string switching = $"Switching VPN to {profileName}…";
+        ShowMessage(switching);
+        int pick = ++_vpnPicks;
         bool up = await _session.Vpn.SwitchProfileAsync(_settings.VpnLocalPort, profileName, TimeSpan.FromSeconds(12));
+        // Picked again while this one was still starting: the later pick owns the tunnel
+        // and will say how it went. This one saying "failed" or "now exiting through"
+        // would describe a tunnel that is not this pick's. Counted, not compared by name:
+        // A, then B, then A again left the setting naming A, so the first pick reported
+        // "failed" while the third was still coming up.
+        if (pick != _vpnPicks)
+        {
+            // Its own "switching" line goes, unless something has replaced it since.
+            if (_messageLabel.Text == switching)
+                ShowMessage("");
+            return;
+        }
         ShowMessage(up ? $"VPN now exiting through {profileName}." : $"{profileName} failed to start; the tunnel is down.");
         UpdateStatus();
     }
@@ -1326,8 +1419,12 @@ public sealed class MainForm : Form
             // the file has not got the change, so it would quietly undo what was just set.
             // A box, as TogglePhoneBridge does for answers to a dialog: the status label
             // clips, and the half that says what to do is the half that goes.
-            MessageBox.Show(this, (dialog.WriteFailed ? WriteFailedText : NotSavedText)
-                + "\n\nWhat applies without a restart is in force until Gergur closes. What needs a restart will not happen.",
+            // Worded per case. A refused save never writes, so a restart setting will not
+            // happen; a failed write leaves the change in memory, where the next save that
+            // does succeed writes it out with everything else.
+            MessageBox.Show(this, dialog.WriteFailed
+                    ? WriteFailedText + "\n\nWhat applies without a restart is in force now, and the next save that succeeds writes it out. What needs a restart has not happened, and will only once a later save succeeds and Gergur restarts."
+                    : NotSavedText + "\n\nWhat applies without a restart is in force until Gergur closes. What needs a restart will not happen.",
                 "Gergur", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return;
         }
@@ -1450,7 +1547,17 @@ public sealed class MainForm : Form
         if (_session.PhoneBridge is null)
         {
             _settings.DropEnabled = false;
-            _settings.Save();
+            try
+            {
+                _settings.Save();
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // The write most likely to fail next, since this branch is where a pairing
+                // key that could not be saved lands, and a click handler has nothing above
+                // it. The box below still says why the drop is not running.
+                DebugLog.WriteAlways($"settings not saved: {ex.Message}");
+            }
             // A box, not the status bar. This answers a question the user was just asked
             // in a dialog, and the status label shares one line with five others, so the
             // half that says what to do is the half that gets clipped.
@@ -1574,7 +1681,7 @@ public sealed class MainForm : Form
         _memoryLabel.Text = $"engine {MemorySnapshot.Format(snapshot.EnginePrivateBytes)} · {snapshot.RendererCount} renderers · shell {MemorySnapshot.Format(snapshot.ShellPrivateBytes)}";
         _blockedLabel.Text = _session.Blocker is { Enabled: true } blocker ? $"{blocker.BlockedCount:N0} blocked" : "blocking off";
         // Name the exit, not just "on": with several profiles, which one matters.
-        _vpnLabel.Text = _settings.VpnInForce && _session.Vpn.IsRunning
+        _vpnLabel.Text = ProxyInForce && _session.Vpn.IsRunning
             ? (_session.Vpn.ActiveProfileName == VpnTunnel.WarpName ? "WARP" : _session.Vpn.ActiveProfileName ?? "VPN")
             : "";
         UpdateSleepLabel();
@@ -1637,10 +1744,15 @@ public sealed class MainForm : Form
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            // A write that failed, which a click handler has nothing above it to catch.
-            // Named rather than quoted: the exception text carries the profile path.
+            // A write that failed, which a click handler has nothing above it to catch. The
+            // log gets the message; the box below names the file rather than quoting it.
             DebugLog.WriteAlways($"settings not saved: {ex.Message}");
             why = WriteFailedText;
+            // A failed write sets no guard, so a change kept in memory is written out by the
+            // next save that does succeed, an agent's /settings patch of something else
+            // included. "Until Gergur closes" undersold how long it can last.
+            if (ifNotSaved == StillInForce)
+                ifNotSaved = "It is in force now, and the next save that succeeds writes it out.";
         }
         MessageBox.Show(this, why + "\n\n" + ifNotSaved, "Gergur", MessageBoxButtons.OK, MessageBoxIcon.Warning);
         return false;

@@ -111,22 +111,40 @@ public sealed class VpnTunnel : IDisposable
         }
         ActiveProfileName = profile.Name;
 
+        // This start's own process. Two profile picks can overlap, since the menu does not
+        // wait for the first, and a later SwitchProfileAsync replaces _process while this
+        // one is still waiting. Everything below acts only on this start's process: taking
+        // down "the" tunnel on this one's timeout killed the later pick's tunnel instead,
+        // and this one's probe could connect to the later one's listener and report
+        // success for a profile that was not the one running.
+        var mine = _process;
         var deadline = DateTime.UtcNow + timeout;
         while (DateTime.UtcNow < deadline)
         {
-            if (_process is null || _process.HasExited)
+            if (!ReferenceEquals(_process, mine))
+                return false;   // superseded; the newer start owns the tunnel now
+            if (mine is null || mine.HasExited)
+            {
+                Stop();
                 return false;
+            }
             try
             {
                 using var probe = new TcpClient();
                 await probe.ConnectAsync("127.0.0.1", port).WaitAsync(TimeSpan.FromSeconds(1));
-                return true;
+                return ReferenceEquals(_process, mine);
             }
             catch
             {
                 await Task.Delay(300);
             }
         }
+        // Given up on, so taken down, if it is still this start's. Left running, it kept its
+        // profile name and a live process: the status bar named that profile, the agent API
+        // said the tunnel was running, and picking the same profile again counted as already
+        // on and did nothing, all straight after "failed to start; the tunnel is down".
+        if (ReferenceEquals(_process, mine))
+            Stop();
         return false;
     }
 

@@ -309,7 +309,7 @@ public sealed class SettingsFileTests : IDisposable
         var settings = Settings.Load(path);
 
         settings.VpnDownThisRun = true;   // what startup does when the tunnel fails
-        Assert.False(settings.VpnInForce);
+        Assert.False(settings.StartWithProxy);
 
         using var patch = System.Text.Json.JsonDocument.Parse("""{ "PageTheme": "Dark" }""");
         Assert.Null(SettingsPatch.Apply(settings, patch.RootElement, [], [], []));
@@ -317,7 +317,22 @@ public sealed class SettingsFileTests : IDisposable
 
         var reloaded = Settings.Load(path);
         Assert.True(reloaded.VpnEnabled);
-        Assert.True(reloaded.VpnInForce);   // and the next start tries the tunnel again
+        Assert.True(reloaded.StartWithProxy);   // and the next start tries the tunnel again
+    }
+
+    [Fact]
+    public void TheSettingsWindowCannotResetATunnelMarkedDown()
+    {
+        // The window edits a clone and copies it back. The run-only mark survives that
+        // only because the copy covers public settings and the clone drops ignored ones;
+        // made public, the copy back would reset it and the next save could write the
+        // vpn off again.
+        var live = new Settings { VpnEnabled = true, VpnDownThisRun = true };
+
+        live.CopyFrom(live.Clone());
+
+        Assert.True(live.VpnDownThisRun);
+        Assert.True(live.VpnEnabled);
     }
 
     [Fact]

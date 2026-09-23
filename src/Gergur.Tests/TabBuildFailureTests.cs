@@ -330,6 +330,47 @@ public sealed class TabBuildFailureTests
         Assert.Contains("VpnDownThisRun = true", startup);
         Assert.DoesNotContain("VpnEnabled = false", startup);
 
+        // A profile pick whose save failed puts back what was there. It used to force the
+        // vpn off, which turned "chosen but down this run" into "chosen off", and the next
+        // save of anything kept that.
+        string pick = Body(form, "private async Task UseVpnProfileAsync(");
+        Assert.DoesNotContain("VpnEnabled = false", pick);
+        Assert.Contains("_settings.VpnEnabled = previousEnabled", pick);
+
+        // What the running engine was given is what the menu, the status bar and the
+        // live profile switch go by, not the setting, which moves under it.
+        Assert.Contains("bool wasOn = ProxyInForce", pick);
+        // A profile already running is compared against the tunnel, not the setting, which
+        // the settings window changes without switching anything.
+        Assert.Contains("_session.Vpn.IsRunning", pick);
+        // A superseded pick is recognised by count, not by the profile name, which A, then
+        // B, then A again puts back.
+        Assert.Contains("if (pick != _vpnPicks)", pick);
+        Assert.DoesNotContain("_settings.VpnProfile, profileName", pick);
+        Assert.DoesNotContain("ResolveProfile(_settings.VpnProfile)?.Name, profileName", pick);
+        string menu = Body(form, "private ToolStripMenuItem BuildVpnMenu(");
+        Assert.Contains("bool proxied = ProxyInForce;", menu);
+        Assert.DoesNotContain("_settings.VpnEnabled", menu);
+        Assert.DoesNotContain("StartWithProxy", menu);
+        Assert.Contains("ProxyInForce && _session.Vpn.IsRunning", form);
+
+        // The one line every one of those reads through, and the menu's Off going through
+        // the tested sequence with the engine's state. Pointing either back at the setting
+        // passed everything else.
+        Assert.Contains("private bool ProxyInForce => _session?.Env.ProxyInForce ?? false;", form);
+        Assert.Contains("TurnVpnOff(_settings, ProxyInForce,", Body(form, "private void TurnVpnOff()"));
+        Assert.Contains("=> TurnVpnOff())", menu);
+
+        string env = Code(File.ReadAllText(FindSource(Path.Combine("src", "Gergur", "App", "BrowserEnvironment.cs"))));
+        string create = Body(env, "public static async Task<BrowserEnvironment> CreateAsync(");
+        Assert.Contains("bool proxied = settings.StartWithProxy", create);
+        Assert.Contains("new BrowserEnvironment(core, settings, proxied)", create);
+
+        string agent = Code(File.ReadAllText(FindSource(Path.Combine("src", "Gergur", "App", "AgentServer.cs"))));
+        Assert.Contains("vpnInForce = _session.Env.ProxyInForce", agent);
+        Assert.Contains("_session.Vpn.IsRunning)));", agent);
+        Assert.Contains("tunnelRunning = tunnelUp", agent);
+
         string drop = Code(File.ReadAllText(FindSource(Path.Combine("src", "Gergur", "App", "DropServer.cs"))));
         // The real pairing key path saves through the real Save, not only the test seam.
         Assert.Contains("EnsureKey(settings, settings.Save)", drop);
@@ -379,6 +420,52 @@ public sealed class TabBuildFailureTests
         Assert.False(Tab.ShouldNavigateWhenBuilt(disposed: false, hasView: false, "https://a/", "https://a/"));
         // Somebody sent the tab elsewhere meanwhile, and theirs stands.
         Assert.False(Tab.ShouldNavigateWhenBuilt(disposed: false, hasView: true, "https://b/", "https://a/"));
+    }
+}
+
+/// <summary>
+/// What the vpn menu's Off does, in each of the four combinations of what the setting says
+/// and what the running engine was started with, with a save that works and one that
+/// fails. The whole sequence runs, not only the decision: deciding right was not enough
+/// when a failed save could put the vpn back on, or a save-only case restart every window.
+/// Turning the vpn on is picking a profile, which is UseVpnProfileAsync and not this.
+/// </summary>
+public sealed class VpnOffTests
+{
+    [Theory]
+    // chosen, proxied, save works: what happens, whether it restarts, the setting after
+    [InlineData(true, true, true, MainForm.VpnOff.SaveAndRestart, true, false)]     // the ordinary Off
+    [InlineData(true, true, false, MainForm.VpnOff.SaveAndRestart, false, true)]    // not saved: put back, no restart
+    [InlineData(false, true, true, MainForm.VpnOff.SaveAndRestart, true, false)]    // off in settings, restart declined: Off must still act
+    [InlineData(false, true, false, MainForm.VpnOff.SaveAndRestart, false, false)]  // not saved: back to what it was, which is off
+    [InlineData(true, false, true, MainForm.VpnOff.SaveOnly, false, false)]         // tunnel failed at startup: nothing to restart
+    [InlineData(true, false, false, MainForm.VpnOff.SaveOnly, false, false)]        // not saved, still off: the engine already runs that way
+    [InlineData(false, false, true, MainForm.VpnOff.Nothing, false, false)]
+    public void OffDoesWhatEachStateNeeds(
+        bool chosen, bool proxied, bool saves, MainForm.VpnOff expected, bool restarts, bool enabledAfter)
+    {
+        var settings = new Gergur.App.Settings { VpnEnabled = chosen };
+        string? outcome = null;
+        int restarted = 0, told = 0;
+
+        var change = MainForm.TurnVpnOff(
+            settings, proxied,
+            saveOrSay: said => { outcome = said; return saves; },
+            restart: () => restarted++,
+            tell: _ => told++);
+
+        Assert.Equal(expected, change);
+        Assert.Equal(restarts ? 1 : 0, restarted);
+        Assert.Equal(enabledAfter, settings.VpnEnabled);
+        if (expected == MainForm.VpnOff.Nothing)
+        {
+            Assert.Null(outcome);   // nothing saved, nothing said
+            return;
+        }
+        // What a failed save says matches what happened to the change.
+        Assert.Equal(expected == MainForm.VpnOff.SaveAndRestart ? MainForm.Undone : MainForm.StillInForce, outcome);
+        // A save-only Off that saved is confirmed; a restart speaks for itself.
+        Assert.Equal(expected == MainForm.VpnOff.SaveOnly && saves ? 1 : 0, told);
     }
 }
 

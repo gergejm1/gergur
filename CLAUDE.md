@@ -50,7 +50,7 @@ sent. Prefer the id: see "Naming a tab" below.
 | POST /eval | {"js": "...", "await": false?, "timeout": s?} | run JS, returns {"ok": true, "result": ...} |
 | POST /click | {"selector": "..."} | querySelector + click; 503 if the page is not loaded |
 | POST /type | {"selector": "...", "text": "..."} | fill input (React-safe); 503 if the page is not loaded |
-| GET /settings | | {settings, restartRequired}; credentials read as "(hidden)" |
+| GET /settings | | {settings, restartRequired, vpnInForce, tunnelRunning}; credentials read as "(hidden)" |
 | POST /settings | {"BlocklistEnabled": false, ...} | change settings, returns {applied, restartNeededFor, unknown, persisted} |
 | POST /window | {"url": "..."?, "focus": true?} | open another window, returns {window, id} |
 | POST /mcp | JSON-RPC 2.0 | the same surface as MCP tools; see below |
@@ -158,8 +158,16 @@ A tunnel that will not come up at startup is recorded for that run only
 (`Settings.VpnDownThisRun`), never in `VpnEnabled`. It used to switch `VpnEnabled` off "for
 this session", and the next save of anything wrote that to disk, an agent's `/settings`
 patch of an unrelated setting included: the vpn was then off at the next start, and an
-agent had turned it off without naming it. What decides whether traffic goes through the
-tunnel reads `VpnInForce`, which is both.
+agent had turned it off without naming it. A new engine points at the tunnel when
+`StartWithProxy` (chosen, and up) says so, and what the running engine was given is recorded
+once in `BrowserEnvironment.ProxyInForce`: the menu, the status bar, whether a profile can
+be switched live, what the menu's Off does (`MainForm.TurnVpnOff`, run in all four states
+with a save that works and one that fails), and `vpnInForce` on `GET /settings` all read that, because `VpnEnabled` moves
+under a running engine whenever a change is waiting for a restart. So `VpnEnabled` in
+`settings` is the choice, `vpnInForce` says the engine points at the tunnel, and
+`tunnelRunning` says the tunnel's process is running (a start that times out is now
+taken down, so a failed start no longer reads as running). Traffic goes through the vpn only when both are
+true; in force with no tunnel, requests fail rather than go around it.
 
 `UrlHeuristics.Search` falls back to the default template rather than throwing, because a
 hand-edited `settings.json` never passes through the API: `string.Format` throws on a
@@ -281,16 +289,23 @@ wakes it. The user's browsing is personal: read what the task requires, nothing 
     `AppSession.PickWindow`, the held navigation for a slow build, settings held while
     a tab sleeps and a suspended tab staying suspended when switched away from, the
     settings save refusal (`Settings.Save`, `DropServer.EnsureKey`), and a tunnel that
-    failed this run never being saved as turned off (`Settings.VpnDownThisRun`).
+    failed this run never being saved as turned off (`Settings.VpnDownThisRun`), and what
+    the vpn menu's Off does in its four states, with the save working and failing
+    (`MainForm.TurnVpnOff`). Turning the vpn on is picking a profile, which is not covered.
   - Source checks only (`TheWindowInUseIsWhatEveryCrossThreadCallerAsks`), which prove the
     call is there and nothing about what it does at runtime: that `ActiveEntry` and
     `OpenExternalUrl` go through `WindowInUse`, that `OnActivated` records the window, and
     that `ApplyLiveSettings` pushes into open tabs, that a woken tab is handed the settings
     held for it, that startup marks a failed tunnel with `VpnDownThisRun` rather than
-    `VpnEnabled`, and that the real pairing key path saves through `Settings.Save`.
+    `VpnEnabled`, that `GET /settings` reports `vpnInForce` and `tunnelRunning` from one
+    snapshot, that a failed profile pick puts back the previous choice rather than
+    forcing the vpn off, that the vpn menu, status bar and live switch read
+    `ProxyInForce`, and that the real pairing key path saves through `Settings.Save`.
   - Nothing at all: whether `ApplySettingsLiveAsync` actually changes an open page (it
     needs an engine), `/settings` answering `persisted: false`, the not-saved boxes in the
-    settings window and the menu toggles, and `/window` closing an empty window.
+    settings window and the menu toggles, the vpn menu being disabled while Gergur starts, `VpnTunnel.StartAsync` taking a failed
+    start down without touching a newer pick's tunnel (it needs a wireproxy; a review
+    ran it in a copy against a fake one, four cases including two overlapping picks), and `/window` closing an empty window.
   - `scripts/verify-agent-api.ps1` exercises only the happy paths of /open and /window
     among these, since every call it makes names a tab and it never changes a page
     setting. Run it against a fresh Release build before relying on any of this.

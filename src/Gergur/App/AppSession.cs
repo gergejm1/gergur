@@ -14,9 +14,11 @@ public sealed class AppSession
 {
     private readonly List<MainForm> _windows = new();
 
-    // The list belongs to the UI thread, but WindowInUse is asked from the agent server's
-    // request threads and the pipe thread a second launch forwards links on. Copying the
-    // list while a window opens or closes throws, or copies a torn list.
+    // The list belongs to the UI thread. WindowInUse is asked from the agent server's
+    // request threads and the pipe thread a second launch forwards links on, where copying
+    // the list while a window opens or closes throws or copies a torn list, so it copies
+    // under this lock. Not every reader takes it: AgentServer.AllTabs reads unlocked and
+    // retries, and most other reads happen on the UI thread inside OnUiAsync.
     private readonly object _windowsLock = new();
 
     public Settings Settings { get; }
