@@ -35,8 +35,14 @@ public sealed class TabLifecycleManager
 {
     private readonly Func<DateTime> _utcNow;
 
-    public TimeSpan SuspendAfter { get; }
-    public TimeSpan DiscardAfter { get; }
+    /// <summary>
+    /// Settable so a change in the settings takes effect in the window you changed it
+    /// from. These used to be fixed at construction, which meant a window read them once
+    /// when it opened: the dialog never listed them as needing a restart, and changing
+    /// one did nothing at all until you opened a new window.
+    /// </summary>
+    public TimeSpan SuspendAfter { get; set; }
+    public TimeSpan DiscardAfter { get; set; }
 
     public TabLifecycleManager(TimeSpan suspendAfter, TimeSpan discardAfter, Func<DateTime>? utcNow = null)
     {

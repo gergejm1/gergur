@@ -364,6 +364,7 @@ public sealed class DropServerLiveTests : IDisposable
                 await idle.ConnectAsync(IPAddress.Loopback, _port);
                 squatters.Add(idle);
             }
+            await WaitForEverySlotTakenAsync();
 
             // With every slot held, the answer is "busy", delivered as an answer. This
             // used to accept 503 or 200 and to swallow the IOException from a reset,
@@ -385,6 +386,29 @@ public sealed class DropServerLiveTests : IDisposable
         {
             foreach (var idle in squatters)
                 idle.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Waits until the server holds every one of its connection slots. A connected socket
+    /// is not yet a held slot: each accepted connection is handled on the thread pool, so
+    /// the order handlers claim slots is not the order the sockets connected, and a request
+    /// sent right after the sixteenth connect could take a slot ahead of it and be served.
+    /// That failed about one full run of the suite in ten, in a fifth of a second.
+    ///
+    /// Two seconds, because the squatters' own head deadline is five: this wait plus the
+    /// server's two second wait for a slot has to end before the first of them is dropped.
+    /// </summary>
+    private async Task WaitForEverySlotTakenAsync()
+    {
+        var slots = (SemaphoreSlim)typeof(DropServer)
+            .GetField("_slots", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!
+            .GetValue(_server)!;
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(2);
+        while (slots.CurrentCount > 0)
+        {
+            Assert.True(DateTime.UtcNow < deadline, $"{slots.CurrentCount} slots still free with 16 connections open");
+            await Task.Delay(10);
         }
     }
 }

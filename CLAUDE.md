@@ -33,20 +33,206 @@ $H = @{ 'X-Gergur-Token' = $t }
 Invoke-RestMethod "http://127.0.0.1:24002/tabs" -Headers $H
 ```
 
+Every endpoint that takes a tab takes `id` or `index`, and `id` wins when both are
+sent. Prefer the id: see "Naming a tab" below.
+
 | Endpoint | Body / query | Does |
 |---|---|---|
-| GET /tabs | | list tabs: index, window, url, title, state, active, errors |
-| POST /open | {"url": "..."} | open tab (activates), returns index |
-| POST /activate | {"index": n} | switch to tab |
-| POST /close | {"index": n} | close tab |
-| POST /navigate | {"url": "...", "index": n?} | navigate (default: active tab) |
-| GET /page?index=n | | {url, title, text} - rendered innerText |
-| GET /html?index=n | | outer HTML |
-| GET /screenshot?index=n | | PNG bytes (activates the tab first) |
-| POST /eval | {"js": "...", "index": n?} | run JS, returns {"result": ...} |
-| POST /click | {"selector": "...", "index": n?} | querySelector + click |
-| POST /type | {"selector": "...", "text": "...", "index": n?} | fill input (React-safe) |
+| GET /tabs | | list tabs: id, index, window, url, title, state, active, errors |
+| POST /open | {"url": "...", "background": true?, "window": n?} | open tab, returns {id, index} |
+| POST /activate | {"id": "t3"} or {"index": n} | switch to tab |
+| POST /close | {"id": "t3"} or {"index": n} | close tab |
+| POST /navigate | {"url": "...", "wait": true?, "timeout": s?} | navigate; wait returns {ok, loaded} |
+| GET /page | | {url, title, text} - rendered innerText |
+| GET /html | | outer HTML |
+| GET /screenshot | ?activate=1, ?chrome=1 | PNG bytes |
+| GET /console | | {url, errors} - the same list the status bar counts |
+| POST /eval | {"js": "...", "await": false?, "timeout": s?} | run JS, returns {"ok": true, "result": ...} |
+| POST /click | {"selector": "..."} | querySelector + click; 503 if the page is not loaded |
+| POST /type | {"selector": "...", "text": "..."} | fill input (React-safe); 503 if the page is not loaded |
+| GET /settings | | {settings, restartRequired}; credentials read as "(hidden)" |
+| POST /settings | {"BlocklistEnabled": false, ...} | change settings, returns {applied, restartNeededFor, unknown, persisted} |
+| POST /window | {"url": "..."?, "focus": true?} | open another window, returns {window, id} |
 | POST /mcp | JSON-RPC 2.0 | the same surface as MCP tools; see below |
+
+### Naming a tab
+
+`id` is handed out once per tab and stays with it wherever it goes, including into
+another window. `index` is a position, and a tab opening, closing or being torn off
+renumbers every position after it, so an agent holding an index acts on whatever slid
+into that slot: the wrong page navigated away from, typed into, or closed. Read the id
+out of /tabs and use that. The index still works, and still means a flat position across
+every window in window order.
+
+### Working while somebody else is using the browser
+
+Nothing here takes the screen unless it is asked to:
+
+- `POST /window` opens a second window, placed directly behind whatever has focus
+  unless `focus` is set, and always with a tab in it. Not taking the keyboard is not the
+  same as not covering the screen: a new window starts at the top of the stack, so it is
+  put behind explicitly. Measured on 2026-09-22 with a terminal in front: focus kept, new
+  window behind. That is the one to reach for: a window of your own is where to work
+  without interrupting anyone. It answers with a `window` index.
+- `POST /open` takes that `window` index, so tabs land in your window rather than the
+  one the user is reading. With `background: true` it does not switch to the new tab.
+- `GET /screenshot` reads whatever the tab last rendered. `activate=1` switches the tab's
+  window to it first, which changes what that window shows, and is not the default. It
+  never raises the window over other apps; `POST /activate` is the one that does.
+- `GET /page` disturbs nothing and is the better read anyway.
+
+Activating a tab and focusing a window are the two things the person at the keyboard
+feels, so both are opt in.
+
+A window shows one tab at a time, so `chrome=1` for a tab that is not the one on screen
+is refused rather than answered with a different page inside the right frame. Pass
+`activate=1` with it, or leave the tab out and photograph what is on screen.
+
+A tab that has never been on screen answers 503 rather than a blank png, and so does one
+whose page has not finished loading when the wait runs out. `activate=1` skips the first
+of those deliberately: it rebuilds the view, and the capture then waits for the page
+rather than sleeping a fixed moment and photographing whatever is there.
+
+The wait reports what it saw, which sounds obvious and was not: it used to ask afterwards
+whether the tab still had a load outstanding, and the staleness cutoff on that answer was
+the same fifteen seconds the wait itself takes, so a page that never loaded read as
+"settled" the moment the wait gave up and the refusal turned back into a blank png.
+
+There is still a cutoff, at two minutes, on how long a tab counts as loading. A navigation
+that starts and never completes, which is what a link that turns into a download looks
+like, would otherwise make every later read wait for a page that is not coming. So a tab
+left loading for longer than that reads as settled and will be photographed as it stands,
+which for a slow-loris url means the previous page under the new url. Two minutes is long
+enough that nothing ordinary reaches it; it is written down here because it is a real hole
+rather than a tidy one.
+
+### Settings over the API
+
+`GET /settings` reports every setting. Credentials read as `"(hidden)"`: the answer goes
+into a transcript, and `DropKey` is the pairing key for the only listener in this browser
+that reaches past loopback.
+
+`POST /settings` refuses a setting outright when changing it would widen what this API can
+reach *and* outlive the agent that changed it. Everything on that list is persisted, in
+force at the next launch long after the session is gone, and shows up nowhere a person
+would look:
+
+- `DropKey`, `DropEnabled`, `DropPort`, `AgentServerEnabled`, `AgentServerPort` - who can
+  reach this browser from off the machine, and with what credential.
+- `ExtraBrowserArguments` - arbitrary engine flags, which is the rest of its security.
+- `DisableSiteIsolation` - the renderer sandbox boundary.
+- `VpnEnabled`, `VpnProfile`, `VpnBypassHosts`, `VpnLocalPort` - whether traffic goes
+  through the tunnel, which one, what skips it, and the port the engine's `--proxy-server`
+  flag points at, which is every request the browser makes. `"VpnBypassHosts": "*"`
+  sends everything around the tunnel while `GET /settings` still reports the vpn as on
+  and the status bar still shows it.
+- `SearchUrlTemplate` - where every search the person types goes. Validating it was tried
+  first and was not enough: a template can be perfectly well formed and still point at
+  somebody else's server.
+
+Those are changed from the settings window, where somebody is looking at what they typed.
+The refusal names the setting rather than dropping it quietly. It refuses in both
+directions on purpose: an agent cannot turn the phone drop or the vpn *off* either, even
+though that narrows the reach, because a coarse rule you can state in one sentence is
+easier to keep right than a list of exceptions. Turning the vpn off to test the YouTube
+buffering symptom below is a settings-window job.
+
+Everything else is range checked as well as type checked, and a single refusal rejects the
+whole patch rather than applying half of it. What can take effect without a restart does,
+through the same path the settings dialog uses, so `applied` means applied;
+`restartNeededFor` names the engine flags that did not. That includes the page settings on
+tabs already open (`MainForm.ApplyLiveSettings` pushes them into every live view): the
+colour scheme, tracking prevention and the two autofill switches at once, `PageAdCleanup`
+from the next page each tab loads, since it is a script that runs as a document is
+created. A suspended tab takes them when it wakes, since calls into a sleeping view can
+wake it. Those used to reach only views built afterwards while being reported as applied.
+
+`persisted: false` comes back, with the reason, when Gergur could not read `settings.json`
+at startup. That run is on defaults and leaves the file alone for good: saving those
+defaults would replace the pairing key and the vpn profile with them. The settings window
+and the menu toggles are held to the same rule and say so in a box; the vpn toggle does
+not restart for a change it could not save, because the restart would read the old value
+back, and the phone drop does not start, because its pairing key would not survive.
+
+A tunnel that will not come up at startup is recorded for that run only
+(`Settings.VpnDownThisRun`), never in `VpnEnabled`. It used to switch `VpnEnabled` off "for
+this session", and the next save of anything wrote that to disk, an agent's `/settings`
+patch of an unrelated setting included: the vpn was then off at the next start, and an
+agent had turned it off without naming it. What decides whether traffic goes through the
+tunnel reads `VpnInForce`, which is both.
+
+`UrlHeuristics.Search` falls back to the default template rather than throwing, because a
+hand-edited `settings.json` never passes through the API: `string.Format` throws on a
+template naming an argument it was not given, the address bar calls it straight from the
+Enter key with no try/catch, and there is no unhandled-exception handler in the app. A bad
+template in the file used to turn every search into a crash dialog that survived restarts.
+
+### When a read refuses
+
+Every endpoint that touches a page answers 503 rather than guessing when the page is not
+there: /page, /html, /eval, /click, /type and /screenshot. /open, /window and /navigate
+answer 503 "could not start" when the engine failed to build the tab's view, which is a
+different thing from a url it refused and has a different fix. /open and /window take
+the tab or window they made away again before answering (`TabManager.OpenOrDiscardAsync`),
+so a failure leaves nothing for the person to find: no tab, no "could not start" in their
+status bar about a tab that is gone, not on their Ctrl+Shift+T stack, and for a tab opened
+in front, the tab they were reading comes back rather than whichever sat next to it.
+/navigate keeps its tab and says in `retryInSeconds` how long until it can be tried again,
+because a tab that failed waits five seconds before the next attempt, and five minutes
+after three failures in a row. Nothing retries by itself: the next read or navigate after
+that is the retry. A build that is slow rather than failed is not reported as either,
+including a retry after an earlier failure that is still under way: a `wait: true`
+navigate gives up on it within its own timeout, answers `loaded: false`, and the
+navigation happens when the view arrives. Two navigations asked for during one slow build
+end on the second.
+
+A 500, or an MCP tool that "failed inside the browser", is written to
+`%LOCALAPPDATA%\Gergur\debug.log` whether or not `GERGUR_DEBUG` is set. That is where the
+cause is: the answer itself only says where to look.
+
+Refusing matters most for /click and /type, which used to answer `{"ok": false}` for a
+page that never loaded, and that is indistinguishable from "nothing matched that
+selector": an agent reads it as a bad selector and retries against a page that was never
+there.
+
+### Waiting for things
+
+- `POST /eval` awaits a promise, so `fetch(...).then(r => r.json())` comes back with
+  its value rather than `{}`. Only an expression can be awaited; a script of several
+  statements runs as it always did and answers with its completion value. Which of the
+  two it is gets decided by parsing the source without running it, so a well formed
+  expression cannot run twice. `await=0` forces the old immediate read. The answer is
+  `{"ok": true, "result": ...}` or `{"ok": false, "error": "..."}`, either way, and that
+  includes a script that threw: the plain engine call reports a thrown error and the
+  value null identically, which is why this one does not use it.
+- Reading a tab wakes it, and that means both kinds of asleep. A suspended tab is
+  resumed; a discarded one has its view rebuilt, and either way the read waits for
+  whatever page is on its way, whoever started it. Waiting only when *this* call had to
+  build the view was not enough: activating a tab, or clicking it in the strip, issues the
+  navigation and returns, so the next read saw a live view with nothing in it and answered
+  200 with the real url, the real title and an empty page. The wait is 15 seconds, under
+  the call's own budget rather than added to it, so waking a tab does not push a request
+  past its own deadline. A screenshot spends one budget across the wait, the paint and the
+  capture, and a `wait: true` navigate starts its clock before the view is built. Both
+  used to hold two full waits: a wake of 15 seconds and then the endpoint's own 15 made a
+  screenshot of a wedged page take 30, past the 20 an MCP tool call gets, so the honest
+  refusal arrived as "the tool call was abandoned".
+- Reading a tab counts as using it, so it will not be frozen underneath the request, and
+  an agent polling one more often than the suspend timer keeps that tab's renderer alive.
+  That is deliberate, and it is a real memory cost in a browser whose whole point is to
+  be frugal: prefer reading a tab when you need it to polling it.
+- `POST /navigate` with `wait: true` comes back when *that* page has loaded and says
+  whether it actually did, rather than leaving you to sleep and hope. A sleep that is too
+  short reads as a broken page: one run here reported a video player wedged when it had
+  simply not started yet. It is bound to the navigation it asked for, not to the next one
+  the tab happens to finish, because navigating a tab that is still loading aborts the
+  old load and that abort arrives first.
+- Over `/mcp` both waits are capped to the tool call's own budget, so a slow page answers
+  `{"ok": true, "loaded": false}` rather than the tool reporting itself abandoned.
+- `GET /screenshot?chrome=1` photographs the whole window, tab strip and toolbar and
+  status bar included, using `PrintWindow` from outside the app. The engine's own
+  capture returns the page alone, and two of the faults reported in this browser lived in
+  the chrome where nothing automated could see them.
 
 `/mcp` speaks Model Context Protocol over JSON-RPC (`initialize`, `ping`, `tools/list`,
 `tools/call`), so any Claude Code session can drive the browser as native tools rather
@@ -61,20 +247,80 @@ Each tool maps onto an endpoint above, so there is one implementation of every a
 An `index` that is supplied but unusable is an error, never a silent fall back to the
 tab the user is looking at.
 
-Tabs can be dragged out into their own windows, so `index` is a flat position
-across every window in window order: tearing a tab off renumbers what follows it.
-Re-read /tabs rather than reusing an index across such a change. `window` says
-which window a tab is in, and `active` means active within that window, so several
-tabs can be active at once. `index` omitted means the active tab of the focused
-window. Reading/evaluating a parked (asleep) tab wakes it. Screenshots activate the target tab, so prefer /page for background
-reads to avoid disturbing what the user is looking at. The user's browsing is
-personal: read what the task requires, nothing more.
+`window` says which window a tab is in, and `active` means active within that window,
+so several tabs can be active at once. With neither `id` nor `index`, an endpoint acts
+on the active tab of the window the person last brought to the front, which the app
+records as it happens (`AppSession.LastActiveWindow`). Asking a form whether it has focus
+from a request thread always says no, so "the focused window" used to mean window 0
+whatever the person was using. Reading or evaluating a parked (asleep) tab
+wakes it. The user's browsing is personal: read what the task requires, nothing more.
 
 ## Notes
 
-- Settings: `%LOCALAPPDATA%\Gergur\settings.json`. Engine flags (VPN, process
-  policy) apply only on a fresh engine start.
+- Tabs leave their strip sideways as well as up and down. Height alone was the old test,
+  and with monitors side by side the natural way to move a tab to the other screen is
+  sideways, level with the strip, so it counted as a reorder: pulling off the left edge
+  worked out as "move to the front". Being over another window's strip counts as leaving
+  too, even inside the margin, because two maximised windows' strips meet at the monitor
+  boundary. A torn off window lands on the monitor it was dropped on (`TabDrag.TearOffBounds`);
+  it used to be clamped at zero, which is only the edge of the primary monitor, so a screen
+  to its left or above sent it back. The user's machine has a monitor at X=-1920.
+- A tab whose page the engine could not start says so ("could not start", a status
+  message), and at launch the first one brings up "Gergur failed to start". The build
+  itself never throws: it is awaited from a tab click, an async void handler, in an app
+  with no unhandled exception handler, and throwing there took the whole browser down.
+- Live verification, 2026-09-22, against the Release build of that afternoon, before the
+  last two review rounds: 48 endpoint checks passing, a `chrome=1` capture looked at by
+  eye, which does include the rendered page area, and an agent window measured behind a
+  terminal. The drag, sideways onto another monitor, was confirmed by hand by the user
+  the same day; nothing automated drives it. **The code as committed has not been run
+  live.** What changed since that run, and what checks each part:
+  - Unit tests, which exercise the decision with no engine behind it:
+    `TabManager.OpenOrDiscardAsync` (a failed tab taken away quietly, the previous tab
+    back), `Tab.CouldNotStart`, `AgentServer.NavigateAnswer` and `PageCouldNotStart`,
+    `AppSession.PickWindow`, the held navigation for a slow build, settings held while
+    a tab sleeps and a suspended tab staying suspended when switched away from, the
+    settings save refusal (`Settings.Save`, `DropServer.EnsureKey`), and a tunnel that
+    failed this run never being saved as turned off (`Settings.VpnDownThisRun`).
+  - Source checks only (`TheWindowInUseIsWhatEveryCrossThreadCallerAsks`), which prove the
+    call is there and nothing about what it does at runtime: that `ActiveEntry` and
+    `OpenExternalUrl` go through `WindowInUse`, that `OnActivated` records the window, and
+    that `ApplyLiveSettings` pushes into open tabs, that a woken tab is handed the settings
+    held for it, that startup marks a failed tunnel with `VpnDownThisRun` rather than
+    `VpnEnabled`, and that the real pairing key path saves through `Settings.Save`.
+  - Nothing at all: whether `ApplySettingsLiveAsync` actually changes an open page (it
+    needs an engine), `/settings` answering `persisted: false`, the not-saved boxes in the
+    settings window and the menu toggles, and `/window` closing an empty window.
+  - `scripts/verify-agent-api.ps1` exercises only the happy paths of /open and /window
+    among these, since every call it makes names a tab and it never changes a page
+    setting. Run it against a fresh Release build before relying on any of this.
+  Never exercised live at all: a view build that fails (and so the could-not-start
+  messages and the taking away of a failed /open or /window), a tab discarded after
+  fifteen minutes, the sleep timers applying live, an agent window placed while another
+  Gergur window has focus rather than a terminal, and tearing a tab off onto a monitor
+  with a different scale, since every monitor on this machine is at 96 dpi.
+- An agent's own window is saved with the session when it closes and comes back at the
+  next launch like any other window, carrying whatever the agent left open in it.
+- Settings: `%LOCALAPPDATA%\Gergur\settings.json`, or `GET`/`POST /settings` while it
+  runs. Engine flags (VPN, process policy) apply only on a fresh engine start, and
+  `restartNeededFor` in the response names the ones that have not taken effect yet
+  rather than leaving you to find out.
+- `Settings.Save()` writes to one fixed path, so nothing a test can reach may call it.
+  `SettingsPatch.Apply` changes memory and the `/settings` endpoint decides to persist.
+  It did not always: a run of SettingsPatchTests wrote its fixtures over the real file
+  and took out the vpn profile, the blocklist and the phone drop pairing key, and that
+  key was not recoverable from anything in the build. The tests now read that file
+  before and after and fail if it moved.
 - Debug trace: set `GERGUR_DEBUG=1` before launch, log at `%LOCALAPPDATA%\Gergur\debug.log`.
+  Failures are written there without it: agent API 500s, a view that could not start
+  (without its url, which is browsing and only logged with tracing on), a window that
+  could not be put behind the one in use, a settings file that could not be read. It
+  starts over past 4 MB and keeps the one before as `debug.log.old`, and keeps writing
+  past the cap while something holds the file open rather than going silent. The test
+  assembly sends it to `%TEMP%\gergur-tests\debug.log` before any test runs (`TestLog`),
+  because tests fail builds on purpose and each one used to land in the real log looking
+  exactly like a real failure; `DebugLogTests.TestsNeverWriteTheRealLog` fails if that
+  stops.
 - `errors` on /tabs is exactly what the status bar's "⚠ N issues" counts: JS errors,
   unhandled rejections, `console.error` calls, and failed subresource loads on that
   tab's current page. It clears on every navigation, so it always describes the page
@@ -82,6 +328,11 @@ personal: read what the task requires, nothing more.
   they are the blocker working, not a page defect. A cross-origin script served
   without CORS headers reports opaquely (no message, file, or line) and is labelled
   as such rather than shown as a bare "Script error".
+- `PrintWindow` is how the chrome gets photographed, and it answers TRUE for a minimised
+  window while drawing nothing, so that case is refused rather than served as a black
+  png. Whether it captures the WebView2 page area at all under PW_RENDERFULLCONTENT is
+  the classic blind spot with hardware composited content: verify a `chrome=1` capture
+  by looking at the image, not by checking that bytes came back.
 - The user never wants em dashes anywhere: code, UI text, docs, commits.
 - The phone drop (`DropServer`, port 24003) is the only listener beyond loopback, so
   treat everything it reads as hostile. Its pairing key is read from the raw query,

@@ -83,12 +83,39 @@ public sealed class DropServer
         : null;
 
     /// <summary>Mints the pairing key if there is not one yet. Returns it either way.</summary>
-    public static string EnsureKey(Settings settings)
+    public static string EnsureKey(Settings settings) => EnsureKey(settings, settings.Save);
+
+    /// <summary>
+    /// The same, saving through <paramref name="save"/>, so a test can point it at a file of
+    /// its own. Settings.Save() writes the real one, and the pairing key in it has been lost
+    /// to a test once already.
+    /// </summary>
+    internal static string EnsureKey(Settings settings, Func<bool> save)
     {
         if (settings.DropKey.Length < 16)
         {
+            string previous = settings.DropKey;
             settings.DropKey = Convert.ToHexString(RandomNumberGenerator.GetBytes(12));
-            settings.Save();
+            bool saved;
+            try
+            {
+                saved = save();
+            }
+            catch
+            {
+                // A write that failed leaves the same unkept key as a refusal.
+                settings.DropKey = previous;
+                throw;
+            }
+            if (!saved)
+            {
+                // A key that is not written down is gone at the next start, and a phone
+                // paired with it is then refused with no explanation. Refused here instead,
+                // which StartPhoneBridge reports as why the drop is not running.
+                settings.DropKey = previous;
+                throw new InvalidOperationException(
+                    "The pairing key could not be saved, because the settings file could not be read when Gergur started. Restart Gergur and try again.");
+            }
         }
         return settings.DropKey;
     }

@@ -49,7 +49,7 @@ public sealed class BrowserEnvironment
             enableFeatures.Add("msWebView2SimulateMemoryPressureWhenInactive");
         if (settings.V8ScavengerMaxMb > 0)
             flags.Add($"--js-flags=--scavenger_max_new_space_capacity_mb={settings.V8ScavengerMaxMb}");
-        if (settings.VpnEnabled)
+        if (settings.VpnInForce)
         {
             flags.Add($"--proxy-server=socks5://127.0.0.1:{settings.VpnLocalPort}");
 
@@ -103,10 +103,37 @@ public sealed class BrowserEnvironment
             DefaultBackgroundColor = Color.White,
         };
         host.Controls.Add(webView);
-        _ = webView.Handle; // force HWND creation; init needs it even while the control is hidden
-        await webView.EnsureCoreWebView2Async(Core);
+        try
+        {
+            _ = webView.Handle; // force HWND creation; init needs it even while the control is hidden
+            await webView.EnsureCoreWebView2Async(Core);
+            ApplyViewSettings(webView.CoreWebView2, Settings);
+            return webView;
+        }
+        catch
+        {
+            // Everything after Controls.Add, not just the init. The profile and settings
+            // calls below it can throw too, on a runtime older than the SDK or a browser
+            // process that died a moment after starting, and the control is parented and
+            // owns an HWND by then. The caller never learns about it, because it only
+            // takes ownership of what is returned, so nothing can ever reach it to dispose
+            // it: one orphan per failed build, and the tab retries every five seconds.
+            try { host.Controls.Remove(webView); } catch { }
+            try { webView.Dispose(); } catch { }
+            throw;
+        }
+    }
 
-        webView.CoreWebView2.Profile.PreferredTrackingPreventionLevel = Settings.TrackingPrevention switch
+    /// <summary>
+    /// The page settings a view takes from <see cref="Settings"/>. Used when a view is made
+    /// and again when the settings change, so a change reaches the tabs already open. It
+    /// used to run only on the first path: an open page kept its old colour scheme and
+    /// password saving until the tab was rebuilt, while the settings window and the agent
+    /// API both said the change was applied.
+    /// </summary>
+    internal static void ApplyViewSettings(CoreWebView2 core, Settings settings)
+    {
+        core.Profile.PreferredTrackingPreventionLevel = settings.TrackingPrevention switch
         {
             "None" => CoreWebView2TrackingPreventionLevel.None,
             "Basic" => CoreWebView2TrackingPreventionLevel.Basic,
@@ -114,15 +141,13 @@ public sealed class BrowserEnvironment
             _ => CoreWebView2TrackingPreventionLevel.Strict,
         };
         // What sites see for prefers-color-scheme: Auto follows Windows, or pin it.
-        webView.CoreWebView2.Profile.PreferredColorScheme = Settings.PageTheme switch
+        core.Profile.PreferredColorScheme = settings.PageTheme switch
         {
             "Light" => CoreWebView2PreferredColorScheme.Light,
             "Dark" => CoreWebView2PreferredColorScheme.Dark,
             _ => CoreWebView2PreferredColorScheme.Auto,
         };
-        var webSettings = webView.CoreWebView2.Settings;
-        webSettings.IsPasswordAutosaveEnabled = Settings.SavePasswords;
-        webSettings.IsGeneralAutofillEnabled = Settings.FormAutofill;
-        return webView;
+        core.Settings.IsPasswordAutosaveEnabled = settings.SavePasswords;
+        core.Settings.IsGeneralAutofillEnabled = settings.FormAutofill;
     }
 }

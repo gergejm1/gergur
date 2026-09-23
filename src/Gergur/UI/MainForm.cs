@@ -76,6 +76,86 @@ public sealed class MainForm : Form
         BuildUi();
     }
 
+    /// <summary>
+    /// Opens another window on the same session, optionally without taking the screen.
+    ///
+    /// An agent driving this browser while somebody is using it has nowhere of its own to
+    /// work: every tab it opens lands in the window being read, and every activation
+    /// takes the view away mid-sentence. A window it can have to itself is the answer,
+    /// and one that does not come to the front is what makes it bearable.
+    /// </summary>
+    internal static async Task<MainForm> OpenWindowAsync(AppSession session, bool focus)
+    {
+        var window = new MainForm(session, null, isSecondaryWindow: true, restore: null);
+        if (focus)
+        {
+            window.Show();
+        }
+        else
+        {
+            // ShowWithoutActivation keeps the keyboard where it is. It does not decide the
+            // stacking: a new top level window starts at the top, and whether Windows lets
+            // it stay there depends on who has focus. Measured with a terminal in front it
+            // came up well behind; with the person in Gergur itself it is the same process
+            // asking, and nothing stopped it landing on top of the page they were reading.
+            // So it is put directly behind whatever has focus, which is right either way.
+            window._openWithoutStealingFocus = true;
+            IntPtr inUse = GetForegroundWindow();
+            window.Show();
+
+            // Behind the top level window that owns whatever has focus, so a Gergur dialog
+            // in front does not wedge this between it and the window the person is reading.
+            IntPtr root = inUse == IntPtr.Zero ? IntPtr.Zero : GetAncestor(inUse, GA_ROOTOWNER);
+            bool rootIsTopmost = root != IntPtr.Zero
+                && (GetWindowLong(root, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0;
+            IntPtr after = BehindWhat(root, rootIsTopmost, window.Handle);
+            if (!SetWindowPos(window.Handle, after, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE))
+                DebugLog.WriteAlways("an agent window could not be placed behind the one in use");
+        }
+        await window.Ready;
+        return window;
+    }
+
+    /// <summary>
+    /// Which window a new agent window should sit directly behind.
+    ///
+    /// Normally the one in use. Not when that one is always on top, which is what the
+    /// taskbar, Start, a picture in picture video or an always-on-top app are: linking a
+    /// window in after a topmost one can make it topmost itself, and then the agent's
+    /// window would sit on top of the person's work for good. Nor when there is nothing
+    /// in use at all. The bottom of the stack is right in both.
+    /// </summary>
+    internal static IntPtr BehindWhat(IntPtr inUseRoot, bool inUseIsTopmost, IntPtr ours)
+        => inUseRoot == IntPtr.Zero || inUseRoot == ours || inUseIsTopmost ? HWND_BOTTOM : inUseRoot;
+
+    internal static readonly IntPtr HWND_BOTTOM = new(1);
+    private const uint GA_ROOTOWNER = 3;
+    private const int GWL_EXSTYLE = -20;
+    private const int WS_EX_TOPMOST = 0x00000008;
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern int GetWindowLong(IntPtr window, int index);
+
+    private const uint SWP_NOSIZE = 0x0001;
+    private const uint SWP_NOMOVE = 0x0002;
+    private const uint SWP_NOACTIVATE = 0x0010;
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern IntPtr GetForegroundWindow();
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern bool SetWindowPos(IntPtr window, IntPtr insertAfter, int x, int y, int width, int height, uint flags);
+
+    private bool _openWithoutStealingFocus;
+
+    /// <summary>
+    /// True only for this window's first appearance, when an agent asked for it and the
+    /// person at the keyboard did not. Cleared once it is up, because otherwise the
+    /// window would refuse activation for the rest of its life: showing it again, or
+    /// bringing it back from minimised, would leave it behind whatever was in front.
+    /// </summary>
+    protected override bool ShowWithoutActivation => _openWithoutStealingFocus;
+
     /// <summary>The services every window shares. Null until the first window has started them.</summary>
     internal AppSession? Session => _session;
 
@@ -112,6 +192,7 @@ public sealed class MainForm : Form
         _tabStrip.TabTornOff += (_, drop) => _ = DropTabAsync(drop.Tab, drop.ScreenLocation);
         _tabStrip.TabDragMoved += (_, screen) => UpdateDropIndicators(screen);
         _tabStrip.TabDragEnded += (_, _) => ClearDropIndicators();
+        _tabStrip.IsOverAnotherStrip = screen => DropTargetAt(screen) is not null;
 
         _toolbar = new Panel { Dock = DockStyle.Top, Height = 40, BackColor = Theme.ToolbarBg };
         _backButton = MakeToolButton(Glyphs.Back, 8);
@@ -377,7 +458,7 @@ public sealed class MainForm : Form
                 return;
             blocker.Enabled = !blocker.Enabled;
             _settings.BlocklistEnabled = blocker.Enabled;
-            _settings.Save();
+            SaveSettingsOrSay(StillInForce);   // in force either way; this only says if it will not last
             UpdateStatus();
         };
         _menu.Items.Add(blocking);
@@ -403,9 +484,23 @@ public sealed class MainForm : Form
 
     // ------------------------------------------------------------------ startup
 
+    /// <summary>
+    /// Recorded for the agent API, which cannot ask which window has focus from its own
+    /// threads. An agent's own window opened in the background is not activated, so it
+    /// does not take this over from the window the person is in.
+    /// </summary>
+    protected override void OnActivated(EventArgs e)
+    {
+        base.OnActivated(e);
+        _session?.NoteActive(this);
+    }
+
     protected override async void OnShown(EventArgs e)
     {
         base.OnShown(e);
+        // It has had its one unactivated appearance; from here it behaves like any other
+        // window, so a later Show or a restore from minimised comes to the front.
+        _openWithoutStealingFocus = false;
         try
         {
             if (_session is null)
@@ -439,6 +534,20 @@ public sealed class MainForm : Form
             else if (!_isSecondaryWindow)
                 await RestoreStartupAsync();
 
+            // The first window's first page failing to start used to throw straight into
+            // the catch below and say "Gergur failed to start". A failed build no longer
+            // throws, so ask: an engine that cannot start a page at launch is almost
+            // always the whole engine, not one tab, and a blank window with no reason is
+            // the worst way to find that out.
+            if (!_isSecondaryWindow && Tabs?.ActiveTab is { HasView: false, LastBuildFailure: { } why })
+            {
+                MessageBox.Show(this,
+                    "Gergur could not start its page engine:" + Environment.NewLine + Environment.NewLine + why
+                    + Environment.NewLine + Environment.NewLine
+                    + "If you recently changed Extra browser arguments in Settings, that is the usual cause.",
+                    "Gergur failed to start", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+
             UpdateStatus();
             DebugLog.Write($"layout client={ClientSize} strip={_tabStrip.Bounds} toolbar={_toolbar.Bounds} host={_hostPanel.Bounds} status={_statusStrip.Bounds} statusVisible={_statusStrip.Visible}");
         }
@@ -470,7 +579,8 @@ public sealed class MainForm : Form
             bool up = await vpn.StartAsync(_settings.VpnLocalPort, _settings.VpnProfile, TimeSpan.FromSeconds(12));
             if (!up)
             {
-                _settings.VpnEnabled = false; // session-only; the saved intent stays
+                // For this run only, and kept out of VpnEnabled so no later save can write it.
+                _settings.VpnDownThisRun = true;
                 ShowMessage("VPN tunnel failed to start; browsing without it.");
             }
         }
@@ -520,7 +630,9 @@ public sealed class MainForm : Form
     {
         if (AppSession.Current is not { } session)
             return;
-        var window = session.Windows.FirstOrDefault(w => w.ContainsFocus) ?? session.Windows.FirstOrDefault();
+        // Not ContainsFocus: this runs on the pipe thread, where focus is always somebody
+        // else's, so a link from another app always went to window 0.
+        var window = session.WindowInUse();
         if (window is null || window.IsDisposed)
             return;
         window.BeginInvoke(() =>
@@ -634,11 +746,18 @@ public sealed class MainForm : Form
         if (Tabs is null || _session is null || Tabs.Tabs.Count < 2)
             return;
 
+        // On the monitor it was dropped on, whichever that is. Clamping at zero, as this
+        // used to, is only the edge of the primary monitor: a tab dropped on a screen to
+        // the left of it or above it came back onto the primary instead.
+        var bounds = TabDrag.TearOffBounds(
+            screenLocation,
+            Size,
+            new Size(Scaled(160), Scaled(24)),
+            Screen.FromPoint(screenLocation).WorkingArea);
         var window = new MainForm(_session, null, isSecondaryWindow: true, restore: null)
         {
             StartPosition = FormStartPosition.Manual,
-            Location = new Point(Math.Max(0, screenLocation.X - 160), Math.Max(0, screenLocation.Y - 24)),
-            Size = Size,
+            Bounds = bounds,
         };
         window.Show();
         await window.Ready;
@@ -727,10 +846,10 @@ public sealed class MainForm : Form
     /// </summary>
     private ToolStripMenuItem BuildVpnMenu()
     {
-        string active = _settings.VpnEnabled
+        string active = _settings.VpnInForce
             ? _session?.Vpn.ActiveProfileName ?? VpnTunnel.ResolveProfile(_settings.VpnProfile)?.Name ?? "on"
             : "off";
-        var menu = new ToolStripMenuItem($"VPN ({active})") { Checked = _settings.VpnEnabled };
+        var menu = new ToolStripMenuItem($"VPN ({active})") { Checked = _settings.VpnInForce };
 
         var profiles = VpnTunnel.ListProfiles();
         if (!VpnTunnel.IsProvisioned)
@@ -739,12 +858,12 @@ public sealed class MainForm : Form
         }
         else
         {
-            var off = new ToolStripMenuItem("Off", null, (_, _) => SetVpnEnabled(false)) { Checked = !_settings.VpnEnabled };
+            var off = new ToolStripMenuItem("Off", null, (_, _) => SetVpnEnabled(false)) { Checked = !_settings.VpnInForce };
             menu.DropDownItems.Add(off);
             menu.DropDownItems.Add(new ToolStripSeparator());
             foreach (var profile in profiles)
             {
-                bool current = _settings.VpnEnabled
+                bool current = _settings.VpnInForce
                     && string.Equals(profile.Name, VpnTunnel.ResolveProfile(_settings.VpnProfile)?.Name, StringComparison.OrdinalIgnoreCase);
                 var item = new ToolStripMenuItem(profile.Name) { Checked = current };
                 string name = profile.Name;
@@ -787,7 +906,12 @@ public sealed class MainForm : Form
         if (_settings.VpnEnabled == enabled)
             return;
         _settings.VpnEnabled = enabled;
-        _settings.Save();
+        if (!SaveSettingsOrSay(Undone))
+        {
+            // No restart: it would read the old value back from the file.
+            _settings.VpnEnabled = !enabled;
+            return;
+        }
         RestartForNewEngineFlags(); // the proxy is a browser-process flag
     }
 
@@ -798,18 +922,30 @@ public sealed class MainForm : Form
     /// </summary>
     private async Task UseVpnProfileAsync(string profileName)
     {
-        bool wasOn = _settings.VpnEnabled;
+        // In force, not merely chosen: with the tunnel down this run the engine started
+        // without its proxy flag, so switching profile live would route nothing.
+        bool wasOn = _settings.VpnInForce;
         bool sameProfile = string.Equals(VpnTunnel.ResolveProfile(_settings.VpnProfile)?.Name, profileName,
             StringComparison.OrdinalIgnoreCase);
+        string previousProfile = _settings.VpnProfile;
         _settings.VpnProfile = profileName;
         _settings.VpnEnabled = true;
-        _settings.Save();
+        bool saved = SaveSettingsOrSay(wasOn ? StillInForce : Undone);
 
         if (!wasOn)
         {
+            if (!saved)
+            {
+                // Turning it on takes a restart, which would read the old values back.
+                _settings.VpnProfile = previousProfile;
+                _settings.VpnEnabled = false;
+                return;
+            }
             RestartForNewEngineFlags();
             return;
         }
+        // Already on: switching profile happens live, so it works for this run even
+        // unsaved, and the box has said it will not last.
         if (_session is null || (sameProfile && _session.Vpn.IsRunning))
             return;
 
@@ -860,6 +996,14 @@ public sealed class MainForm : Form
         {
             if (_shortcuts.Handle(e.KeyData))
                 e.Handled = e.SuppressKeyPress = true;
+        };
+        // Said out loud, because otherwise nothing is: the build no longer throws into the
+        // click that asked for it, so without this a tab whose page could not start just
+        // showed a blank area and did nothing when clicked.
+        tab.ViewBuildFailed += (_, _) =>
+        {
+            if (!_closing)
+                ShowMessage(Tab.CouldNotStartMessage(tab.NextBuildAttemptUtc, DateTime.UtcNow));
         };
         tab.PageLoaded += (_, _) => _session?.History.Append(tab.Url, tab.Title);
         // A sign-in popup closing itself is the normal end of an OAuth handshake.
@@ -1127,6 +1271,41 @@ public sealed class MainForm : Form
     }
 
     /// <summary>
+    /// Pushes the settings that can change without a restart into the things already
+    /// holding a copy of them, across every window.
+    ///
+    /// Shared with the agent API rather than left in the dialog's hands, because it did
+    /// not used to be: <c>POST /settings {"BlocklistEnabled": false}</c> answered
+    /// "applied", and the blocker went on blocking for the rest of the session, because
+    /// <see cref="Blocking.RequestBlocker.Enabled"/> is its own field and nothing re-read
+    /// it. Being told a change took effect when it did not is worse than being told it
+    /// needs a restart.
+    ///
+    /// The sleep timers are here too, which they were not: each window read them once
+    /// when it opened, so changing one did nothing until you opened another window, and
+    /// nothing said so because they are not engine flags and were never on the restart
+    /// list. Now the window you changed them in honours them.
+    /// </summary>
+    internal static void ApplyLiveSettings(AppSession session)
+    {
+        session.Blocker.Enabled = session.Settings.BlocklistEnabled;
+        foreach (var window in session.Windows)
+        {
+            window._addressBar.SearchUrlTemplate = session.Settings.SearchUrlTemplate;
+            if (window._lifecycle is { } lifecycle)
+            {
+                lifecycle.SuspendAfter = TimeSpan.FromMinutes(Math.Max(1, session.Settings.SuspendAfterMinutes));
+                lifecycle.DiscardAfter = TimeSpan.FromMinutes(Math.Max(2, session.Settings.DiscardAfterMinutes));
+            }
+            // The page settings reach tabs already open, not only the next view built.
+            // Each one catches its own failure, so nothing escapes the discard.
+            foreach (var tab in window.Tabs?.Tabs ?? [])
+                _ = tab.ApplySettingsLiveAsync(session.Settings);
+            window.UpdateStatus();
+        }
+    }
+
+    /// <summary>
     /// Modal, unlike history and downloads: settings are shared by every window, so
     /// letting two of these disagree with each other would be asking for trouble.
     /// What can be applied without a restart is applied here and now.
@@ -1139,11 +1318,19 @@ public sealed class MainForm : Form
         if (dialog.ShowDialog(this) != DialogResult.OK)
             return;
 
-        // Applied live across every window; the rest waits for new tabs or a restart.
-        _session.Blocker.Enabled = _settings.BlocklistEnabled;
-        foreach (var window in _session.Windows)
-            window._addressBar.SearchUrlTemplate = _settings.SearchUrlTemplate;
-        UpdateStatus();
+        ApplyLiveSettings(_session);
+
+        if (!dialog.Saved)
+        {
+            // Not "Settings saved", and no offer to restart: a restart reads the file, and
+            // the file has not got the change, so it would quietly undo what was just set.
+            // A box, as TogglePhoneBridge does for answers to a dialog: the status label
+            // clips, and the half that says what to do is the half that goes.
+            MessageBox.Show(this, (dialog.WriteFailed ? WriteFailedText : NotSavedText)
+                + "\n\nWhat applies without a restart is in force until Gergur closes. What needs a restart will not happen.",
+                "Gergur", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
 
         if (dialog.ChangedRestartSettings.Count == 0)
         {
@@ -1231,7 +1418,7 @@ public sealed class MainForm : Form
         if (_settings.DropEnabled)
         {
             _settings.DropEnabled = false;
-            _settings.Save();
+            SaveSettingsOrSay("The phone drop is off until Gergur closes, and may be back on at the next start.");
             _session.StopPhoneBridge();
             ShowMessage("Phone drop off.");
             return;
@@ -1248,7 +1435,13 @@ public sealed class MainForm : Form
             return;
 
         _settings.DropEnabled = true;
-        _settings.Save();
+        if (!SaveSettingsOrSay("The phone drop has not been started, because its pairing key could not be kept."))
+        {
+            // Not started. Its pairing key would be minted now and lost at the next start,
+            // so a phone paired today would be locked out tomorrow with no explanation.
+            _settings.DropEnabled = false;
+            return;
+        }
         _session.StartPhoneBridge();
 
         // A failed start used to leave the setting on with nothing listening, so the next
@@ -1381,7 +1574,7 @@ public sealed class MainForm : Form
         _memoryLabel.Text = $"engine {MemorySnapshot.Format(snapshot.EnginePrivateBytes)} · {snapshot.RendererCount} renderers · shell {MemorySnapshot.Format(snapshot.ShellPrivateBytes)}";
         _blockedLabel.Text = _session.Blocker is { Enabled: true } blocker ? $"{blocker.BlockedCount:N0} blocked" : "blocking off";
         // Name the exit, not just "on": with several profiles, which one matters.
-        _vpnLabel.Text = _settings.VpnEnabled && _session.Vpn.IsRunning
+        _vpnLabel.Text = _settings.VpnInForce && _session.Vpn.IsRunning
             ? (_session.Vpn.ActiveProfileName == VpnTunnel.WarpName ? "WARP" : _session.Vpn.ActiveProfileName ?? "VPN")
             : "";
         UpdateSleepLabel();
@@ -1423,4 +1616,47 @@ public sealed class MainForm : Form
     }
 
     private void ShowMessage(string text) => _messageLabel.Text = text;
+
+    /// <summary>
+    /// Saves the settings, or says in a box why they were not. A run that could not read
+    /// settings.json at startup leaves that file alone rather than risk overwriting it, so
+    /// a change made now lasts until Gergur closes. Callers that restart to apply a change
+    /// must not go ahead when this is false: the restart reads the file and quietly puts
+    /// the old value back, so the vpn you just turned on comes back off.
+    /// </summary>
+    /// <param name="ifNotSaved">What happens to the change when it cannot be saved, said
+    /// in the box: whether it is still in force for this run or was undone.</param>
+    private bool SaveSettingsOrSay(string ifNotSaved)
+    {
+        string why;
+        try
+        {
+            if (_settings.Save())
+                return true;
+            why = NotSavedText;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // A write that failed, which a click handler has nothing above it to catch.
+            // Named rather than quoted: the exception text carries the profile path.
+            DebugLog.WriteAlways($"settings not saved: {ex.Message}");
+            why = WriteFailedText;
+        }
+        MessageBox.Show(this, why + "\n\n" + ifNotSaved, "Gergur", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        return false;
+    }
+
+    internal const string NotSavedText =
+        "This change was not saved.\n\n"
+        + "Gergur could not read its settings file when it started, so it is leaving that file "
+        + "alone rather than risk overwriting your settings with defaults. Close Gergur, check "
+        + "nothing else has %LOCALAPPDATA%\\Gergur\\settings.json open, start Gergur again, then "
+        + "make the change again.";
+
+    internal const string WriteFailedText =
+        "This change was not saved: the settings file could not be written. Something may "
+        + "have %LOCALAPPDATA%\\Gergur\\settings.json open, or the disk may be full.";
+
+    internal const string StillInForce = "It is in force until Gergur closes.";
+    internal const string Undone = "It has been undone, because it needs a restart and a restart would read the old value back.";
 }

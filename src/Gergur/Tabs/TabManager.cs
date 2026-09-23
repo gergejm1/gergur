@@ -81,14 +81,57 @@ public sealed class TabManager
             await ActivateAsync(tab);
     }
 
-    public async Task CloseTabAsync(Tab tab)
+    public Task CloseTabAsync(Tab tab) => RemoveAndDisposeAsync(tab, remember: true, activateInstead: null);
+
+    /// <summary>
+    /// Opens a tab on somebody else's behalf, an agent's, and takes it away again if its
+    /// page could not start. Returns the tab, or null when it was taken away.
+    ///
+    /// Taken away without a trace. Closing it the ordinary way left two: the person's
+    /// status bar said a tab that no longer existed could not start, and for a tab opened
+    /// in front the tab that came forward was whichever sat next to it rather than the one
+    /// they had been reading. It is also kept off their Ctrl+Shift+T stack on purpose.
+    /// Today it could not reach it anyway, because a tab whose page never started never
+    /// recorded a url and about:blank is not remembered, but that is a side effect of
+    /// NavigateAsync rather than a decision, and this should not depend on it.
+    /// </summary>
+    internal async Task<Tab?> OpenOrDiscardAsync(string url, bool activate)
+    {
+        var previous = ActiveTab;
+        var tab = new Tab(this) { ReportsBuildFailure = false };
+        bool kept = false;
+        try
+        {
+            RegisterTab(tab);
+            if (activate)
+                await ActivateAsync(tab);
+            await tab.NavigateAsync(url);
+            kept = tab.HasView;
+        }
+        finally
+        {
+            // Quiet only for the trial, whatever happens to it. A kept tab that stayed
+            // quiet would go blank without a word the next time its view could not be
+            // rebuilt, which is the silence the failure message exists to end.
+            tab.ReportsBuildFailure = true;
+        }
+        if (kept)
+        {
+            RaiseChanged();
+            return tab;
+        }
+        await RemoveAndDisposeAsync(tab, remember: false, activateInstead: previous);
+        return null;
+    }
+
+    private async Task RemoveAndDisposeAsync(Tab tab, bool remember, Tab? activateInstead)
     {
         DebugLog.Write($"CloseTabAsync url={tab.Url}\n{Environment.StackTrace}");
         int index = _tabs.IndexOf(tab);
         if (index < 0)
             return;
         _tabs.RemoveAt(index);
-        if (!HomePage.IsHome(tab.Url))
+        if (remember && !HomePage.IsHome(tab.Url))
             _recentlyClosed.Push(new TabSnapshot(tab.Url, tab.Title));
         bool wasActive = ActiveTab == tab;
         if (wasActive)
@@ -102,10 +145,18 @@ public sealed class TabManager
             return;
         }
         if (wasActive)
-            await ActivateAsync(_tabs[Math.Min(index, _tabs.Count - 1)]);
+        {
+            var next = activateInstead is not null && _tabs.Contains(activateInstead)
+                ? activateInstead
+                : _tabs[Math.Min(index, _tabs.Count - 1)];
+            await ActivateAsync(next);
+        }
         else
             RaiseChanged();
     }
+
+    /// <summary>How many closed tabs Ctrl+Shift+T can bring back.</summary>
+    internal int RecentlyClosedCount => _recentlyClosed.Count;
 
     /// <summary>
     /// Removes a tab without disposing it: it is moving to another window. The caller

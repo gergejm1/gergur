@@ -14,6 +14,11 @@ public sealed class AppSession
 {
     private readonly List<MainForm> _windows = new();
 
+    // The list belongs to the UI thread, but WindowInUse is asked from the agent server's
+    // request threads and the pipe thread a second launch forwards links on. Copying the
+    // list while a window opens or closes throws, or copies a torn list.
+    private readonly object _windowsLock = new();
+
     public Settings Settings { get; }
     public BrowserEnvironment Env { get; }
     public RequestBlocker Blocker { get; }
@@ -27,6 +32,34 @@ public sealed class AppSession
 
     /// <summary>Windows in creation order; the first is the one restored at startup.</summary>
     public IReadOnlyList<MainForm> Windows => _windows;
+
+    /// <summary>
+    /// The window the person last brought to the front. Kept here because the agent API
+    /// needs it from its own threads, and asking a form whether it has focus from anywhere
+    /// but the UI thread always says no: GetFocus only sees the calling thread's queue. So
+    /// "the focused window" silently meant "the first window", and a request naming no tab
+    /// navigated or typed into window 0's page while the person was working in another.
+    /// </summary>
+    public MainForm? LastActiveWindow { get; private set; }
+
+    public void NoteActive(MainForm window) => LastActiveWindow = window;
+
+    /// <summary>
+    /// The window a request that names none means: the one last brought to the front, or
+    /// the first when that one has gone or nothing has been brought forward yet. Also
+    /// where a link opened from another app lands, which had the same always-window-0 bug.
+    /// </summary>
+    public MainForm? WindowInUse()
+    {
+        MainForm[] windows;
+        lock (_windowsLock)
+            windows = _windows.ToArray();
+        return PickWindow(windows, LastActiveWindow);
+    }
+
+    /// <summary>The choice itself, apart from any window, so a test can pin it.</summary>
+    internal static T? PickWindow<T>(IReadOnlyList<T> windows, T? last) where T : class
+        => last is not null && windows.Contains(last) ? last : windows.FirstOrDefault();
 
     /// <summary>
     /// The one live session. How a url forwarded from a second launch finds a window
@@ -126,12 +159,19 @@ public sealed class AppSession
         PhoneBridgeError = null;
     }
 
-    public void AddWindow(MainForm window) => _windows.Add(window);
+    public void AddWindow(MainForm window)
+    {
+        lock (_windowsLock)
+            _windows.Add(window);
+    }
 
     /// <summary>Drops a closed window and, when it was the last one, tears the shared services down.</summary>
     public void RemoveWindow(MainForm window)
     {
-        _windows.Remove(window);
+        lock (_windowsLock)
+            _windows.Remove(window);
+        if (LastActiveWindow == window)
+            LastActiveWindow = null;
         if (_windows.Count > 0)
             return;
         Agent?.Stop();

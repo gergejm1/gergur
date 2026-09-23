@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
 using System.Security.AccessControl;
@@ -63,11 +64,17 @@ public sealed class AgentServer
         }
     }
 
-    /// <summary>The active tab of the focused window, falling back to the first window.</summary>
+    /// <summary>
+    /// The active tab of the window the person last brought to the front, falling back to
+    /// the first window.
+    ///
+    /// Not ContainsFocus: this runs on a request thread, and focus is per thread, so that
+    /// was false for every window every time and this always meant window 0. A request
+    /// naming no tab then acted on window 0's page while the person was in another.
+    /// </summary>
     private (MainForm Window, Tab Tab)? ActiveEntry()
     {
-        var windows = _session.Windows;
-        var window = windows.FirstOrDefault(w => w.ContainsFocus) ?? windows.FirstOrDefault();
+        var window = _session.WindowInUse();
         return window?.Tabs?.ActiveTab is { } tab ? (window, tab) : null;
     }
 
@@ -249,7 +256,13 @@ public sealed class AgentServer
         {
             try
             {
-                var err = JsonSerializer.SerializeToUtf8Bytes(new { error = ex.Message });
+                // Logged, not returned. A WebView2 failure carries the profile path,
+                // account name and all, and this body goes into an agent transcript. The
+                // same policy /eval and WindowCapture already follow.
+                // Always written: pointing a caller at a log that only exists when
+                // GERGUR_DEBUG is set points them at nothing.
+                DebugLog.WriteAlways($"request failed: {ex}");
+                var err = JsonSerializer.SerializeToUtf8Bytes(new { error = "that request failed inside the browser; the cause is in %LOCALAPPDATA%/Gergur/debug.log" });
                 await WriteAsync(stream, 500, "application/json", err);
             }
             catch { }
@@ -267,16 +280,23 @@ public sealed class AgentServer
         // looking at right now. Only an absent index means "the active tab".
         (MainForm Window, Tab Tab)? TargetEntry()
         {
-            var (supplied, index) = ResolveIndex(query, body);
-            if (!supplied)
-                return ActiveEntry();
-            if (index is not { } i)
-                return null; // supplied but unusable: that is an error, not the active tab
             var all = AllTabs();
-            return i >= 0 && i < all.Count ? all[i] : null;
+            var active = ActiveEntry();
+            int at = TargetIndex(
+                all.Select(e => e.Tab.Id).ToList(),
+                StringValue(query, body, "id"),
+                ResolveIndex(query, body),
+                active is null ? -1 : all.FindIndex(e => e.Tab == active.Value.Tab));
+            return at >= 0 && at < all.Count ? all[at] : null;
         }
 
+        string? StringFrom(string name) => StringValue(query, body, name);
+
         Tab? Target() => TargetEntry()?.Tab;
+
+        bool? BoolFrom(string name) => BoolValue(query, body, name);
+
+        double? NumberFrom(string name) => NumberValue(query, body, name);
 
         string? BodyString(string name)
             => body is not null && body.RootElement.TryGetProperty(name, out var p) && p.ValueKind == JsonValueKind.String
@@ -297,6 +317,7 @@ public sealed class AgentServer
                     var windows = _session.Windows.ToList();
                     return Task.FromResult(AllTabs().Select((e, i) => new
                     {
+                        id = e.Tab.Id,       // stable; prefer this to index
                         index = i,
                         window = windows.IndexOf(e.Window), // which window this tab lives in
                         url = e.Tab.Url,
@@ -309,22 +330,203 @@ public sealed class AgentServer
                 return (200, "application/json", Json(list));
             }
 
+            case ("GET", "/settings"):
+            {
+                // Reading them needed a look at a json file on disk, and changing one
+                // needed the browser closed, the file edited and the browser relaunched.
+                // That is three restarts to try a thing twice, and it is how a session
+                // got lost here.
+                var current = await OnUiAsync(() => Task.FromResult(SettingsPatch.Snapshot(_session.Settings)));
+                return (200, "application/json", Json(new
+                {
+                    settings = current,
+                    restartRequired = Settings.RestartRequired.ToArray(),
+                }));
+            }
+
+            case ("POST", "/settings"):
+            {
+                if (body is not { RootElement.ValueKind: JsonValueKind.Object } patch)
+                    return (400, "application/json", Json(new { error = "a json object of settings is required" }));
+
+                // Over http the settings are the body. As an MCP tool they arrive nested
+                // under "settings", because a tool whose schema is an empty object tells
+                // the model nothing about what it may send. Both are accepted rather than
+                // making one of the two callers wrap or unwrap by hand.
+                var wanted = patch.RootElement;
+                if (wanted.TryGetProperty("settings", out var nested) && nested.ValueKind == JsonValueKind.Object)
+                    wanted = nested;
+
+                var applied = new List<string>();
+                var needsRestart = new List<string>();
+                var unknown = new List<string>();
+                bool persisted = true;
+                string? whyNotPersisted = null;
+                string? failure = await OnUiAsync(() =>
+                {
+                    string? error = SettingsPatch.Apply(
+                        _session.Settings, wanted, applied, needsRestart, unknown);
+                    if (error is null && applied.Count > 0)
+                    {
+                        // The same live-apply the settings dialog runs. Without it this
+                        // answered "applied" for the blocklist and the blocker went on
+                        // blocking: RequestBlocker.Enabled is its own field and nothing
+                        // re-read it.
+                        MainForm.ApplyLiveSettings(_session);
+                        try
+                        {
+                            // The patch changes memory; writing it out is this endpoint's
+                            // call. A failure here is not a failed request: the change is
+                            // in force, it just will not survive a restart, and a bare 500
+                            // would leave the caller thinking neither happened.
+                            if (!_session.Settings.Save())
+                            {
+                                persisted = false;
+                                whyNotPersisted = $"{_session.Settings.NotSavingBecause}, so it is left alone until the next start";
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            // Named, not quoted: the exception text carries the full
+                            // profile path, account name included, and this answer goes
+                            // into a transcript.
+                            DebugLog.Write($"Settings not persisted: {ex}");
+                            persisted = false;
+                            whyNotPersisted = ex is UnauthorizedAccessException
+                                ? "the settings file could not be written to"
+                                : "the settings file could not be written";
+                        }
+                    }
+                    return Task.FromResult(error);
+                });
+                if (failure is not null)
+                    return (400, "application/json", Json(new { error = failure }));
+
+                return (200, "application/json", Json(new
+                {
+                    ok = true,
+                    applied,
+                    // Named rather than silently ignored: a setting that did nothing and
+                    // said nothing is worse than one that refused.
+                    restartNeededFor = needsRestart,
+                    unknown,
+                    // In force but not written down, which is worth knowing before
+                    // anybody restarts expecting it to stick.
+                    persisted,
+                    persistError = whyNotPersisted,
+                }));
+            }
+
+            case ("POST", "/window"):
+            {
+                if (_session.Windows.Count == 0)
+                    return (503, "application/json", Json(new { error = "no window is ready" }));
+                bool focus = BoolFrom("focus") ?? false;
+                var opened = await OnUiAsync(() => MainForm.OpenWindowAsync(_session, focus));
+                if (opened.Tabs is not { } manager)
+                {
+                    // Closed here too, not only when its page fails: an empty window with
+                    // no tab manager is nothing anybody can use, and it would sit behind
+                    // the person's work until they found it.
+                    await OnUiAsync(() => { CloseIfOpen(opened); return Task.FromResult(true); });
+                    return (503, "application/json", Json(new { error = "the new window did not start" }));
+                }
+
+                // Always a tab, even with no url. A secondary window skips the startup
+                // restore, so without this it came up empty and nothing could put a tab
+                // in it: /open targets the focused window, which is the user's, which is
+                // the one this exists to stay out of.
+                string url = BodyString("url") ?? HomePage.Url;
+                var first = await OnUiAsync(() => manager.OpenOrDiscardAsync(
+                    UrlHeuristics.ToNavigableUrl(url, _session.Settings.SearchUrlTemplate), activate: true));
+                if (first is null)
+                {
+                    // Taken away again rather than left behind. Every retry otherwise made
+                    // another window, and a new tab starts with no failures on record, so
+                    // the back-off never applied: five retries were five engine starts.
+                    // Taking its only tab away closes a window by itself; this is for the
+                    // case where that did not happen. Only while it is empty, though: a tab
+                    // the person dragged into it during a slow build is theirs now.
+                    await OnUiAsync(() =>
+                    {
+                        if (opened.Tabs?.Tabs.Count is null or 0)
+                            CloseIfOpen(opened);
+                        return Task.FromResult(true);
+                    });
+                    return PageCouldNotStart(null, DateTime.UtcNow);
+                }
+                // On the UI thread, which owns the window list: this is the same race
+                // /open was moved off the request thread to avoid.
+                int index = await OnUiAsync(() => Task.FromResult(_session.Windows.ToList().IndexOf(opened)));
+                return (200, "application/json", Json(new { window = index, id = first.Id }));
+            }
+
+            case ("GET", "/console"):
+            {
+                if (Target() is not { } consoleTab)
+                    return (404, "application/json", Json(new { error = "no such tab" }));
+                // On the UI thread, as /tabs does. RecentErrors is a plain List the UI
+                // thread appends to and clears on every navigation, so copying it from a
+                // request thread races a page that is logging errors in a loop: a torn
+                // list on a good day, "Destination array was not long enough" on a bad one.
+                var reported = await OnUiAsync(() => Task.FromResult(new
+                {
+                    url = consoleTab.Url,
+                    // The same list the status bar counts, which until now could only be
+                    // reached by injecting a second error reporter of one's own.
+                    errors = consoleTab.RecentErrors.ToArray(),
+                }));
+                return (200, "application/json", Json(reported));
+            }
+
             case ("POST", "/open"):
             {
                 string url = BodyString("url") ?? HomePage.Url;
-                var window = ActiveEntry()?.Window ?? _session.Windows.FirstOrDefault();
+                // Opening a tab normally means "look at this", so activating is the right
+                // default. An agent working while someone else uses the browser wants the
+                // opposite, and taking the screen away mid-sentence is how that goes wrong.
+                bool background = BoolFrom("background") ?? false;
+
+                // Which window. Without this, a tab always landed in the focused one, so
+                // the window /window opens to keep out of the user's way could never be
+                // filled: everything an agent opened went straight back into the window
+                // it was trying to leave alone.
+                // Resolved on the UI thread, which owns the window list: reading Count and
+                // then indexing from a request thread lets a window open or close between
+                // the two, and that surfaces as an opaque 500.
+                MainForm? window = await OnUiAsync(() => Task.FromResult(
+                    NumberFrom("window") is { } which
+                        ? (which == (int)which && (int)which >= 0 && (int)which < _session.Windows.Count
+                            ? _session.Windows[(int)which]
+                            : null)
+                        : ActiveEntry()?.Window ?? _session.Windows.FirstOrDefault()));
+                if (window is null && NumberFrom("window") is not null)
+                    return (404, "application/json", Json(new { error = "no such window" }));
+
                 if (window?.Tabs is not { } manager)
                     return (503, "application/json", Json(new { error = "no window is ready" }));
-                var tab = await OnUiAsync(() => manager.CreateTabAsync(UrlHeuristics.ToNavigableUrl(url, _session.Settings.SearchUrlTemplate)));
-                return (200, "application/json", Json(new { index = AllTabs().FindIndex(e => e.Tab == tab) }));
+                // A 200 here used to hand out a tab whose page never started, and a /page on
+                // it then read about:blank. Now such a tab is taken away again rather than
+                // left in the user's window, for the same reason as /window: each retry made
+                // another blank tab, with a clean record.
+                var tab = await OnUiAsync(() => manager.OpenOrDiscardAsync(
+                    UrlHeuristics.ToNavigableUrl(url, _session.Settings.SearchUrlTemplate),
+                    activate: !background));
+                if (tab is null)
+                    return PageCouldNotStart(null, DateTime.UtcNow);
+                return (200, "application/json", Json(new
+                {
+                    id = tab.Id,
+                    index = AllTabs().FindIndex(e => e.Tab == tab),
+                }));
             }
 
             case ("POST", "/activate"):
             {
                 // Documented as taking an index. Defaulting to the active tab would make
                 // "activate" a no-op and "close" destructive, so require it explicitly.
-                if (!ResolveIndex(query, body).Supplied)
-                    return (400, "application/json", Json(new { error = "index required" }));
+                if (StringFrom("id") is null && !ResolveIndex(query, body).Supplied)
+                    return (400, "application/json", Json(new { error = "id or index required" }));
                 if (TargetEntry() is not { } entry || entry.Window.Tabs is null)
                     return (404, "application/json", Json(new { error = "no such tab" }));
                 await OnUiAsync(async () =>
@@ -339,8 +541,8 @@ public sealed class AgentServer
             case ("POST", "/close"):
             {
                 // Closing is the one destructive action here; it must never guess.
-                if (!ResolveIndex(query, body).Supplied)
-                    return (400, "application/json", Json(new { error = "index required" }));
+                if (StringFrom("id") is null && !ResolveIndex(query, body).Supplied)
+                    return (400, "application/json", Json(new { error = "id or index required" }));
                 if (TargetEntry() is not { } entry || entry.Window.Tabs is null)
                     return (404, "application/json", Json(new { error = "no such tab" }));
                 await OnUiAsync(async () => { await entry.Window.Tabs.CloseTabAsync(entry.Tab); return true; });
@@ -354,15 +556,34 @@ public sealed class AgentServer
                 string url = BodyString("url") ?? "";
                 if (url.Length == 0)
                     return (400, "application/json", Json(new { error = "url required" }));
-                await OnUiAsync(async () => { await tab.NavigateAsync(UrlHeuristics.ToNavigableUrl(url, _session.Settings.SearchUrlTemplate)); return true; });
-                return (200, "application/json", Json(new { ok = true }));
+                string target = UrlHeuristics.ToNavigableUrl(url, _session.Settings.SearchUrlTemplate);
+
+                // Sleeping and hoping is the alternative, and a sleep that is too short
+                // reads as a broken page rather than a slow one.
+                if (BoolFrom("wait") == true)
+                {
+                    var allowed = TimeSpan.FromSeconds(Math.Clamp(NumberFrom("timeout") ?? 30, 1, 120));
+                    bool? loaded = await OnUiAsync(() => tab.NavigateAndWaitAsync(target, allowed));
+                    return NavigateAnswer(waited: true, loaded, tab, DateTime.UtcNow);
+                }
+
+                // Answered honestly even without a wait: the engine refusing the url is
+                // the one thing this can know straight away, and reporting ok for it would
+                // leave the caller reading the old page as the new one.
+                bool went = await OnUiAsync(() => tab.NavigateAsync(target));
+                return NavigateAnswer(waited: false, went ? true : null, tab, DateTime.UtcNow);
             }
 
             case ("GET", "/page"):
             {
                 if (Target() is not { } tab)
                     return (404, "application/json", Json(new { error = "no such tab" }));
-                string text = await EvalStringAsync(tab, "document.body ? document.body.innerText : ''");
+                var (text, readable) = await ReadStringAsync(tab, "document.body ? document.body.innerText : ''");
+                if (!readable)
+                    return (503, "application/json", Json(new
+                    {
+                        error = "that tab's page did not finish loading in time to read",
+                    }));
                 return (200, "application/json", Json(new { url = tab.Url, title = tab.Title, text = Truncate(text, 200_000) }));
             }
 
@@ -370,7 +591,12 @@ public sealed class AgentServer
             {
                 if (Target() is not { } tab)
                     return (404, "application/json", Json(new { error = "no such tab" }));
-                string html = await EvalStringAsync(tab, "document.documentElement.outerHTML");
+                var (html, readable) = await ReadStringAsync(tab, "document.documentElement.outerHTML");
+                if (!readable)
+                    return (503, "application/json", Json(new
+                    {
+                        error = "that tab's page did not finish loading in time to read",
+                    }));
                 return (200, "application/json", Json(new { url = tab.Url, html = Truncate(html, 400_000) }));
             }
 
@@ -378,16 +604,87 @@ public sealed class AgentServer
             {
                 if (TargetEntry() is not { } shot || shot.Window.Tabs is null)
                     return (404, "application/json", Json(new { error = "no such tab" }));
-                var png = await OnUiAsync(async () =>
+
+                // Activating switches the tab's window to it, which changes what the person
+                // looking at that window sees, so it is asked for rather than assumed. It does
+                // not raise the window over other apps: /activate does that, this does not.
+                bool activate = BoolFrom("activate") ?? false;
+                bool wantsChrome = BoolFrom("chrome") == true;
+                bool isOnScreen = shot.Window.Tabs.ActiveTab == shot.Tab;
+
+                // Checked before either branch, because a blank photograph of the window
+                // is no better than a blank photograph of the page, and the chrome branch
+                // used to return above this. A tab nobody has looked at has painted
+                // nothing, and capturing it anyway produces a blank png served as a
+                // perfectly good 200 with nothing to say it is wrong.
+                if (!isOnScreen && !activate && !shot.Tab.HasRendered)
                 {
-                    if (shot.Window.Tabs.ActiveTab != shot.Tab)
+                    // Worded from the state rather than from the flag: a tab discarded
+                    // after fifteen minutes has rendered plenty, it just has no frame now.
+                    string state = shot.Tab.State == TabState.Discarded
+                        ? "that tab is asleep and has no rendered frame"
+                        : "that tab has not been on screen yet";
+                    return (503, "application/json", Json(new
                     {
-                        await shot.Window.Tabs.ActivateAsync(shot.Tab); // capture needs a rendered, visible view
-                        await Task.Delay(400);
-                    }
-                    return await shot.Tab.CaptureScreenshotAsync();
-                });
-                return (200, "image/png", png);
+                        error = $"{state}; read it with /page, or pass activate=1 to switch its window to it first",
+                    }));
+                }
+
+                // A window shows one tab at a time, so asking for the chrome around a tab
+                // that is not the one on screen has no answer. Returning the window anyway
+                // would hand back a different page inside the right frame, at 200, with
+                // nothing to say it was the wrong one.
+                if (wantsChrome && !isOnScreen && !activate)
+                    return (400, "application/json", Json(new
+                    {
+                        error = "that tab is not the one its window is showing; "
+                            + "pass activate=1 to switch its window to it, or omit the tab to photograph what is on screen",
+                    }));
+
+                // Bring it forward and let its page arrive. The fixed 400ms this replaced
+                // was enough for a switch between two loaded tabs and nowhere near a tab
+                // whose view had to be rebuilt, so activate=1 traded the honest refusal
+                // above for the blank png it exists to prevent.
+                // Started before anything that can take time, including the view build
+                // inside ActivateAsync, which for a discarded tab can be a cold engine
+                // start. Computing it afterwards left that outside every budget, which is
+                // the defect this same request had for /navigate one pass ago.
+                var shotDeadline = DateTime.UtcNow + Tab.WakeTimeout;
+                if (activate && !isOnScreen)
+                {
+                    await OnUiAsync(async () =>
+                    {
+                        await shot.Window.Tabs.ActivateAsync(shot.Tab);
+                        return true;
+                    });
+                }
+                bool ready = await OnUiAsync(() => shot.Tab.WaitForPageAsync(shotDeadline - DateTime.UtcNow));
+                if (!ready)
+                    return (503, "application/json", Json(new
+                    {
+                        error = "that tab's page did not finish loading in time to photograph",
+                    }));
+                if (activate && !isOnScreen)
+                    await OnUiAsync(async () => { await Task.Delay(250); return true; }); // let it paint
+
+                if (wantsChrome)
+                {
+                    var (captured, why) = await OnUiAsync(() => Task.FromResult(WindowCapture.Of(shot.Window)));
+                    return captured.Length == 0
+                        ? (503, "application/json", Json(new { error = why ?? "the window could not be captured" }))
+                        : (200, "image/png", captured);
+                }
+
+                var (png, hadPage) = await OnUiAsync(
+                    () => shot.Tab.CaptureScreenshotAsync(shotDeadline - DateTime.UtcNow));
+                if (!hadPage)
+                    return (503, "application/json", Json(new
+                    {
+                        error = "that tab had no rendered page to photograph when the wait ran out",
+                    }));
+                return png.Length == 0
+                    ? (503, "application/json", Json(new { error = "the page could not be captured" }))
+                    : (200, "image/png", png);
             }
 
             case ("POST", "/eval"):
@@ -397,8 +694,33 @@ public sealed class AgentServer
                 string js = BodyString("js") ?? "";
                 if (js.Length == 0)
                     return (400, "application/json", Json(new { error = "js required" }));
-                string result = await OnUiAsync(() => tab.ExecuteScriptAsync(js));
-                return (200, "application/json", Encoding.UTF8.GetBytes($"{{\"result\":{result}}}"));
+
+                // The result of a promise used to come back as {}, so anything async had
+                // to park its answer on a global and be polled for from outside. Awaited
+                // by default now; await=0 keeps the old immediate read for a caller who
+                // wants the expression and not what it settles to.
+                if (BoolFrom("await") == false)
+                {
+                    var (immediate, readable) = await OnUiAsync(
+                        () => tab.ReadScriptAsync(js, Tab.WakeTimeout));
+                    // Ready is not dropped here either. It was: a tab whose page never
+                    // arrived answered {"ok": true, "result": null}, which is exactly what
+                    // a script returning null looks like, on the one endpoint that is
+                    // supposed to tell those apart.
+                    if (!readable)
+                        return (503, "application/json", Json(new
+                        {
+                            error = "that tab's page did not finish loading in time to read",
+                        }));
+                    // Same shape either way, and built in one place: this was a fifth
+                    // hand-rolled copy of the envelope in the change that added the helper
+                    // because four copies were four chances to drift.
+                    return Evaluated(Tab.Succeeded(immediate));
+                }
+
+                var settled = TimeSpan.FromSeconds(Math.Clamp(NumberFrom("timeout") ?? 15, 1, 120));
+                string outcome = await OnUiAsync(() => tab.ExecuteScriptAwaitingAsync(js, settled));
+                return Evaluated(outcome);
             }
 
             case ("POST", "/click"):
@@ -422,9 +744,14 @@ public sealed class AgentServer
                         return true;
                     })()
                     """;
-                string result = await OnUiAsync(() => tab.ExecuteScriptAsync(js));
+                var (clicked, clickable) = await ActOnPageAsync(tab, js);
+                if (!clickable)
+                    return (503, "application/json", Json(new
+                    {
+                        error = "that tab's page did not finish loading in time to click",
+                    }));
                 await Task.Delay(900); // let the cursor glide and the click land before responding
-                return (200, "application/json", Json(new { ok = result == "true" }));
+                return (200, "application/json", Json(new { ok = clicked }));
             }
 
             case ("POST", "/type"):
@@ -456,9 +783,14 @@ public sealed class AgentServer
                         return true;
                     })()
                     """;
-                string result = await OnUiAsync(() => tab.ExecuteScriptAsync(js));
+                var (typed, typeable) = await ActOnPageAsync(tab, js);
+                if (!typeable)
+                    return (503, "application/json", Json(new
+                    {
+                        error = "that tab's page did not finish loading in time to type into",
+                    }));
                 await Task.Delay(900);
-                return (200, "application/json", Json(new { ok = result == "true" }));
+                return (200, "application/json", Json(new { ok = typed }));
             }
 
             default:
@@ -476,16 +808,117 @@ public sealed class AgentServer
     /// <summary>How long a single tool call may run before the connection is released.</summary>
     private static readonly TimeSpan ToolTimeout = TimeSpan.FromSeconds(20);
 
-    /// <summary>Past this, a screenshot is more likely to be rejected than read.</summary>
+    /// <summary>
+    /// What a page returns is the page's decision, and "return document.body.innerHTML"
+    /// on a big site is megabytes. /page and /html have always bounded their output; this
+    /// did not, so a single expression could hand a client more than it can take and fail
+    /// it with an opaque error rather than a readable one. Applied after the result is
+    /// already in memory, so it bounds what the client receives, not what the page built.
+    /// </summary>
+    private const int MaxEvalBytes = 1024 * 1024;
+
+    private static (int, string, byte[]) Evaluated(string json)
+    {
+        var body = Encoding.UTF8.GetBytes(json);
+        return body.Length <= MaxEvalBytes
+            ? (200, "application/json", body)
+            : (413, "application/json", JsonSerializer.SerializeToUtf8Bytes(new
+            {
+                ok = false,
+                error = $"the result is {body.Length / 1024.0 / 1024.0:0.0} MB, over the "
+                    + $"{MaxEvalBytes / 1024 / 1024} MB limit. Return less of it, or read the page with /page.",
+            }));
+    }
+
+    /// <summary>Caps what a screenshot may weigh before a client is asked to swallow it
+    /// as base64. A 4K capture is megabytes, and most clients reject one opaquely.</summary>
     private const int MaxScreenshotBytes = 5 * 1024 * 1024;
 
     private static object Text(string description) => new { type = "string", description };
+    /// <summary>
+    /// Preferred over the index everywhere both are offered: an index is a position, and
+    /// opening, closing or tearing off a tab renumbers every position after it, so an
+    /// agent holding one acts on whatever slid into that slot.
+    /// </summary>
+    private static object Id() => new { type = "string", description = "Tab id from gergur_list_tabs. Stable for the life of the tab; prefer this to index." };
+
     private static object Index() => new { type = "integer", description = "Tab index from gergur_list_tabs. Omit for the active tab of the focused window." };
     /// <summary>For the tools where the index is required, so the schema and the prose agree.</summary>
     private static object NamedIndex() => new { type = "integer", description = "Tab index from gergur_list_tabs." };
 
     private static object Tool(string name, string description, object properties, string[] required)
         => new { name, description, inputSchema = new { type = "object", properties, required } };
+
+    /// <summary>
+    /// Splits a request target into its path and its query.
+    ///
+    /// A pair with no "=" is a flag that is present, which is how a url writes one and how
+    /// BoolValue reads one. It used to be dropped entirely, so <c>?chrome</c> silently
+    /// captured the page instead of the window, and the test that said otherwise passed
+    /// because it built its dictionary by hand and never came through here.
+    /// </summary>
+    internal static Dictionary<string, string> ParseQuery(string rawPath, out string path)
+    {
+        var query = new Dictionary<string, string>();
+        int qm = rawPath.IndexOf('?');
+        if (qm < 0)
+        {
+            path = rawPath;
+            return query;
+        }
+
+        path = rawPath[..qm];
+        foreach (var pair in rawPath[(qm + 1)..].Split('&', StringSplitOptions.RemoveEmptyEntries))
+        {
+            int eq = pair.IndexOf('=');
+            if (eq > 0)
+                query[Uri.UnescapeDataString(pair[..eq])] = Uri.UnescapeDataString(pair[(eq + 1)..]);
+            else if (eq < 0)
+                query[Uri.UnescapeDataString(pair)] = "";
+            // eq == 0 is "=value", a pair with no name. Nothing can ask for it, so it goes.
+        }
+        return query;
+    }
+
+    /// <summary>
+    /// Which tab a request means: its position in <paramref name="tabIds"/>, or -1 when
+    /// the answer is "none", which every endpoint turns into a 404.
+    ///
+    /// The rule that matters is that -1 is never quietly replaced by the active tab. An
+    /// agent that believes it is closing tab 3, or the tab it knows as t9, must not close
+    /// the page the user is reading because its name turned out to be stale. This project
+    /// shipped exactly that bug once with indexes, which is why the index path has had a
+    /// test since; the id path is newer and is the one an agent will actually hold onto
+    /// across a tab opening or being torn off.
+    ///
+    /// An id beats an index when both arrive, because it is the one that survives.
+    /// </summary>
+    internal static int TargetIndex(
+        IReadOnlyList<string> tabIds,
+        string? id,
+        (bool Supplied, int? Index) byIndex,
+        int activeIndex)
+    {
+        if (id is not null)
+        {
+            // Supplied and empty is still supplied: it names nothing, so it is an error,
+            // not an invitation to pick the tab somebody is looking at.
+            if (id.Length == 0)
+                return -1;
+            for (int i = 0; i < tabIds.Count; i++)
+            {
+                if (string.Equals(tabIds[i], id, StringComparison.OrdinalIgnoreCase))
+                    return i;
+            }
+            return -1;
+        }
+
+        if (!byIndex.Supplied)
+            return activeIndex;
+        if (byIndex.Index is not { } at)
+            return -1; // supplied but unreadable: an error, not the active tab
+        return at >= 0 && at < tabIds.Count ? at : -1;
+    }
 
     /// <summary>
     /// Where a request says to act, split out so it can be tested directly.
@@ -521,6 +954,75 @@ public sealed class AgentServer
     }
 
     /// <summary>
+    /// A string named in the query or in the json body, whichever carries it. The query
+    /// wins, because a caller who put it in the url meant this request specifically.
+    /// </summary>
+    internal static string? StringValue(
+        IReadOnlyDictionary<string, string> query, JsonDocument? body, string name)
+    {
+        if (query.TryGetValue(name, out var fromQuery))
+            return fromQuery;
+        if (body is { RootElement.ValueKind: JsonValueKind.Object }
+            && body.RootElement.TryGetProperty(name, out var fromBody)
+            && fromBody.ValueKind == JsonValueKind.String)
+            return fromBody.GetString();
+        return null;
+    }
+
+    /// <summary>
+    /// A flag named in the query or the body. Null means it was not asked for at all,
+    /// which is not the same as false: every caller of this decides its own default, and
+    /// "chrome=0" has to be able to mean something different from leaving it out.
+    ///
+    /// A bare "?chrome" is true, because that is what a flag in a url looks like, and an
+    /// unparseable value is null rather than false: silently reading "yes" as "no" is how
+    /// a request does the opposite of what it said.
+    /// </summary>
+    internal static bool? BoolValue(
+        IReadOnlyDictionary<string, string> query, JsonDocument? body, string name)
+    {
+        if (query.TryGetValue(name, out var fromQuery))
+        {
+            if (fromQuery.Length == 0 || fromQuery == "1")
+                return true;
+            if (fromQuery == "0")
+                return false;
+            return bool.TryParse(fromQuery, out bool parsed) ? parsed : null;
+        }
+        if (body is { RootElement.ValueKind: JsonValueKind.Object }
+            && body.RootElement.TryGetProperty(name, out var fromBody))
+        {
+            return fromBody.ValueKind switch
+            {
+                JsonValueKind.True => true,
+                JsonValueKind.False => false,
+                JsonValueKind.String => bool.TryParse(fromBody.GetString(), out bool parsed) ? parsed : null,
+                _ => null,
+            };
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// A number named in the query or the body. Null when it is missing or unreadable,
+    /// so a timeout of "soon" falls back to the default rather than to zero.
+    /// </summary>
+    internal static double? NumberValue(
+        IReadOnlyDictionary<string, string> query, JsonDocument? body, string name)
+    {
+        if (query.TryGetValue(name, out var fromQuery))
+            return double.TryParse(fromQuery, NumberStyles.Float, CultureInfo.InvariantCulture, out double parsed)
+                ? parsed
+                : null;
+        if (body is { RootElement.ValueKind: JsonValueKind.Object }
+            && body.RootElement.TryGetProperty(name, out var fromBody)
+            && fromBody.ValueKind == JsonValueKind.Number
+            && fromBody.TryGetDouble(out double number))
+            return number;
+        return null;
+    }
+
+    /// <summary>
     /// Arguments a tool cannot run without. The schema declares these, but a schema is
     /// only a hint to the caller: nothing stops one being omitted, and for
     /// gergur_close_tab that meant falling through to "the active tab" and closing the
@@ -530,9 +1032,13 @@ public sealed class AgentServer
     {
         "gergur_open_tab" => ["url"],
         "gergur_navigate" => ["url"],
-        "gergur_activate_tab" => ["index"],
-        "gergur_close_tab" => ["index"],
+        // Either names the tab. Requiring the index outright would make a caller that
+        // correctly used the stable id supply a position as well, and the position is
+        // the thing that goes stale.
+        "gergur_activate_tab" => ["id|index"],
+        "gergur_close_tab" => ["id|index"],
         "gergur_run_javascript" => ["js"],
+        "gergur_change_settings" => ["settings"],
         "gergur_click" => ["selector"],
         "gergur_type_text" => ["selector", "text"],
         _ => [],
@@ -547,17 +1053,23 @@ public sealed class AgentServer
     /// <summary>The first required argument this call is missing, or null when complete.</summary>
     internal static string? MissingRequiredArg(string name, JsonElement? args)
     {
-        foreach (string key in RequiredArgsForTool(name))
+        foreach (string requirement in RequiredArgsForTool(name))
         {
-            if (args is not { ValueKind: JsonValueKind.Object } supplied
-                || !supplied.TryGetProperty(key, out var value)
-                || value.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined
-                || (EmptyIsMeaningless(key)
-                    && value.ValueKind == JsonValueKind.String
-                    && value.GetString()?.Length is null or 0))
-                return key;
+            // "a|b" is satisfied by either. Reported as "a or b", because a caller told
+            // it needs "id|index" has been told the name of nothing.
+            string[] alternatives = requirement.Split('|');
+            if (!alternatives.Any(key => Supplied(args, key)))
+                return string.Join(" or ", alternatives);
         }
         return null;
+
+        static bool Supplied(JsonElement? args, string key)
+            => args is { ValueKind: JsonValueKind.Object } supplied
+                && supplied.TryGetProperty(key, out var value)
+                && value.ValueKind is not (JsonValueKind.Null or JsonValueKind.Undefined)
+                && !(EmptyIsMeaningless(key)
+                    && value.ValueKind == JsonValueKind.String
+                    && value.GetString()?.Length is null or 0);
     }
 
     /// <summary>
@@ -578,6 +1090,10 @@ public sealed class AgentServer
         "gergur_run_javascript" => ("POST", "/eval"),
         "gergur_click" => ("POST", "/click"),
         "gergur_type_text" => ("POST", "/type"),
+        "gergur_open_window" => ("POST", "/window"),
+        "gergur_read_settings" => ("GET", "/settings"),
+        "gergur_change_settings" => ("POST", "/settings"),
+        "gergur_page_errors" => ("GET", "/console"),
         _ => ("", ""),
     };
 
@@ -587,25 +1103,78 @@ public sealed class AgentServer
         Tool("gergur_list_tabs",
             "List every open tab across all Gergur windows: flat index, which window, url, title, sleep state, and any errors the page reported.",
             new { }, []),
-        Tool("gergur_open_tab", "Open a url in a new tab and focus it. Bare terms are treated as a search.",
-            new { url = Text("The url or search terms to open.") }, ["url"]),
-        Tool("gergur_navigate", "Point an existing tab at a url.",
-            new { url = Text("The url to go to."), index = Index() }, ["url"]),
-        Tool("gergur_activate_tab", "Bring a tab to the front, and its window with it.",
-            new { index = NamedIndex() }, ["index"]),
-        Tool("gergur_close_tab", "Close a tab.", new { index = NamedIndex() }, ["index"]),
+        Tool("gergur_open_tab",
+            "Open a url in a new tab. Bare terms are treated as a search. Set background to leave the user on the tab they are reading.",
+            new
+            {
+                url = Text("The url or search terms to open."),
+                background = new { type = "boolean", description = "Open without switching to it. Defaults to false." },
+                window = new
+                {
+                    type = "integer",
+                    description = "Which window to open it in, as returned by gergur_open_window. Omit for the focused window.",
+                },
+            },
+            ["url"]),
+        Tool("gergur_navigate", "Point an existing tab at a url. Set wait to come back only once the page has loaded.",
+            new
+            {
+                url = Text("The url to go to."),
+                id = Id(),
+                index = Index(),
+                wait = new { type = "boolean", description = "Wait for the load to finish and report whether it did." },
+            },
+            ["url"]),
+        Tool("gergur_activate_tab", "Bring a tab to the front, and its window with it. Supply id or index; this changes what the user is looking at.",
+            new { id = Id(), index = NamedIndex() }, []),
+        Tool("gergur_close_tab", "Close a tab. Supply id or index; it will not guess.",
+            new { id = Id(), index = NamedIndex() }, []),
         Tool("gergur_read_page", "Read a page as rendered text. Prefer this over a screenshot for reading: it does not disturb which tab the user is looking at.",
-            new { index = Index() }, []),
-        Tool("gergur_read_html", "Read a page's full HTML.", new { index = Index() }, []),
-        Tool("gergur_screenshot", "Capture a tab as a PNG. This activates the tab first, so it changes what the user sees.",
-            new { index = Index() }, []),
-        Tool("gergur_run_javascript", "Evaluate JavaScript in a page and return the result.",
-            new { js = Text("The expression to evaluate."), index = Index() }, ["js"]),
+            new { id = Id(), index = Index() }, []),
+        Tool("gergur_read_html", "Read a page's full HTML.", new { id = Id(), index = Index() }, []),
+        Tool("gergur_screenshot",
+            "Capture a tab as a PNG. Reads what the tab last rendered without disturbing the user; set activate to switch its window to it first, or chrome to photograph the whole window including the tab strip and toolbar.",
+            new
+            {
+                id = Id(),
+                index = Index(),
+                activate = new { type = "boolean", description = "Switch its window to this tab first. Changes what that window shows, but does not raise it over other apps." },
+                chrome = new { type = "boolean", description = "Photograph the window rather than the page." },
+            },
+            []),
+        Tool("gergur_run_javascript",
+            "Evaluate JavaScript in a page and return the result. A promise is awaited, so fetch and the like come back with their value rather than an empty object.",
+            new { js = Text("The expression to evaluate."), id = Id(), index = Index() }, ["js"]),
         Tool("gergur_click", "Click the first element matching a CSS selector. Animates a visible cursor to it first.",
-            new { selector = Text("A CSS selector."), index = Index() }, ["selector"]),
+            new { selector = Text("A CSS selector."), id = Id(), index = Index() }, ["selector"]),
         Tool("gergur_type_text", "Fill an input or textarea, in a way React and similar frameworks notice.",
-            new { selector = Text("A CSS selector for the field."), text = Text("The text to enter."), index = Index() },
+            new { selector = Text("A CSS selector for the field."), text = Text("The text to enter."), id = Id(), index = Index() },
             ["selector", "text"]),
+        Tool("gergur_open_window",
+            "Open another browser window on the same session. Leave focus false to work in it without taking the screen from whoever is using the browser.",
+            new
+            {
+                url = Text("Optional url to open in the new window's first tab."),
+                focus = new { type = "boolean", description = "Bring the new window to the front. Defaults to false." },
+            },
+            []),
+        Tool("gergur_read_settings",
+            "Read every Gergur setting and its current value, plus which ones only take effect after a restart.",
+            new { }, []),
+        Tool("gergur_change_settings",
+            "Change Gergur settings. Names come from gergur_read_settings; anything unrecognised is reported back rather than ignored, and a value of the wrong type changes nothing at all.",
+            new
+            {
+                settings = new
+                {
+                    type = "object",
+                    description = "Setting names mapped to their new values, for example {\"BlocklistEnabled\": true}.",
+                },
+            },
+            ["settings"]),
+        Tool("gergur_page_errors",
+            "Read the JavaScript errors, unhandled rejections and failed subresource loads a page has reported. This is what the status bar's issue count counts, and it clears on every navigation.",
+            new { id = Id(), index = Index() }, []),
     ];
 
     private Task<(int, string, byte[])> HandleMcpAsync(JsonDocument? body)
@@ -721,10 +1290,22 @@ public sealed class AgentServer
                 };
             }
 
+            // Anything this call waits on has to finish inside the tool's own budget.
+            // /navigate's wait defaults to 30 seconds and the budget is 20, so every page
+            // slower than 20 seconds came back as "abandoned" rather than as the honest
+            // {"ok": true, "loaded": false} the wait exists to give. The query wins over
+            // the body, so writing it here caps whatever the caller asked for.
+            double ceiling = ToolTimeout.TotalSeconds - 2;
+            double asked = NumberValue(query, args, "timeout") ?? ceiling;
+            query["timeout"] = Math.Min(asked, ceiling)
+                .ToString("0.###", CultureInfo.InvariantCulture);
+
             // A page running a script that never returns would otherwise hold this
             // connection, its stream and its task for the life of the process.
             var dispatch = RouteAsync(httpMethod, path, query, args);
-            if (await Task.WhenAny(dispatch, Task.Delay(ToolTimeout)) != dispatch)
+            using var budget = new CancellationTokenSource();
+            var spent = Task.Delay(ToolTimeout, budget.Token);
+            if (await Task.WhenAny(dispatch, spent) != dispatch)
             {
                 // The abandoned call still holds args, so disposing here would be a
                 // use-after-dispose on a live task. Hand disposal to that task instead,
@@ -739,6 +1320,10 @@ public sealed class AgentServer
                     $"{name} did not finish within {ToolTimeout.TotalSeconds:0} seconds and was abandoned. "
                     + "It may still complete. If it was a read, the page may be running a script that never returns.");
             }
+
+            // The dispatch won, so the budget timer and its continuation are dead weight
+            // for the rest of the 20 seconds.
+            budget.Cancel();
 
             var (status, contentType, payload) = await dispatch;
             if (contentType == "image/png")
@@ -765,7 +1350,8 @@ public sealed class AgentServer
         catch (Exception ex)
         {
             // A failed tool call is reported to the caller, never thrown at the transport.
-            return McpError($"{name} failed: {ex.Message}");
+            DebugLog.WriteAlways($"{name} failed: {ex}");
+            return McpError($"{name} failed inside the browser; the cause is in %LOCALAPPDATA%/Gergur/debug.log");
         }
         finally
         {
@@ -834,9 +1420,98 @@ public sealed class AgentServer
         }
         """;
 
-    private async Task<string> EvalStringAsync(Tab tab, string js)
+    /// <summary>
+    /// What an endpoint says when the tab's page could not be started at all, as opposed
+    /// to a url the engine refused. Told apart because the fix is different: a caller told
+    /// its url was bad goes and changes a url that was fine.
+    /// </summary>
+    /// <param name="tab">The tab that is still there, or null when what was made for the
+    /// request has been taken away again.</param>
+    /// <param name="nowUtc">The clock, passed in so the wording can be pinned by a test.</param>
+    internal static (int, string, byte[]) PageCouldNotStart(Tab? tab, DateTime nowUtc)
     {
-        string raw = await OnUiAsync(() => tab.ExecuteScriptAsync(js));
+        if (tab is null)
+        {
+            // No retryInSeconds. The back-off belongs to a tab, and a discarded one's wait
+            // says nothing about the next /open, which makes a new tab that tries at once.
+            return (503, "application/json", JsonSerializer.SerializeToUtf8Bytes(new
+            {
+                error = "the page could not start, so nothing was opened",
+            }));
+        }
+
+        // Worded from the real wait, which after three failures in a row is five minutes,
+        // not "a few seconds". Nothing retries by itself: the next read or navigate is the
+        // retry, and before this many seconds it is refused without trying.
+        int seconds = Tab.SecondsUntil(tab.NextBuildAttemptUtc, nowUtc);
+        return (503, "application/json", JsonSerializer.SerializeToUtf8Bytes(new
+        {
+            error = seconds == 0
+                ? "that tab's page could not start; it can be tried again now"
+                : $"that tab's page could not start; it can be tried again after {Tab.DescribeWait(seconds)}",
+            id = tab.Id,
+            retryInSeconds = seconds,
+        }));
+    }
+
+    /// <summary>
+    /// What /navigate answers, apart from the endpoint so a test can pin it.
+    /// </summary>
+    /// <param name="waited">Whether the caller asked to wait for the page.</param>
+    /// <param name="loaded">For a wait, whether that page loaded, or null when the
+    /// navigation never went out. Without a wait, true when it went out and null when not.</param>
+    internal static (int, string, byte[]) NavigateAnswer(bool waited, bool? loaded, Tab tab, DateTime nowUtc)
+    {
+        // Only a build that actually failed. One that is just slow, a retry after an
+        // earlier failure included, carries on and navigates when it arrives, so the honest
+        // answer then is "not loaded yet", not "could not start; try again", which would
+        // have the caller start another.
+        if (loaded != true && tab.CouldNotStart)
+            return PageCouldNotStart(tab, nowUtc);
+        // Null means the navigation never went out. Folding it into loaded:false would
+        // read as a slow page and have the caller wait and retry.
+        if (loaded is null)
+            return (503, "application/json", JsonSerializer.SerializeToUtf8Bytes(new { error = "the engine would not take that url" }));
+        return waited
+            ? (200, "application/json", JsonSerializer.SerializeToUtf8Bytes(new { ok = true, loaded = loaded.Value }))
+            : (200, "application/json", JsonSerializer.SerializeToUtf8Bytes(new { ok = true }));
+    }
+
+    /// <summary>Closes a window that has not already closed itself. Closing a disposed form throws.</summary>
+    private static void CloseIfOpen(Form window)
+    {
+        if (!window.IsDisposed && !window.Disposing)
+            window.Close();
+    }
+
+    /// <summary>
+    /// Runs a script for an endpoint that changes something, and says whether the page was
+    /// there to change. /click and /type used to drop that, so a tab whose page had not
+    /// settled answered ok:false, which reads exactly like "no element matched" and has an
+    /// agent retrying selectors against a page that was never there.
+    /// </summary>
+    private async Task<(bool Worked, bool Ready)> ActOnPageAsync(Tab tab, string js)
+    {
+        var (raw, ready) = await OnUiAsync(() => tab.ReadScriptAsync(js, Tab.WakeTimeout));
+        return (raw == "true", ready);
+    }
+
+    /// <summary>
+    /// A string out of a page, and whether the page was there to be read.
+    ///
+    /// Ready used to be dropped here, so /page on a tab still loading after fifteen
+    /// seconds answered 200 with the real url, the real title and empty text. Nothing in
+    /// that says it is wrong, and CLAUDE.md points at /page as the read that disturbs
+    /// nothing, which makes it the one most likely to be believed.
+    /// </summary>
+    private async Task<(string Text, bool Ready)> ReadStringAsync(Tab tab, string js)
+    {
+        var (raw, ready) = await OnUiAsync(() => tab.ReadScriptAsync(js, Tab.WakeTimeout));
+        return (AsString(raw), ready);
+    }
+
+    private static string AsString(string raw)
+    {
         try
         {
             using var doc = JsonDocument.Parse(raw);
@@ -902,18 +1577,7 @@ public sealed class AgentServer
         }
 
         string path = rawPath;
-        var query = new Dictionary<string, string>();
-        int qm = rawPath.IndexOf('?');
-        if (qm >= 0)
-        {
-            path = rawPath[..qm];
-            foreach (var pair in rawPath[(qm + 1)..].Split('&', StringSplitOptions.RemoveEmptyEntries))
-            {
-                int eq = pair.IndexOf('=');
-                if (eq > 0)
-                    query[Uri.UnescapeDataString(pair[..eq])] = Uri.UnescapeDataString(pair[(eq + 1)..]);
-            }
-        }
+        var query = ParseQuery(rawPath, out path);
 
         JsonDocument? body = null;
         if (headers.TryGetValue("content-length", out var lenText)
@@ -951,6 +1615,7 @@ public sealed class AgentServer
             400 => "Bad Request",
             403 => "Forbidden",
             404 => "Not Found",
+            413 => "Payload Too Large",
             500 => "Internal Server Error",
             503 => "Service Unavailable",
             _ => "Error",

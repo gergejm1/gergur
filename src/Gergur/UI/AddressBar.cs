@@ -11,7 +11,7 @@ public sealed class AddressBar : TextBox
     public event EventHandler? Escaped;
 
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
-    public string SearchUrlTemplate { get; set; } = "https://www.google.com/search?q={0}";
+    public string SearchUrlTemplate { get; set; } = UrlHeuristics.DefaultSearchUrlTemplate;
 
     /// <summary>Supplies address-bar suggestions (typically from browsing history),
     /// refreshed each time the bar gains focus so newly-visited sites appear.</summary>

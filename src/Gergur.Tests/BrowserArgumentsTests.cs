@@ -36,6 +36,16 @@ public sealed class BrowserArgumentsTests
     }
 
     [Fact]
+    public void ATunnelThatDidNotComeUpIsNotAProxy()
+    {
+        // Chosen but down this run: pointing the engine at a dead proxy would fail every
+        // request, which is what browsing without it avoids.
+        var args = BrowserEnvironment.BuildBrowserArguments(
+            new Settings { VpnEnabled = true, VpnLocalPort = 24001, VpnDownThisRun = true });
+        Assert.DoesNotContain("--proxy-server", args);
+    }
+
+    [Fact]
     public void VpnOffAddsNoProxyFlags()
     {
         var args = BrowserEnvironment.BuildBrowserArguments(new Settings());

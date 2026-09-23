@@ -44,6 +44,20 @@ public sealed class TabStripControl : Control
     /// <summary>Raised when any drag ends, so stale drop indicators can be cleared.</summary>
     public event EventHandler? TabDragEnded;
 
+    /// <summary>
+    /// Asked, with a screen point, whether that point is over another window's tab strip.
+    ///
+    /// The margin that stops a shaky hand tearing a tab out also covers the first few
+    /// pixels past the edge, and with two maximised windows on side by side monitors the
+    /// other window's strip starts right there. Without this, letting go just across the
+    /// monitor boundary, on top of the other strip that was lit up to accept it, still
+    /// reordered the tab in its own window: to the front when the other monitor is on
+    /// the left, which is the bug as it was first reported.
+    /// </summary>
+    [System.ComponentModel.Browsable(false)]
+    [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
+    public Func<Point, bool>? IsOverAnotherStrip { get; set; }
+
     private int _externalDropIndex = -1;
 
     /// <summary>This strip in screen coordinates, for cross-window hit testing.</summary>
@@ -272,7 +286,9 @@ public sealed class TabStripControl : Control
                 _dragX = e.X;
                 // Pulled clear of the strip: stop offering a drop slot here, because
                 // releasing lands the tab in another window or makes a new one.
-                _dragOutside = TabDrag.IsClearOfStrip(e.Y, Height, S(28));
+                _dragOutside = TabDrag.IsOutside(
+                    e.Location, Size, S(28),
+                    overAnotherStrip: IsOverAnotherStrip?.Invoke(PointToScreen(e.Location)) ?? false);
                 // No slot unless releasing would actually reorder, or the bar promises a
                 // move that mouse-up refuses: a drift straight down inside the strip arms
                 // the drag for tear-off but is still a click.
