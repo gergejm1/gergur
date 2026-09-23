@@ -281,8 +281,18 @@ wakes it. The user's browsing is personal: read what the task requires, nothing 
   last two review rounds: 48 endpoint checks passing, a `chrome=1` capture looked at by
   eye, which does include the rendered page area, and an agent window measured behind a
   terminal. The drag, sideways onto another monitor, was confirmed by hand by the user
-  the same day; nothing automated drives it. **The code as committed has not been run
-  live.** What changed since that run, and what checks each part:
+  the same day; nothing automated drives it.
+- Live verification again that evening, against a Release build of 8f5abbc, the user's
+  real profile, a window of the script's own: `scripts/verify-agent-api.ps1` passed 51 of
+  51 on its second run, and both captures were looked at by eye. The first run, about a
+  minute after launch, lost one plain `/screenshot` of the script's own loaded page to
+  "no rendered page to photograph when the wait ran out" (that message covers a capture
+  that timed out or threw and a wake that ran out; which one was not established). It
+  did not happen again in three tries on the same build, and the cause is not known. The
+  same run showed that an `edge://` url is accepted and fails at once (`loaded: false`),
+  so the script's check for it was wrong to demand 503; it now checks that the answer
+  comes back at once.
+- What changed between the afternoon build and 8f5abbc, and what else checks each part:
   - Unit tests, which exercise the decision with no engine behind it:
     `TabManager.OpenOrDiscardAsync` (a failed tab taken away quietly, the previous tab
     back), `Tab.CouldNotStart`, `AgentServer.NavigateAnswer` and `PageCouldNotStart`,
@@ -308,7 +318,7 @@ wakes it. The user's browsing is personal: read what the task requires, nothing 
     ran it in a copy against a fake one, four cases including two overlapping picks), and `/window` closing an empty window.
   - `scripts/verify-agent-api.ps1` exercises only the happy paths of /open and /window
     among these, since every call it makes names a tab and it never changes a page
-    setting. Run it against a fresh Release build before relying on any of this.
+    setting. It was run against 8f5abbc that evening, as above.
   Never exercised live at all: a view build that fails (and so the could-not-start
   messages and the taking away of a failed /open or /window), a tab discarded after
   fifteen minutes, the sleep timers applying live, an agent window placed while another

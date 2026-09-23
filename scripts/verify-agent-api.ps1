@@ -106,10 +106,16 @@ try {
     Check 'the replaced one does not claim to have loaded' ($first.loaded -ne $true) (Show $first)
     Check 'and the tab is on the page that won' ($landed -like '*example.com/?second*') $landed
 
-    Write-Host "`n--- navigate refuses what it cannot do"
+    Write-Host "`n--- navigate reports a url that cannot load"
+    # The engine accepts an edge:// url and then fails the navigation at once, so the honest
+    # answer is loaded:false, or 503 if it refuses outright. What tells it from a slow page is
+    # time: it answers straight away rather than waiting out its timeout. Requiring 503 alone
+    # failed live on 2026-09-22 against a correct answer.
+    $clock = [Diagnostics.Stopwatch]::StartNew()
     $bad = Status { Post '/navigate' @{ id = $mine; url = 'edge://nonsense-that-is-not-real'; wait = $true; timeout = 10 } }
-    # 503, and only 503. loaded:false is the slow-page answer, which is what this is not.
-    Check 'a url the engine will not take is not a slow page' ($bad.code -eq 503) ("" + $bad.code + " " + (Show $bad.body))
+    $clock.Stop()
+    $notLoaded = $bad.code -eq 503 -or ($bad.code -eq 200 -and $bad.body.loaded -eq $false)
+    Check 'a url that cannot load says so at once, not after the timeout like a slow page' ($notLoaded -and $clock.Elapsed.TotalSeconds -lt 5) ("" + $bad.code + " " + (Show $bad.body) + (" in {0:N1}s" -f $clock.Elapsed.TotalSeconds))
     Post '/navigate' @{ id = $mine; url = 'https://example.com'; wait = $true; timeout = 30 } | Out-Null
 
     Write-Host "`n--- eval"
