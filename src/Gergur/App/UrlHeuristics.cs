@@ -9,6 +9,10 @@ public static class UrlHeuristics
     public static string ToNavigableUrl(string input, string? searchUrlTemplate)
     {
         input = input.Trim();
+        // gergur://history and the rest: the browser's own pages, by the names the
+        // address bar shows for them.
+        if (InternalPages.Resolve(input) is { } ownPage)
+            return ownPage;
         if (Uri.TryCreate(input, UriKind.Absolute, out var absolute)
             && NavigableSchemes.Contains(absolute.Scheme, StringComparer.OrdinalIgnoreCase))
         {

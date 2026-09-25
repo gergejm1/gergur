@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- Only the Assets folder may be reached from here; see history.html. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src file: 'unsafe-inline'; style-src file: 'unsafe-inline'; img-src file:; base-uri 'none'; form-action 'none'">
+<title>Downloads</title>
+<link rel="icon" href="favicon.png?v=235fd424">
+<link rel="stylesheet" href="pages.css">
+</head>
+<body class="downloads">
+<main class="page">
+  <header class="page-head">
+    <h1>Downloads</h1>
+    <button id="clear-finished" class="btn btn-ghost head-action" type="button" disabled>Clear finished</button>
+  </header>
+
+  <div id="list" aria-label="Downloads"></div>
+</main>
+
+<script src="bridge.js"></script>
+<script>
+(function () {
+    "use strict";
+    var g = window.gergur;
+    var d = g.dom;
+
+    var list = document.getElementById("list");
+    var clearFinished = document.getElementById("clear-finished");
+
+    var ul = null;
+    var rows = new Map();
+    var pushes = 0;
+    var shown = false;
+
+    // Rows are kept and updated in place rather than rebuilt: a running download pushes
+    // several times a second, and rebuilding would take the keyboard focus off a button
+    // each time.
+    function render(items) {
+        shown = true;
+        clearFinished.disabled = !items.some(function (i) { return i.state !== "inProgress"; });
+        if (!items.length) {
+            rows.clear();
+            ul = null;
+            d.notice(list, "No downloads yet", "Files you download will show up here.");
+            return;
+        }
+        if (!ul || ul.parentNode !== list) {
+            d.clear(list);
+            rows.clear();
+            ul = d.el("ul", "list");
+            list.appendChild(ul);
+        }
+        var seen = new Set();
+        items.forEach(function (item, i) {
+            var row = rows.get(item.id);
+            if (!row) {
+                row = build(item);
+                rows.set(item.id, row);
+            }
+            update(row, item);
+            seen.add(item.id);
+            var at = ul.children[i];
+            if (at !== row.li) ul.insertBefore(row.li, at || null);
+        });
+        rows.forEach(function (row, id) {
+            if (seen.has(id)) return;
+            if (row.li.parentNode) row.li.parentNode.removeChild(row.li);
+            rows.delete(id);
+        });
+    }
+
+    function build(item) {
+        var li = d.el("li", "dl");
+        var badge = d.el("span", "file-badge");
+        badge.setAttribute("aria-hidden", "true");
+        var main = d.el("div", "dl-main");
+        var name = d.el("div", "dl-name");
+        var progress = d.el("div", "progress");
+        var fill = d.el("span");
+        progress.appendChild(fill);
+        progress.setAttribute("role", "progressbar");
+        progress.setAttribute("aria-label", "Download progress");
+        progress.setAttribute("aria-valuemin", "0");
+        progress.setAttribute("aria-valuemax", "100");
+        var meta = d.el("div", "dl-meta");
+        var status = d.el("span", "dl-status");
+        var host = d.el("span", "host");
+        var when = d.el("span", "when");
+        meta.appendChild(status);
+        meta.appendChild(host);
+        meta.appendChild(when);
+        main.appendChild(name);
+        main.appendChild(progress);
+        main.appendChild(meta);
+        var actions = d.el("div", "dl-actions");
+        li.appendChild(badge);
+        li.appendChild(main);
+        li.appendChild(actions);
+        return { li: li, badge: badge, name: name, progress: progress, fill: fill, status: status, host: host, when: when, actions: actions, state: null, id: item.id };
+    }
+
+    function setText(node, text) {
+        if (node.textContent !== text) node.textContent = text;
+    }
+
+    function update(row, item) {
+        var fileName = g.clip(item.fileName || "(unknown)", 300);
+        setText(row.name, fileName);
+        row.name.title = fileName;
+        setText(row.badge, g.extensionOf(item.fileName) || "FILE");
+        row.badge.style.setProperty("--hue", String(g.hueOf(g.extensionOf(item.fileName) || "file")));
+        setText(row.status, String(item.status || ""));
+        setText(row.host, g.siteOf(item.url));
+        row.host.title = g.clip(item.url || "", 2048);
+        setText(row.when, g.shortWhen(item.startedUtc, new Date()));
+
+        var running = item.state === "inProgress";
+        row.progress.hidden = !running;
+        if (running) {
+            var fraction = g.progressOf(item.received, item.total);
+            row.progress.classList.toggle("is-unknown", fraction === null);
+            if (fraction === null) {
+                row.fill.style.width = "";
+                row.progress.removeAttribute("aria-valuenow");
+            } else {
+                row.fill.style.width = (fraction * 100).toFixed(1) + "%";
+                row.progress.setAttribute("aria-valuenow", String(Math.round(fraction * 100)));
+            }
+        }
+
+        row.li.classList.toggle("is-interrupted", item.state === "interrupted");
+        if (row.state !== item.state) {
+            row.state = item.state;
+            setActions(row, item);
+        }
+    }
+
+    function setActions(row, item) {
+        var hadFocus = row.actions.contains(document.activeElement);
+        d.clear(row.actions);
+        var label = g.clip(item.fileName || "download", 120);
+        if (item.state === "completed") {
+            row.actions.appendChild(action("Open", "downloads.open", row.id, "Open " + label));
+            row.actions.appendChild(action("Show in folder", "downloads.showInFolder", row.id, "Show " + label + " in folder"));
+        } else if (item.state === "inProgress") {
+            row.actions.appendChild(action("Cancel", "downloads.cancel", row.id, "Cancel " + label));
+        }
+        // A button that went away under the keyboard hands focus to its replacement.
+        if (hadFocus) {
+            var next = row.actions.querySelector("button") || clearFinished;
+            next.focus();
+        }
+    }
+
+    function action(text, op, id, spoken) {
+        var button = d.el("button", "btn btn-sm", text);
+        button.type = "button";
+        button.setAttribute("aria-label", spoken);
+        // Not disabled while it works: a disabled button drops the keyboard focus.
+        var busy = false;
+        button.addEventListener("click", function () {
+            if (busy) return;
+            busy = true;
+            g.call(op, { id: id }).then(function () {
+                if (op === "downloads.cancel") refresh();
+            }, function (err) {
+                d.toast(g.describeError(err));
+            }).then(function () { busy = false; });
+        });
+        return button;
+    }
+
+    function refresh() {
+        var mark = pushes;
+        var slow = window.setTimeout(function () { if (!shown) d.showLoading(list); }, 300);
+        g.call("downloads.list", {}).then(function (items) {
+            window.clearTimeout(slow);
+            // A push that arrived meanwhile is newer than this answer.
+            if (mark !== pushes) return;
+            render(Array.isArray(items) ? items : []);
+        }, function (err) {
+            window.clearTimeout(slow);
+            if (mark !== pushes) return;
+            shown = false;
+            ul = null;
+            rows.clear();
+            clearFinished.disabled = true;
+            d.showError(list, "Could not load your downloads", err, refresh);
+        });
+    }
+
+    // The browser skips pushes to a sleeping tab, so a page coming back into view asks again.
+    document.addEventListener("visibilitychange", function () { if (!document.hidden) refresh(); });
+    g.on("downloads", function (message) {
+        pushes++;
+        if (Array.isArray(message.items)) render(message.items);
+        else refresh();
+    });
+
+    clearFinished.addEventListener("click", function () {
+        clearFinished.disabled = true;
+        g.call("downloads.clearFinished", {}).then(refresh, function (err) {
+            clearFinished.disabled = false;
+            d.toast("Could not clear the list. " + g.describeError(err));
+        });
+    });
+
+    refresh();
+})();
+</script>
+</body>
+</html>

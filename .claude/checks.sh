@@ -60,4 +60,14 @@ if [ "$status" -ne 0 ]; then
   exit 1
 fi
 
+# The browser's own pages (history, downloads, bookmarks, new tab) share bridge.js, whose
+# helpers decide what the history page groups under which day and how sizes read.
+echo "checks: running the page bridge tests"
+timeout 60 node "$ROOT/src/Gergur/Assets/bridge.test.js"
+status=$?
+if [ "$status" -ne 0 ]; then
+  echo "checks: page bridge tests failed (status $status)"
+  exit 1
+fi
+
 echo "checks: OK"

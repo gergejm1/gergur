@@ -26,7 +26,8 @@ public sealed class HistoryStore
 
     public void Append(string url, string title)
     {
-        if (HomePage.IsHome(url))
+        // Nor the browser's own pages: nobody went to History, they looked at it.
+        if (HomePage.IsHome(url) || InternalPages.Identify(url) is not null)
             return;
         try
         {
@@ -44,6 +45,14 @@ public sealed class HistoryStore
     /// visit so a reload or an in-page navigation loop does not flood the list.
     /// </summary>
     public IReadOnlyList<HistoryVisit> Read(string? search = null, int max = 5000)
+        => TryRead(search, max) ?? Array.Empty<HistoryVisit>();
+
+    /// <summary>
+    /// The same, or null when the file could not be read. The history page needs the
+    /// difference: an empty list there reads "No history yet", which is untrue of a file
+    /// that is merely locked.
+    /// </summary>
+    public IReadOnlyList<HistoryVisit>? TryRead(string? search = null, int max = 5000)
     {
         var visits = new List<HistoryVisit>();
         try
@@ -57,7 +66,7 @@ public sealed class HistoryStore
         }
         catch
         {
-            return Array.Empty<HistoryVisit>();
+            return null;
         }
 
         visits.Reverse(); // the log is append-order; the window wants newest first
@@ -75,7 +84,11 @@ public sealed class HistoryStore
         return result;
     }
 
-    /// <summary>Drops every visit to any of these URLs. Returns the number of lines removed.</summary>
+    /// <summary>
+    /// Drops every visit to any of these URLs. Returns the number of lines removed, or -1
+    /// when the file could not be rewritten, so the history page can say so rather than
+    /// report nothing removed.
+    /// </summary>
     public int Remove(IEnumerable<string> urls)
     {
         var drop = new HashSet<string>(urls, StringComparer.OrdinalIgnoreCase);
@@ -99,20 +112,23 @@ public sealed class HistoryStore
         }
         catch
         {
-            return 0;
+            return -1;
         }
     }
 
-    public void Clear()
+    /// <summary>Deletes the whole history. False when the file could not be deleted.</summary>
+    public bool Clear()
     {
         try
         {
             if (File.Exists(_path))
                 File.Delete(_path);
+            return true;
         }
         catch
         {
-            // Nothing useful to do; the window reports what it can still read.
+            // Said, not swallowed: "cleared" when it was not is the worst answer to give here.
+            return false;
         }
     }
 

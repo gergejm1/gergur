@@ -271,7 +271,38 @@ public sealed class AgentServer
 
     // ------------------------------------------------------------------ routing
 
+    /// <summary>
+    /// The refusal for a tab that is, or may be, showing one of the browser's own pages,
+    /// judged from this thread, or null when it is not. Either address counts: Url is where
+    /// a navigation is heading, and the committed one is what is on screen, which a
+    /// navigation that never commits leaves behind. On one only by the committed address,
+    /// the tab is leaving it. The tab checks again, on its own thread, when the script
+    /// actually runs.
+    /// </summary>
+    internal static InternalPages.OwnPageRefusedException? OwnPageRefusal(Tab tab)
+        // The same rule the tab applies when the script runs, less the navigation record,
+        // which only the UI thread may read.
+        => Tab.RefusalFor(tab.Url, null, tab.CommittedSourceForOtherThreads);
+
+    internal static (int, string, byte[]) Refusal(InternalPages.OwnPageRefusedException refused)
+        => (refused.Status, "application/json", JsonSerializer.SerializeToUtf8Bytes(new { error = refused.Message }));
+
     private async Task<(int, string, byte[])> RouteAsync(
+        string method, string path, Dictionary<string, string> query, JsonDocument? body)
+    {
+        // The page reached one of the browser's own pages while the request was waiting for
+        // it. Refused the same as when it was there from the start, for http and MCP alike.
+        try
+        {
+            return await RouteRequestAsync(method, path, query, body);
+        }
+        catch (InternalPages.OwnPageRefusedException refused)
+        {
+            return Refusal(refused);
+        }
+    }
+
+    private async Task<(int, string, byte[])> RouteRequestAsync(
         string method, string path, Dictionary<string, string> query, JsonDocument? body)
     {
         // An index that was supplied but cannot be used must never fall back to the
@@ -291,6 +322,12 @@ public sealed class AgentServer
         }
 
         string? StringFrom(string name) => StringValue(query, body, name);
+
+        // The browser's own pages show history, downloads and bookmarks, and can open a
+        // downloaded file or clear history. Reading or scripting them through this API
+        // would reach all of that, and launching files is the kind of reach /settings
+        // refuses. Both addresses are plain fields, safe to read here.
+        (int, string, byte[])? OwnPageRefused(Tab t) => OwnPageRefusal(t) is { } refused ? Refusal(refused) : null;
 
         Tab? Target() => TargetEntry()?.Tab;
 
@@ -320,11 +357,16 @@ public sealed class AgentServer
                         id = e.Tab.Id,       // stable; prefer this to index
                         index = i,
                         window = windows.IndexOf(e.Window), // which window this tab lives in
-                        url = e.Tab.Url,
+                        // The browser's own pages by name, as the address bar and the session
+                        // show them: their file url is a path into the install, account name
+                        // and all, and it would go into the transcript.
+                        url = InternalPages.NameOf(e.Tab.Url),
                         title = e.Tab.Title,
                         state = e.Tab.State.ToString(),
                         active = e.Window.Tabs?.ActiveTab == e.Tab, // active within its own window
-                        errors = e.Tab.RecentErrors.ToArray(), // what the status bar's "N issues" is counting
+                        // What the status bar's "N issues" is counting. Not for the browser's
+                        // own pages, which /console refuses: one rule for both.
+                        errors = e.Tab.ShownPage is null ? e.Tab.RecentErrors.ToArray() : [],
                     }).ToArray());
                 });
                 return (200, "application/json", Json(list));
@@ -480,17 +522,24 @@ public sealed class AgentServer
             {
                 if (Target() is not { } consoleTab)
                     return (404, "application/json", Json(new { error = "no such tab" }));
+                if (OwnPageRefused(consoleTab) is { } refusedConsole)
+                    return refusedConsole;
                 // On the UI thread, as /tabs does. RecentErrors is a plain List the UI
                 // thread appends to and clears on every navigation, so copying it from a
                 // request thread races a page that is logging errors in a loop: a torn
                 // list on a good day, "Destination array was not long enough" on a bad one.
-                var reported = await OnUiAsync(() => Task.FromResult(new
+                var reported = await OnUiAsync(() =>
                 {
-                    url = consoleTab.Url,
-                    // The same list the status bar counts, which until now could only be
-                    // reached by injecting a second error reporter of one's own.
-                    errors = consoleTab.RecentErrors.ToArray(),
-                }));
+                    // Again on this thread, as every other read here does.
+                    consoleTab.RefuseOwnPage();
+                    return Task.FromResult(new
+                    {
+                        url = consoleTab.Url,
+                        // The same list the status bar counts, which until now could only be
+                        // reached by injecting a second error reporter of one's own.
+                        errors = consoleTab.RecentErrors.ToArray(),
+                    });
+                });
                 return (200, "application/json", Json(reported));
             }
 
@@ -593,6 +642,8 @@ public sealed class AgentServer
             {
                 if (Target() is not { } tab)
                     return (404, "application/json", Json(new { error = "no such tab" }));
+                if (OwnPageRefused(tab) is { } refused)
+                    return refused;
                 var (text, readable) = await ReadStringAsync(tab, "document.body ? document.body.innerText : ''");
                 if (!readable)
                     return (503, "application/json", Json(new
@@ -606,6 +657,8 @@ public sealed class AgentServer
             {
                 if (Target() is not { } tab)
                     return (404, "application/json", Json(new { error = "no such tab" }));
+                if (OwnPageRefused(tab) is { } refused)
+                    return refused;
                 var (html, readable) = await ReadStringAsync(tab, "document.documentElement.outerHTML");
                 if (!readable)
                     return (503, "application/json", Json(new
@@ -619,6 +672,8 @@ public sealed class AgentServer
             {
                 if (TargetEntry() is not { } shot || shot.Window.Tabs is null)
                     return (404, "application/json", Json(new { error = "no such tab" }));
+                if (OwnPageRefused(shot.Tab) is { } refusedShot)
+                    return refusedShot;
 
                 // Activating switches the tab's window to it, which changes what the person
                 // looking at that window sees, so it is asked for rather than assumed. It does
@@ -684,7 +739,25 @@ public sealed class AgentServer
 
                 if (wantsChrome)
                 {
-                    var (captured, why) = await OnUiAsync(() => Task.FromResult(WindowCapture.Of(shot.Window)));
+                    // Checked again in the same step as the capture, after the wait above:
+                    // long enough for the window to switch tabs, or for this tab to arrive at
+                    // one of the browser's own pages, and the photograph includes the page.
+                    bool switchedAway = false;
+                    var (captured, why) = await OnUiAsync(() =>
+                    {
+                        if (shot.Window.Tabs?.ActiveTab != shot.Tab)
+                        {
+                            switchedAway = true;
+                            return Task.FromResult<(byte[], string?)>(([], null));
+                        }
+                        shot.Tab.RefuseOwnPage();
+                        return Task.FromResult(WindowCapture.Of(shot.Window));
+                    });
+                    if (switchedAway)   // the same answer as on entry
+                        return (400, "application/json", Json(new
+                        {
+                            error = "that tab is no longer the one its window is showing; ask again, with activate=1 to switch its window back to it",
+                        }));
                     return captured.Length == 0
                         ? (503, "application/json", Json(new { error = why ?? "the window could not be captured" }))
                         : (200, "image/png", captured);
@@ -706,6 +779,8 @@ public sealed class AgentServer
             {
                 if (Target() is not { } tab)
                     return (404, "application/json", Json(new { error = "no such tab" }));
+                if (OwnPageRefused(tab) is { } refused)
+                    return refused;
                 string js = BodyString("js") ?? "";
                 if (js.Length == 0)
                     return (400, "application/json", Json(new { error = "js required" }));
@@ -742,6 +817,8 @@ public sealed class AgentServer
             {
                 if (Target() is not { } tab)
                     return (404, "application/json", Json(new { error = "no such tab" }));
+                if (OwnPageRefused(tab) is { } refused)
+                    return refused;
                 string selector = BodyString("selector") ?? "";
                 string js = $$"""
                     (() => {
@@ -773,6 +850,8 @@ public sealed class AgentServer
             {
                 if (Target() is not { } tab)
                     return (404, "application/json", Json(new { error = "no such tab" }));
+                if (OwnPageRefused(tab) is { } refused)
+                    return refused;
                 string selector = BodyString("selector") ?? "";
                 string text = BodyString("text") ?? "";
                 string js = $$"""

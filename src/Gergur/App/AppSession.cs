@@ -1,5 +1,6 @@
 using Gergur.Blocking;
 using Gergur.Data;
+using Gergur.Tabs;
 using Gergur.UI;
 
 namespace Gergur.App;
@@ -188,17 +189,41 @@ public sealed class AppSession
     /// </summary>
     public void SaveSession()
     {
-        var windows = new List<SessionWindow>();
-        foreach (var window in _windows)
+        var session = SessionOf(_windows
+            .Where(w => w.Tabs is not null)
+            .Select(w => (w.OpenedByAgent, w.Tabs!.Tabs, w.Tabs.ActiveTab)));
+        if (session is not null)
+            SessionStore.Save(session);
+    }
+
+    /// <summary>
+    /// What the session file should hold, or null to leave it as it is.
+    ///
+    /// An agent's own window is its workspace, not the person's browsing, so it is never
+    /// part of the session. And when only agent windows are left there is nothing of the
+    /// person's to write: their session was saved when their own last window closed.
+    /// Writing anyway is how it was lost once. The person closed their window, an agent's
+    /// window was the last one open, the agent closed its own last tab, the app exited,
+    /// and the exit saved "no windows" over the tabs they had.
+    /// </summary>
+    internal static List<SessionWindow>? SessionOf(IEnumerable<(bool OpenedByAgent, IReadOnlyList<Tab> Tabs, Tab? Active)> windows)
+    {
+        var saved = new List<SessionWindow>();
+        bool anyOfTheirs = false;
+        foreach (var (openedByAgent, tabs, active) in windows)
         {
-            if (window.Tabs is not { } tabs)
+            if (openedByAgent)
                 continue;
-            var kept = tabs.Tabs.Where(t => !HomePage.IsHome(t.Url)).ToList();
+            anyOfTheirs = true;
+            var kept = tabs.Where(t => !HomePage.IsHome(t.Url)).ToList();
             if (kept.Count == 0)
                 continue;
-            int activeIndex = tabs.ActiveTab is null ? 0 : Math.Max(0, kept.IndexOf(tabs.ActiveTab));
-            windows.Add(new SessionWindow(kept.Select(t => new SessionTab(t.Url, t.Title)).ToList(), activeIndex));
+            int activeIndex = active is null ? 0 : Math.Max(0, kept.IndexOf(active));
+            // The browser's own pages by their gergur:// name, not their path into this
+            // install, which a moved or rebuilt Gergur no longer has.
+            saved.Add(new SessionWindow(kept.Select(t => new SessionTab(
+                InternalPages.Identify(t.Url) is { } page ? InternalPages.AddressOf(page) : t.Url, t.Title)).ToList(), activeIndex));
         }
-        SessionStore.Save(windows);
+        return anyOfTheirs ? saved : null;
     }
 }

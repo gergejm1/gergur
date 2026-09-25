@@ -1,0 +1,331 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- Nothing on this page may load from anywhere but the Assets folder: it holds the
+     browsing history, so even a slip elsewhere must have no way to send it out. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src file: 'unsafe-inline'; style-src file: 'unsafe-inline'; img-src file:; base-uri 'none'; form-action 'none'">
+<title>History</title>
+<link rel="icon" href="favicon.png?v=235fd424">
+<link rel="stylesheet" href="pages.css">
+</head>
+<body class="history">
+<main class="page">
+  <header class="page-head">
+    <h1>History</h1>
+  </header>
+
+  <div class="bar">
+    <div class="search" role="search">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="7" cy="7" r="4.6" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M10.5 10.5L14 14" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+      <input id="search" type="search" placeholder="Search history" aria-label="Search history" autocomplete="off" spellcheck="false" autofocus>
+    </div>
+    <div class="bar-actions">
+      <div id="selection" class="selection" hidden>
+        <span id="selection-count" class="selection-count"></span>
+        <button id="delete-selected" class="btn btn-danger" type="button">Delete selected</button>
+        <button id="deselect" class="btn btn-ghost" type="button">Cancel</button>
+      </div>
+      <button id="clear-all" class="btn btn-ghost" type="button">Clear all history</button>
+    </div>
+  </div>
+
+  <div id="confirm" class="confirm" role="group" aria-labelledby="confirm-text" hidden>
+    <p id="confirm-text"><strong id="confirm-title">Clear all browsing history?</strong> <span id="confirm-detail">Every entry goes, and this cannot be undone.</span></p>
+    <div class="confirm-actions">
+      <button id="confirm-yes" class="btn btn-solid" type="button">Clear history</button>
+      <button id="confirm-no" class="btn" type="button">Cancel</button>
+    </div>
+  </div>
+
+  <div id="list" aria-label="History entries"></div>
+  <div class="more"><button id="more" class="btn" type="button" hidden>Show more</button></div>
+  <p id="cap-note" class="hint" hidden>Showing the newest 5,000. Search to find older ones.</p>
+</main>
+
+<script src="bridge.js"></script>
+<script>
+(function () {
+    "use strict";
+    var g = window.gergur;
+    var d = g.dom;
+    var PAGE = 500;
+    // The most the browser answers with in one list (InternalPages clamps max to it). Asking
+    // past it came back 5000 again, looked like the end, and History silently stopped there.
+    var LIMIT = 5000;
+
+    var list = document.getElementById("list");
+    var search = document.getElementById("search");
+    var more = document.getElementById("more");
+    var selection = document.getElementById("selection");
+    var selectionCount = document.getElementById("selection-count");
+    var deleteSelected = document.getElementById("delete-selected");
+    var deselect = document.getElementById("deselect");
+    var clearAll = document.getElementById("clear-all");
+    var confirmBox = document.getElementById("confirm");
+    var confirmYes = document.getElementById("confirm-yes");
+    var confirmNo = document.getElementById("confirm-no");
+    var capNote = document.getElementById("cap-note");
+
+    var state = { q: "", max: PAGE, seq: 0, shown: false, anchor: -1 };
+    var selected = new Set();
+    var rows = [];
+
+    function load(focusAfter) {
+        var seq = ++state.seq;
+        var slow = window.setTimeout(function () {
+            if (seq === state.seq && !state.shown) d.showLoading(list);
+        }, 300);
+        var args = { max: state.max };
+        if (state.q) args.q = state.q;
+        g.call("history.list", args).then(function (items) {
+            window.clearTimeout(slow);
+            if (seq !== state.seq) return;
+            render(Array.isArray(items) ? items : [], focusAfter);
+        }, function (err) {
+            window.clearTimeout(slow);
+            if (seq !== state.seq) return;
+            state.shown = false;
+            rows = [];
+            more.hidden = true;
+            d.showError(list, "Could not load your history", err, function () { load(); });
+        });
+    }
+
+    function render(items, focusAfter) {
+        var focus = focusAfter || d.captureFocus(list);
+        var present = new Set(items.map(function (i) { return i.url; }));
+        selected.forEach(function (url) { if (!present.has(url)) selected.delete(url); });
+        rows = [];
+        state.shown = true;
+        state.anchor = -1;
+        d.clear(list);
+
+        if (!items.length) {
+            if (state.q) d.notice(list, "No matches", "Nothing in your history matches “" + g.clip(state.q, 80) + "”.");
+            else d.notice(list, "No history yet", "Pages you visit will show up here.");
+        } else {
+            var frag = document.createDocumentFragment();
+            g.groupByDay(items, function (i) { return i.visitedUtc; }, new Date()).forEach(function (group) {
+                var section = d.el("section", "day");
+                var heading = d.el("h2", "day-label", group.label);
+                section.appendChild(heading);
+                var ul = d.el("ul", "list");
+                group.items.forEach(function (item) { ul.appendChild(buildRow(item)); });
+                section.appendChild(ul);
+                frag.appendChild(section);
+            });
+            list.appendChild(frag);
+        }
+
+        var wasOnMore = document.activeElement === more;
+        var atLimit = items.length >= LIMIT;
+        more.hidden = items.length < state.max || atLimit;
+        capNote.hidden = !atLimit;
+        updateSelection();
+        if (!d.restoreFocus(list, focus) && wasOnMore && more.hidden && rows.length) {
+            rows[rows.length - 1].link.focus();
+        }
+    }
+
+    function buildRow(item) {
+        var index = rows.length;
+        var title = g.displayTitle(item.title, item.url);
+        var row = d.el("li", "row");
+        row.dataset.key = item.url;
+
+        var check = d.el("label", "check");
+        var box = document.createElement("input");
+        box.type = "checkbox";
+        box.dataset.part = "check";
+        box.checked = selected.has(item.url);
+        box.setAttribute("aria-label", "Select " + title);
+        box.addEventListener("click", function (e) { toggle(index, box.checked, e.shiftKey); });
+        check.appendChild(box);
+
+        var link = d.el("a", "link");
+        link.dataset.part = "link";
+        link.appendChild(d.el("span", "title", title));
+        link.appendChild(d.el("span", "host", g.siteOf(item.url)));
+        d.linkTo(link, item.url);
+
+        var remove = d.el("button", "icon-btn");
+        remove.type = "button";
+        remove.dataset.part = "remove";
+        remove.title = "Remove from history";
+        remove.setAttribute("aria-label", "Remove " + title + " from history");
+        remove.appendChild(d.icon("close"));
+        remove.addEventListener("click", function () { removeUrls([item.url]); });
+
+        row.appendChild(check);
+        row.appendChild(d.el("span", "time", g.timeLabel(item.visitedUtc)));
+        row.appendChild(d.avatar(item.title, item.url));
+        row.appendChild(link);
+        row.appendChild(remove);
+        if (box.checked) row.classList.add("is-selected");
+
+        rows.push({ item: item, row: row, box: box, link: link });
+        return row;
+    }
+
+    // Selection is by address, because removing deletes every visit to it: all the rows
+    // for one address check together, so the page shows what will actually go.
+    function toggle(index, on, extend) {
+        var from = index, to = index;
+        if (extend && state.anchor >= 0 && state.anchor < rows.length) {
+            from = Math.min(state.anchor, index);
+            to = Math.max(state.anchor, index);
+        }
+        for (var i = from; i <= to; i++) {
+            if (on) selected.add(rows[i].item.url);
+            else selected.delete(rows[i].item.url);
+        }
+        state.anchor = index;
+        rows.forEach(function (r) {
+            var picked = selected.has(r.item.url);
+            r.box.checked = picked;
+            r.row.classList.toggle("is-selected", picked);
+        });
+        updateSelection();
+    }
+
+    function updateSelection() {
+        var n = selected.size;
+        selection.hidden = n === 0;
+        clearAll.hidden = n > 0;
+        selectionCount.textContent = n === 1 ? "1 selected" : n + " selected";
+    }
+
+    function clearSelection() {
+        selected.clear();
+        state.anchor = -1;
+        rows.forEach(function (r) { r.box.checked = false; r.row.classList.remove("is-selected"); });
+        updateSelection();
+    }
+
+    var removing = false;
+    function removeUrls(urls, focusAfter) {
+        if (removing) return;
+        removing = true;
+        g.call("history.remove", { urls: urls }).then(function (result) {
+            var n = result && typeof result.removed === "number" ? result.removed : 0;
+            urls.forEach(function (u) { selected.delete(u); });
+            d.toast(n === 1 ? "Removed 1 entry from history." : "Removed " + n + " entries from history.");
+            load(focusAfter);
+        }, function (err) {
+            d.toast("Could not remove that. " + g.describeError(err));
+        }).then(function () { removing = false; });
+    }
+
+    deleteSelected.addEventListener("click", function () {
+        if (!selected.size) return;
+        var urls = Array.from(selected);
+        // One page goes straight away; several ask first. Each removes every visit to that
+        // page, a shift-click range can cover hundreds, and there is no undo.
+        if (urls.length > 1) {
+            openConfirm(urls);
+            return;
+        }
+        search.focus();
+        removeUrls(urls);
+    });
+
+    deselect.addEventListener("click", function () {
+        clearSelection();
+        clearAll.focus();
+    });
+
+    // ---------------------------------------------------------------- confirm
+
+    var confirmTitle = document.getElementById("confirm-title");
+    var confirmDetail = document.getElementById("confirm-detail");
+    // What Yes does: "clear" for all of history, or the list of pages to delete.
+    var confirming = "clear";
+
+    function openConfirm(what) {
+        confirming = what;
+        var pages = Array.isArray(what);
+        confirmTitle.textContent = pages ? "Delete " + what.length + " pages from history?" : "Clear all browsing history?";
+        confirmDetail.textContent = pages
+            ? "Every visit to each of them goes, and this cannot be undone."
+            : "Every entry goes, and this cannot be undone.";
+        confirmYes.textContent = pages ? "Delete" : "Clear history";
+        confirmBox.hidden = false;
+        confirmNo.focus();
+    }
+
+    function closeConfirm() {
+        confirmBox.hidden = true;
+        // Back where the person was, or the search box when that button is hidden now.
+        (clearAll.hidden ? search : clearAll).focus();
+    }
+
+    clearAll.addEventListener("click", function () { openConfirm("clear"); });
+    confirmNo.addEventListener("click", closeConfirm);
+    confirmBox.addEventListener("keydown", function (e) {
+        if (e.key === "Escape") { e.preventDefault(); closeConfirm(); }
+    });
+    // A flag rather than disabling the button, which would drop the keyboard focus.
+    var clearing = false;
+    confirmYes.addEventListener("click", function () {
+        if (Array.isArray(confirming)) {
+            var urls = confirming;
+            confirmBox.hidden = true;
+            search.focus();
+            removeUrls(urls);
+            return;
+        }
+        if (clearing) return;
+        clearing = true;
+        g.call("history.clear", {}).then(function () {
+            confirmBox.hidden = true;
+            selected.clear();
+            state.max = PAGE;
+            d.toast("History cleared.");
+            search.focus();
+            load();
+        }, function (err) {
+            d.toast("Could not clear history. " + g.describeError(err));
+        }).then(function () { clearing = false; });
+    });
+
+    // ---------------------------------------------------------------- search, more
+
+    var searchLater = d.debounce(function () {
+        var q = search.value.trim();
+        if (q === state.q) return;
+        state.q = q;
+        state.max = PAGE;
+        load();
+    }, 250);
+
+    search.addEventListener("input", searchLater);
+    search.addEventListener("keydown", function (e) {
+        if (e.key === "Enter") {
+            searchLater.now();
+        } else if (e.key === "Escape" && search.value) {
+            e.preventDefault();
+            e.stopPropagation();
+            search.value = "";
+            searchLater.now();
+        }
+    });
+
+    more.addEventListener("click", function () {
+        var firstNew = rows.length;
+        state.max = Math.min(state.max + PAGE, LIMIT);
+        load(rows.length ? { key: "", part: "link", index: firstNew } : null);
+    });
+
+    document.addEventListener("keydown", function (e) {
+        if (e.key === "Escape" && selected.size && confirmBox.hidden) clearSelection();
+    });
+    // Browsing in other tabs adds history, so the list catches up when it is shown again.
+    document.addEventListener("visibilitychange", function () { if (!document.hidden) load(); });
+
+    load();
+})();
+</script>
+</body>
+</html>

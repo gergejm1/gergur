@@ -20,7 +20,7 @@ public sealed class AddressBar : TextBox
 
     public AddressBar()
     {
-        BorderStyle = BorderStyle.FixedSingle;
+        BorderStyle = BorderStyle.None;   // the pill around it draws the frame
         Font = new Font("Segoe UI", 10.5f);
         BackColor = Theme.InputBg;
         ForeColor = Theme.Text;

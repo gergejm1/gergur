@@ -45,6 +45,15 @@ public static class Theme
     /// <summary>Matches the logo/home-page background so pages blend into the chrome.</summary>
     public static readonly Color PageBg = Color.FromArgb(10, 4, 6);
 
+    /// <summary>Drop-down menus: a step above the toolbar, so a menu reads as lifted off it.</summary>
+    public static readonly Color MenuBg = Color.FromArgb(30, 13, 18);
+
+    /// <summary>
+    /// The active tab. The toolbar's own colour, so the tab and the toolbar under it read as
+    /// one surface and the tab being looked at is obvious without an underline.
+    /// </summary>
+    public static readonly Color TabActiveFill = ToolbarBg;
+
     private static readonly string IconFontFamily = ResolveIconFont();
 
     private static string ResolveIconFont()
@@ -97,4 +106,7 @@ public static class Glyphs
     public const string ChevronUp = "\uE70E";
     public const string ChevronDown = "\uE70D";
     public const string Cancel = "\uE711";
+    public const string Lock = "\uE72E";
+    public const string Globe = "\uE774";
+    public const string More = "\uE712";
 }

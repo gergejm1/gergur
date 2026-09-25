@@ -52,7 +52,86 @@ public sealed class TabManager
     }
 
     /// <summary>window.open target: an activated tab whose navigation the opener drives.</summary>
-    internal async Task<Tab> CreatePopupTabAsync() => await CreateTabAsync(url: null, activate: true);
+    internal async Task<Tab> CreatePopupTabAsync(Tab? opener = null)
+    {
+        var tab = await CreateTabAsync(url: null, activate: true);
+        tab.Opener = opener;
+        return tab;
+    }
+
+    // Tabs taken out of the strip whose view is kept alive for downloads still under way,
+    // with how many of those each is waiting on.
+    private readonly Dictionary<Tab, int> _setAside = new();
+
+    /// <summary>
+    /// Takes a tab out of the strip without closing its view until <paramref name="until"/>
+    /// finishes, and puts the tab that opened it back in front. For a link that opens a new
+    /// window only to start a download: the new tab stayed behind empty, in front of the
+    /// page the person had been on. Its view is kept rather than disposed because it is
+    /// the one the download belongs to, and whether closing it would cancel the download
+    /// is not something to find out with somebody's file.
+    ///
+    /// Called again for a tab already set aside, it waits for that download too: the view
+    /// is closed only once every download it started has ended. Its handlers stay wired
+    /// for the same reason, so a second download from it is tracked like the first rather
+    /// than started with nobody listening.
+    ///
+    /// Left alone when it is the window's only tab, since taking it away would close the
+    /// window and the view with it.
+    /// </summary>
+    internal async Task SetAsideAsync(Tab tab, Task until)
+    {
+        if (_setAside.TryGetValue(tab, out int waiting))
+        {
+            _setAside[tab] = waiting + 1;
+            DisposeWhenDone(tab, until);
+            return;
+        }
+        int index = _tabs.IndexOf(tab);
+        if (index < 0 || _tabs.Count == 1)
+            return;
+        var back = tab.Opener is { } opener && _tabs.Contains(opener) ? opener : null;
+        _tabs.RemoveAt(index);
+        _setAside[tab] = 1;
+        bool wasActive = ActiveTab == tab;
+        if (wasActive)
+            ActiveTab = null;
+        tab.Deactivate();
+        if (wasActive)
+            await ActivateAsync(back ?? _tabs[Math.Min(index, _tabs.Count - 1)]);
+        else
+            RaiseChanged();
+        DisposeWhenDone(tab, until);
+    }
+
+    /// <summary>Whether this tab is out of the strip, waiting on a download.</summary>
+    internal bool IsSetAside(Tab tab) => _setAside.ContainsKey(tab);
+
+    private void DisposeWhenDone(Tab tab, Task until)
+    {
+        var here = SynchronizationContext.Current is null
+            ? TaskScheduler.Default
+            : TaskScheduler.FromCurrentSynchronizationContext();
+        _ = until.ContinueWith(
+            _ =>
+            {
+                if (!_setAside.TryGetValue(tab, out int waiting))
+                    return;
+                if (waiting > 1)
+                {
+                    _setAside[tab] = waiting - 1;
+                    return;
+                }
+                _setAside.Remove(tab);
+                tab.Dispose();
+            },
+            CancellationToken.None,
+            TaskContinuationOptions.None,
+            here);
+    }
+
+    /// <summary>How many tabs are out of the strip but not yet closed. For tests.</summary>
+    internal int SetAsideCount => _setAside.Count;
 
     private void RegisterTab(Tab tab)
     {
@@ -137,6 +216,12 @@ public sealed class TabManager
         if (wasActive)
             ActiveTab = null;
         tab.Dispose();
+        // Popups it opened stop pointing at it, or a closed tab stays reachable from each.
+        foreach (var other in _tabs.Concat(_setAside.Keys))
+        {
+            if (other.Opener == tab)
+                other.Opener = null;
+        }
 
         if (_tabs.Count == 0)
         {
@@ -168,6 +253,13 @@ public sealed class TabManager
         if (index < 0)
             return;
         _tabs.RemoveAt(index);
+        // Leaving this window: popups here stop pointing at it, and it at its opener here.
+        foreach (var other in _tabs.Concat(_setAside.Keys))
+        {
+            if (other.Opener == tab)
+                other.Opener = null;
+        }
+        tab.Opener = null;
         tab.DetachOwnerHandlers();
         bool wasActive = ActiveTab == tab;
         if (wasActive)
@@ -229,6 +321,10 @@ public sealed class TabManager
         foreach (var tab in _tabs)
             tab.Dispose();
         _tabs.Clear();
+        // The window is going, so whatever they were kept for goes with it.
+        foreach (var tab in _setAside.Keys)
+            tab.Dispose();
+        _setAside.Clear();
         ActiveTab = null;
     }
 

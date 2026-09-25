@@ -324,8 +324,79 @@ wakes it. The user's browsing is personal: read what the task requires, nothing 
   fifteen minutes, the sleep timers applying live, an agent window placed while another
   Gergur window has focus rather than a terminal, and tearing a tab off onto a monitor
   with a different scale, since every monitor on this machine is at 96 dpi.
-- An agent's own window is saved with the session when it closes and comes back at the
-  next launch like any other window, carrying whatever the agent left open in it.
+- An agent's own window (`POST /window`, `MainForm.OpenedByAgent`) is never part of the
+  person's session, and when only agent windows are left the session file is not written
+  at all (`AppSession.SessionOf`). On 2026-09-24 the person closed their own window, an
+  agent's window was then the last one, the agent closed its own last tab, the app
+  exited, and the exit saved "no windows" over the person's tabs. They were restored
+  from a backup two days old; anything newer was lost. A window stops being the agent's
+  the moment the person uses it (`ClaimForPerson`): typing in its address bar, clicking
+  its tab strip, any keyboard shortcut in it, a link from another app landing in it, or a
+  tab dragged in from their own window. Otherwise dragging all their tabs into an agent
+  window emptied their own, which saved as nothing while the tabs lived on unsaved.
+- History, Downloads and Bookmarks are pages in a tab (`Assets/history.html`,
+  `downloads.html`, `bookmarks.html`, and the new tab page `home.html`), shown in the
+  address bar as `gergur://history` and so on, which can also be typed, and saved in the
+  session by those names rather than a path into the install. They were separate
+  windows. They reach the browser only by posting web messages, and any page can post
+  one, a site included, so `InternalPages` treats a message as a request only when it
+  comes from one of those files in this install's Assets folder, by exact path, and each
+  page may ask only for what it shows: the new tab page can list bookmarks and nothing
+  else, a site can do nothing. Replies and pushes go only to the document the tab has
+  actually committed to (`Tab.ShownPage`), never by the address a navigation is heading
+  to, and never into a sleeping tab; a page reloads its list when it is shown again.
+  Pages must build their DOM with `textContent`, never `innerHTML`, since titles and urls
+  come from the sites themselves. `OwnPagesHardeningTests` checks that every op a page
+  calls is one the host answers: the bookmark Undo once called an op only the demo mode had.
+- The agent API refuses `/page`, `/html`, `/screenshot`, `/console`, `/eval`, `/click` and
+  `/type` on those pages (403). Through them it could read the whole history and bookmark
+  list, launch any downloaded file, or clear history without the page's own confirm,
+  which is the kind of reach the `/settings` refusals exist to stop. Opening them is fine.
+  Checked twice: on entry against both the address a navigation is heading to and the
+  page actually committed (`AgentServer.OwnPageRefusal`), since a navigation that never
+  commits leaves the old page on screen under a new address; and again on the UI thread
+  right before each place agent code or a capture actually runs, with nothing awaited
+  in between (`Tab.RefuseOwnPage`: ReadScriptAsync, CaptureScreenshotAsync, the
+  `chrome=1` and `/console` steps, and in `/eval` before its probe, before the statement
+  run and before the awaiting run, outside every catch), since the wait for the page
+  before that is long enough for the tab to arrive at one of these pages. That second
+  check also counts a navigation the engine has announced and not finished
+  (`NoteNavigationUnderWay`): the engine cannot commit a navigation before the UI thread
+  has handled its NavigationStarting, but it can before the UI thread has handled the
+  SourceChanged after it, and a Back click to one of these pages never moves `Url`. That
+  ordering is reasoned from the WebView2 contract (the host may cancel in
+  NavigationStarting, so the engine waits for it) and has not been exercised against an
+  engine. Back is covered only because these pages are `file://`, which Chromium's
+  back-forward cache never restores without a NavigationStarting; moved to an https
+  virtual host they would need looking at again. The decision is `Tab.RefusalFor`, unit
+  tested with every address; the order of the checks is held by source checks. Two consequences, both
+  deliberate: a tab still leaving one of these pages (where every `/window` and url-less
+  `/open` starts) is refused until the new page commits, answered 503 "still leaving"
+  rather than 403, since it is "not yet" and not "never"; and a `chrome=1` capture of any
+  tab always shows the bookmarks bar, whose titles are therefore readable to an agent
+  with the token. `/tabs` leaves out `errors` for these pages, as `/console` refuses them,
+  and reports their `url` as `gergur://history` and the like, the new tab page as
+  `gergur://newtab`: the file url is a path into the install with the account name in it.
+- A link with `target=_blank` that only starts a download used to leave an empty tab
+  behind, in front of the page it came from. That tab now leaves the strip at once and
+  the opener comes back (`TabManager.SetAsideAsync`), but its view is kept, out of sight,
+  until every download it started has ended: whether closing it would cancel a download
+  was not worth finding out with somebody's file. The exception is its window closing,
+  which disposes it with everything else. A new window that shows a page first, or that
+  its opener wrote into (a report, a print view), is not treated as empty.
+- The bookmarks bar is drawn by hand (`BookmarksBar`), not a page, so it costs a window
+  handle rather than a renderer. Ctrl+Shift+B toggles it, Ctrl+Shift+O opens the
+  bookmarks page. The status bar shows only what changes: engine memory and renderer
+  count are the tooltip of its right-hand items (`ShowItemToolTips`, off by default on a
+  StatusStrip, which is why an earlier error tooltip never showed either).
+- A `bookmarks.json` that is there but cannot be read or parsed at startup (or parses into
+  entries with no url or title, such as `[null]`, which the bar would throw on) loads as an
+  empty list, and every change that run is refused (`BookmarkStore.UnreadableException`),
+  the same rule as `settings.json`. It used to be saved over by the next bookmark, and
+  this sprint gave it four more writers. The first refusal in a run is a box, later ones
+  the status bar; the bookmarks page and the new tab page say it could not be read rather
+  than "No bookmarks yet". The bar is simply empty. A file that is not there yet, or is
+  empty, is not unreadable: there is nothing in it to lose.
 - Settings: `%LOCALAPPDATA%\Gergur\settings.json`, or `GET`/`POST /settings` while it
   runs. Engine flags (VPN, process policy) apply only on a fresh engine start, and
   `restartNeededFor` in the response names the ones that have not taken effect yet
@@ -398,7 +469,20 @@ wakes it. The user's browsing is personal: read what the task requires, nothing 
   that were served one. `adblock.test.js` covers the pruning and drives the skip timer
   against a stub page; what has never run in a browser is the skip itself, because on
   every verified load the ad was gone before anything rendered. Green loads are
-  evidence for the pruning and say nothing about the skip.
+  evidence for the pruning and say nothing about the skip. On 2026-09-24, with page ad
+  cleanup switched off so an ad did render, an emulation of the skip path (mute, press
+  skip, seek the ad to its end) cleared the ad in about a second and then the film never
+  started, three of three: the seek to the end wedges the player on these loads.
+- The ~12 second wait before a YouTube video starts is YouTube's server, not this
+  browser, measured 2026-09-24. The session is flagged as blocking ads (every page carries
+  `bkaEnforcementMessageViewModel`), and on loads where an ad was scheduled the player's
+  first SABR `videoplayback` response carries no media and a backoff of about 12000 ms
+  (the NEXT_REQUEST_POLICY part), which the server enforces: asked early, it answers with
+  the time still remaining. Loads with no ad start in under a second. What ships is
+  already the fastest option measured: about 16 s to the film, against about 21 s for
+  letting the ad play, and never for skipping it. What might lift the flag is upstream
+  of the page and untested: the WARP exit, or the blocklist killing YouTube's
+  `ad_status.js` probe, which would likely trade the wait for an ad.
 - `home.html` asks for its icon at `favicon.png?v=<token>`, where the token is the first
   eight hex of that icon's sha256, and `HomePageIconTests` fails when the two disagree.
   The engine caches favicons per profile keyed on the icon url, and that cache sits

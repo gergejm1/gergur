@@ -17,6 +17,15 @@ public sealed class ShortcutRouter
     /// <summary>Returns true when the key is ours; the caller marks the event handled.</summary>
     public bool Handle(Keys keyData)
     {
+        // A shortcut is always a person at the keyboard, so the window is theirs now.
+        bool handled = Route(keyData);
+        if (handled)
+            _form.ClaimForPerson();
+        return handled;
+    }
+
+    private bool Route(Keys keyData)
+    {
         // Work is queued via BeginInvoke: WebView2 blocks the browser process while
         // KeyDown handlers run, and some of its APIs throw if called inline here.
         switch (keyData)
@@ -27,6 +36,12 @@ public sealed class ShortcutRouter
             case Keys.Control | Keys.W:
             case Keys.Control | Keys.F4:
                 Post(() => _form.CloseActiveTabAsync());
+                return true;
+            case Keys.Control | Keys.Shift | Keys.B:
+                Post(_form.ToggleBookmarksBar);
+                return true;
+            case Keys.Control | Keys.Shift | Keys.O:
+                Post(_form.OpenBookmarks);
                 return true;
             case Keys.Control | Keys.Shift | Keys.T:
                 Post(() => _form.ReopenClosedTabAsync());

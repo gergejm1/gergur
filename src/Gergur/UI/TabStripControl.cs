@@ -10,7 +10,7 @@ namespace Gergur.UI;
 /// </summary>
 public sealed class TabStripControl : Control
 {
-    private const int MaxTabWidth = 220;
+    private const int MaxTabWidth = 240;
     private const int MinTabWidth = 56;
 
     private TabManager? _tabs;
@@ -110,10 +110,11 @@ public sealed class TabStripControl : Control
         _closeRects.Clear();
 
         var tabs = _tabs?.Tabs;
-        int newTabSize = S(26);
-        int margin = S(6);
-        int y = S(5);
-        int tabHeight = Height - y - S(3);
+        int newTabSize = S(28);
+        int margin = S(8);
+        int y = S(7);
+        // Down to the bottom edge, so the active tab runs straight into the toolbar.
+        int tabHeight = Height - y;
 
         int count = tabs?.Count ?? 0;
         int available = Width - newTabSize - margin * 3;
@@ -123,16 +124,27 @@ public sealed class TabStripControl : Control
         g.SmoothingMode = SmoothingMode.AntiAlias;
         if (tabs is not null)
         {
+            int activeIndex = _tabs?.ActiveTab is { } active ? IndexOf(tabs, active) : -1;
             for (int i = 0; i < tabs.Count; i++)
             {
-                var rect = new Rectangle(x, y, tabWidth - S(4), tabHeight);
+                var rect = new Rectangle(x, y, tabWidth, tabHeight);
                 _tabRects.Add(rect);
                 DrawTab(g, tabs[i], rect, i);
+                // A hairline between two tabs that are both idle. Not beside the active or
+                // hovered tab, whose own shape already separates it.
+                bool edgeIsQuiet = i < tabs.Count - 1
+                    && i != activeIndex && i + 1 != activeIndex
+                    && i != _hoverIndex && i + 1 != _hoverIndex;
+                if (edgeIsQuiet)
+                {
+                    using var pen = new Pen(Theme.Border);
+                    g.DrawLine(pen, rect.Right, rect.Top + S(10), rect.Right, rect.Bottom - S(10));
+                }
                 x += tabWidth;
             }
         }
 
-        _newTabRect = new Rectangle(x + S(2), y + (tabHeight - newTabSize) / 2, newTabSize, newTabSize);
+        _newTabRect = new Rectangle(x + S(6), y + (tabHeight - newTabSize) / 2 - S(2), newTabSize, newTabSize);
         DrawNewTabButton(g);
 
         // Drop indicator: a vertical accent bar at the insertion point while dragging.
@@ -172,19 +184,28 @@ public sealed class TabStripControl : Control
         bool isHover = index == _hoverIndex;
         bool isSleeping = tab.State is TabState.Suspended or TabState.Discarded;
 
-        var fill = isActive ? Theme.TabActive : isHover ? Theme.TabHover : Theme.TabBg;
-        using (var path = RoundedRect(rect, S(6)))
-        using (var brush = new SolidBrush(fill))
-        {
-            g.FillPath(brush, path);
-        }
         if (isActive)
         {
-            using var pen = new Pen(Theme.Accent, S(2));
-            g.DrawLine(pen, rect.Left + S(6), rect.Bottom - 1, rect.Right - S(6), rect.Bottom - 1);
+            // Rounded at the top and square at the bottom edge, in the toolbar's colour, so
+            // the tab and the toolbar under it are one surface.
+            using var path = TopRounded(rect, S(9));
+            using var brush = new SolidBrush(Theme.TabActiveFill);
+            g.FillPath(brush, path);
+            // The crimson mark that says which tab this is, short and centred on the top.
+            int markWidth = Math.Min(S(28), rect.Width / 3);
+            using var mark = new SolidBrush(Theme.Accent);
+            using var markPath = RoundedRect(new Rectangle(rect.Left + (rect.Width - markWidth) / 2, rect.Top, markWidth, S(3)), S(1));
+            g.FillPath(mark, markPath);
+        }
+        else if (isHover)
+        {
+            var lifted = Rectangle.FromLTRB(rect.Left + S(3), rect.Top + S(3), rect.Right - S(3), rect.Bottom - S(6));
+            using var path = RoundedRect(lifted, S(8));
+            using var brush = new SolidBrush(Theme.TabBg);
+            g.FillPath(brush, path);
         }
 
-        int pad = S(8);
+        int pad = S(12);
         int iconSize = S(16);
         int textLeft = rect.Left + pad;
 
@@ -192,7 +213,8 @@ public sealed class TabStripControl : Control
         {
             try
             {
-                var iconRect = new Rectangle(rect.Left + pad, rect.Top + (rect.Height - iconSize) / 2, iconSize, iconSize);
+                int visible = isActive ? rect.Height : rect.Height - S(3);
+                var iconRect = new Rectangle(rect.Left + pad, rect.Top + (visible - iconSize) / 2, iconSize, iconSize);
                 g.DrawImage(favicon, iconRect);
                 textLeft = iconRect.Right + S(6);
             }
@@ -204,7 +226,7 @@ public sealed class TabStripControl : Control
         Rectangle closeRect = Rectangle.Empty;
         if (showClose && rect.Width >= S(70))
         {
-            closeRect = new Rectangle(rect.Right - closeSize - S(6), rect.Top + (rect.Height - closeSize) / 2, closeSize, closeSize);
+            closeRect = new Rectangle(rect.Right - closeSize - S(9), rect.Top + (rect.Height - closeSize) / 2 - (isActive ? 0 : S(1)), closeSize, closeSize);
             bool closeHovered = isHover && _hoverClose;
             if (closeHovered)
             {
@@ -235,9 +257,12 @@ public sealed class TabStripControl : Control
             title = "♪ " + title; // ♪
 
         int textRight = closeRect.IsEmpty ? rect.Right - pad : closeRect.Left - S(4);
-        var textRect = Rectangle.FromLTRB(textLeft, rect.Top, Math.Max(textLeft + 1, textRight), rect.Bottom);
+        // Centred on the part of the tab that shows, above the lip an idle one keeps clear.
+        int textBottom = isActive ? rect.Bottom : rect.Bottom - S(3);
+        var textRect = Rectangle.FromLTRB(textLeft, rect.Top, Math.Max(textLeft + 1, textRight), textBottom);
+        // Idle tabs are a step quieter than the one being looked at, so the eye lands there.
         TextRenderer.DrawText(g, title, Font, textRect,
-            isSleeping ? Theme.TextDim : Theme.Text,
+            isSleeping || !(isActive || isHover) ? Theme.TextDim : Theme.Text,
             TextFormatFlags.EndEllipsis | TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.NoPrefix);
     }
 
@@ -245,7 +270,7 @@ public sealed class TabStripControl : Control
     {
         if (_hoverNewTab)
         {
-            using var brush = new SolidBrush(Theme.TabHover);
+            using var brush = new SolidBrush(Theme.TabBg);
             g.FillEllipse(brush, _newTabRect);
         }
         using var pen = new Pen(Theme.Text, Math.Max(1.4f, S(3) / 2f))
@@ -258,6 +283,26 @@ public sealed class TabStripControl : Control
         int cy = _newTabRect.Top + _newTabRect.Height / 2;
         g.DrawLine(pen, inner.Left, cy, inner.Right, cy);
         g.DrawLine(pen, cx, inner.Top, cx, inner.Bottom);
+    }
+
+    /// <summary>Rounded top corners, square bottom ones: a tab sitting on the toolbar.</summary>
+    private static GraphicsPath TopRounded(Rectangle rect, int radius)
+    {
+        var path = new GraphicsPath();
+        int d = radius * 2;
+        path.AddArc(rect.X, rect.Y, d, d, 180, 90);
+        path.AddArc(rect.Right - d, rect.Y, d, d, 270, 90);
+        path.AddLine(rect.Right, rect.Bottom, rect.X, rect.Bottom);
+        path.CloseFigure();
+        return path;
+    }
+
+    private static int IndexOf(IReadOnlyList<Tab> tabs, Tab tab)
+    {
+        for (int i = 0; i < tabs.Count; i++)
+            if (tabs[i] == tab)
+                return i;
+        return -1;
     }
 
     private static GraphicsPath RoundedRect(Rectangle rect, int radius)

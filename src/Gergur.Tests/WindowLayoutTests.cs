@@ -66,18 +66,10 @@ public sealed class WindowLayoutTests
     }
 
     [Fact]
-    public void DownloadsFooterButtonsAreNeverClipped() => OnSta(() =>
-    {
-        using var form = new DownloadsForm(new DownloadManager());
-        _ = form.Handle; // realise the handle so DeviceDpi and docking are meaningful
-        AssertFooterFits(form, form.FooterControls, form.LayoutFooter);
-    });
-
-    [Fact]
     public void SettingsFooterButtonsAreNeverClipped() => OnSta(() =>
     {
         using var form = new SettingsForm(new Settings());
-        _ = form.Handle;
+        _ = form.Handle; // realise the handle so DeviceDpi and docking are meaningful
         AssertFooterFits(form, form.FooterControls, form.LayoutFooter);
     });
 
@@ -92,19 +84,6 @@ public sealed class WindowLayoutTests
             AssertFooterFits(form, form.FooterControls, form.LayoutFooter);
         }
         finally { try { Directory.Delete(root, recursive: true); } catch { } }
-    });
-
-    [Fact]
-    public void HistoryFooterButtonsAreNeverClipped() => OnSta(() =>
-    {
-        string path = Path.Combine(Path.GetTempPath(), $"gergur-layout-{Guid.NewGuid():N}.jsonl");
-        try
-        {
-            using var form = new HistoryForm(new HistoryStore(path), _ => { });
-            _ = form.Handle;
-            AssertFooterFits(form, form.FooterControls, form.LayoutFooter);
-        }
-        finally { try { File.Delete(path); } catch { } }
     });
 }
 

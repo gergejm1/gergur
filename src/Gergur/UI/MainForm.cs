@@ -4,6 +4,7 @@ using Gergur.Data;
 using Gergur.Diagnostics;
 using Gergur.Tabs;
 using Microsoft.Web.WebView2.Core;
+using System.Text.Json;
 // (DebugLog trace calls are dev-only; enabled via GERGUR_DEBUG=1)
 
 namespace Gergur.UI;
@@ -22,8 +23,12 @@ public sealed class MainForm : Form
 
     private AppSession? _session;
     private TabLifecycleManager? _lifecycle;
-    private HistoryForm? _historyWindow;
-    private DownloadsForm? _downloadsWindow;
+    // Coalesces live updates to the browser's own pages. A download reports progress many
+    // times a second, and each report would otherwise post the whole list to every
+    // Downloads tab.
+    private readonly System.Windows.Forms.Timer _pagePushTimer = new() { Interval = 250 };
+    private bool _downloadsPushPending;
+    private bool _bookmarksPushPending;
     private DropForm? _dropWindow;
     private NotifyIcon? _tray;
     private bool _closing;
@@ -37,6 +42,21 @@ public sealed class MainForm : Form
 
     public TabManager? Tabs { get; private set; }
 
+    /// <summary>
+    /// Opened by an agent through /window. Its tabs are the agent's work, so they are never
+    /// saved as the person's session: see <see cref="AppSession.SessionOf"/>.
+    /// </summary>
+    internal bool OpenedByAgent { get; private set; }
+
+    /// <summary>
+    /// The person has used this window, so it is theirs from now on and its tabs are their
+    /// session. Called from what only a person does: typing in the address bar, clicking
+    /// the tab strip, a keyboard shortcut, a link from another app, or dragging in a tab
+    /// from a window of their own. Without it, dragging every tab into an agent's window
+    /// emptied their own, which then saved as "no tabs" while the tabs lived on unsaved.
+    /// </summary>
+    internal void ClaimForPerson() => OpenedByAgent = false;
+
     private TabStripControl _tabStrip = null!;
     private Panel _toolbar = null!;
     private GlyphButton _backButton = null!;
@@ -49,6 +69,8 @@ public sealed class MainForm : Form
     private FindBar _findBar = null!;
     private Panel _hostPanel = null!;
     private StatusStrip _statusStrip = null!;
+    private AddressPill _addressPill = null!;
+    private BookmarksBar _bookmarksBar = null!;
     private ToolStripStatusLabel _messageLabel = null!;
     private ToolStripStatusLabel _errorLabel = null!;
     private ToolStripStatusLabel _vpnLabel = null!;
@@ -86,7 +108,7 @@ public sealed class MainForm : Form
     /// </summary>
     internal static async Task<MainForm> OpenWindowAsync(AppSession session, bool focus)
     {
-        var window = new MainForm(session, null, isSecondaryWindow: true, restore: null);
+        var window = new MainForm(session, null, isSecondaryWindow: true, restore: null) { OpenedByAgent = true };
         if (focus)
         {
             window.Show();
@@ -184,17 +206,17 @@ public sealed class MainForm : Form
 
         _hostPanel = new Panel { Dock = DockStyle.Fill, BackColor = Theme.WindowBg };
 
-        _tabStrip = new TabStripControl { Dock = DockStyle.Top, Height = 46, Font = new Font("Segoe UI", 9.5f) };
-        _tabStrip.TabClicked += async (_, tab) => { await ActivateTabAsync(tab); };
+        _tabStrip = new TabStripControl { Dock = DockStyle.Top, Height = 42, Font = new Font("Segoe UI", 9.5f) };
+        _tabStrip.TabClicked += async (_, tab) => { ClaimForPerson(); await ActivateTabAsync(tab); };
         _tabStrip.TabCloseClicked += async (_, tab) => { await CloseTabAsync(tab); };
-        _tabStrip.NewTabClicked += (_, _) => _ = NewTabAsync();
+        _tabStrip.NewTabClicked += (_, _) => { ClaimForPerson(); _ = NewTabAsync(); };
         _tabStrip.TabReordered += (_, move) => Tabs?.MoveTab(move.From, move.To);
         _tabStrip.TabTornOff += (_, drop) => _ = DropTabAsync(drop.Tab, drop.ScreenLocation);
         _tabStrip.TabDragMoved += (_, screen) => UpdateDropIndicators(screen);
         _tabStrip.TabDragEnded += (_, _) => ClearDropIndicators();
         _tabStrip.IsOverAnotherStrip = screen => DropTargetAt(screen) is not null;
 
-        _toolbar = new Panel { Dock = DockStyle.Top, Height = 40, BackColor = Theme.ToolbarBg };
+        _toolbar = new Panel { Dock = DockStyle.Top, Height = 46, BackColor = Theme.ToolbarBg };
         _backButton = MakeToolButton(Glyphs.Back, 8);
         _forwardButton = MakeToolButton(Glyphs.Forward, 44);
         _reloadButton = MakeToolButton(Glyphs.Refresh, 80);
@@ -209,11 +231,12 @@ public sealed class MainForm : Form
             SearchUrlTemplate = _settings.SearchUrlTemplate,
         };
         _addressBar.Width = _toolbar.Width; // corrected after toolbar is sized
+        _addressPill = new AddressPill(_addressBar);
         _addressBar.SuggestionProvider = () => _session?.History.GetSuggestions() ?? Array.Empty<string>();
-        _addressBar.NavigationRequested += async (_, url) => await NavigateActiveAsync(url);
+        _addressBar.NavigationRequested += async (_, url) => { ClaimForPerson(); await NavigateActiveAsync(url); };
         _addressBar.Escaped += (_, _) =>
         {
-            _addressBar.Text = Tabs?.ActiveTab?.Url ?? "";
+            _addressBar.Text = AddressFor(Tabs?.ActiveTab);
             Tabs?.ActiveTab?.FocusPage();
         };
 
@@ -228,15 +251,44 @@ public sealed class MainForm : Form
         _menuButton.Click += (_, _) => ShowMainMenu();
 
         _toolbar.Controls.AddRange(
-            [_backButton, _forwardButton, _reloadButton, _addressBar,
+            [_backButton, _forwardButton, _reloadButton, _addressPill,
              _downloadsButton, _bookmarkButton, _menuButton]);
         _toolbar.Resize += (_, _) => LayoutToolbar();
+        // The hairline between the chrome and the page, drawn here when the bookmarks bar is
+        // hidden, since then the toolbar is the chrome's bottom edge.
+        _toolbar.Paint += (_, e) =>
+        {
+            if (_bookmarksBar is { Visible: true })
+                return;
+            using var edge = new Pen(Theme.TabStripBg);
+            e.Graphics.DrawLine(edge, 0, _toolbar.Height - 1, _toolbar.Width, _toolbar.Height - 1);
+        };
+
+        _bookmarksBar = new BookmarksBar { Dock = DockStyle.Top, Height = 32, Visible = _settings.ShowBookmarksBar };
+        _bookmarksBar.OpenRequested += (_, open) => _ = OpenBookmarkAsync(open.Url, open.NewTab);
+        _bookmarksBar.RemoveRequested += (_, url) =>
+        {
+            try { _session?.Bookmarks.Remove(url); }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // A menu click has nothing above it to catch this.
+                SayBookmarkNotSaved(ex, "The bookmark could not be removed: something else has the bookmarks file open.");
+            }
+        };
+        _bookmarksBar.ManageRequested += (_, _) => OpenBookmarks();
+        _bookmarksBar.HideRequested += (_, _) => ToggleBookmarksBar();
+        _bookmarksBar.VisibleChanged += (_, _) => _toolbar.Invalidate();   // it owns the bottom hairline now
 
         _statusStrip = new StatusStrip
         {
             BackColor = Theme.TabStripBg,
             ForeColor = Theme.TextDim,
             SizingGrip = false,
+            Renderer = new ChromeRenderer(),
+            Padding = new Padding(6, 0, 10, 0),
+            // Off by default on a StatusStrip, unlike every other ToolStrip. Without it the
+            // memory figures below, and the error list, were set as tooltips nobody could see.
+            ShowItemToolTips = true,
         };
         _messageLabel = new ToolStripStatusLabel { Spring = true, TextAlign = ContentAlignment.MiddleLeft, ForeColor = Theme.TextDim };
         _errorLabel = new ToolStripStatusLabel
@@ -247,11 +299,13 @@ public sealed class MainForm : Form
             ToolTipText = "Click to open DevTools",
         };
         _errorLabel.Click += (_, _) => Tabs?.ActiveTab?.OpenDevTools();
-        _vpnLabel = new ToolStripStatusLabel { ForeColor = Theme.Accent };
+        _vpnLabel = new ToolStripStatusLabel { ForeColor = Theme.Accent, Padding = new Padding(8, 0, 0, 0) };
         _memoryLabel = new ToolStripStatusLabel { ForeColor = Theme.TextDim };
         _sleepLabel = new ToolStripStatusLabel { ForeColor = Theme.TextDim };
         _blockedLabel = new ToolStripStatusLabel { ForeColor = Theme.TextDim };
-        _statusStrip.Items.AddRange([_messageLabel, _errorLabel, _vpnLabel, _sleepLabel, _blockedLabel, _memoryLabel]);
+        // The engine's memory and renderer count are for whoever wants them, not for every
+        // glance at the window: they ride along as the tooltip of the items still shown.
+        _statusStrip.Items.AddRange([_messageLabel, _errorLabel, _vpnLabel, _sleepLabel, _blockedLabel]);
 
         _findBar = new FindBar();
         _findBar.TermChanged += (_, term) => _ = Tabs?.ActiveTab?.FindAsync(term) ?? Task.CompletedTask;
@@ -264,6 +318,7 @@ public sealed class MainForm : Form
         Controls.Add(_hostPanel);
         Controls.Add(_statusStrip);
         Controls.Add(_findBar);
+        Controls.Add(_bookmarksBar);
         Controls.Add(_toolbar);
         Controls.Add(_tabStrip);
 
@@ -283,16 +338,107 @@ public sealed class MainForm : Form
     }
 
     private GlyphButton MakeToolButton(string glyph, int x)
-        => new(glyph) { Location = new Point(x, 5) };
+        => new(glyph) { Location = new Point(x, 7) };
 
     private void OnDownloadsChanged(object? sender, EventArgs e)
     {
         if (InvokeRequired)
         {
-            BeginInvoke(UpdateDownloadsButton);
+            BeginInvoke(() => OnDownloadsChanged(sender, e));
             return;
         }
         UpdateDownloadsButton();
+        _downloadsPushPending = true;
+        _pagePushTimer.Start();
+    }
+
+    private void OnBookmarksChanged(object? sender, EventArgs e)
+    {
+        if (InvokeRequired)
+        {
+            BeginInvoke(() => OnBookmarksChanged(sender, e));
+            return;
+        }
+        UpdateChrome();   // the star
+        if (_session is not null)
+            _bookmarksBar.SetBookmarks(_session.Bookmarks.Items);
+        _bookmarksPushPending = true;
+        _pagePushTimer.Start();
+    }
+
+    /// <summary>
+    /// Tells this window's open Downloads, Bookmarks and new tab pages what changed. The
+    /// Downloads page gets the list itself; the others are told to ask again.
+    /// </summary>
+    private void PushToOwnPages()
+    {
+        _pagePushTimer.Stop();
+        if (_session is null || Tabs is null)
+            return;
+        bool downloadsDue = _downloadsPushPending, bookmarksDue = _bookmarksPushPending;
+        _downloadsPushPending = _bookmarksPushPending = false;
+        string? downloads = null;
+        foreach (var tab in Tabs.Tabs)
+        {
+            // Not into a sleeping tab: calls into a suspended view can wake it, and a download
+            // reports four times a second. The page asks again when it is shown.
+            if (tab.State == TabState.Suspended)
+                continue;
+            switch (tab.ShownPage)
+            {
+                case InternalPages.Page.Downloads when downloadsDue:
+                    // Built only once there is a Downloads page to send it to.
+                    downloads ??= JsonSerializer.Serialize(new { @event = "downloads", items = _session.Downloads.Items.Select(InternalPages.Describe).ToArray() });
+                    tab.PostToPage(downloads, InternalPages.Page.Downloads);
+                    break;
+                case InternalPages.Page.Bookmarks or InternalPages.Page.Home when bookmarksDue:
+                    tab.PostToPage("""{"event":"bookmarks"}""", tab.ShownPage!.Value);
+                    break;
+            }
+        }
+    }
+
+    /// <summary>
+    /// What the address bar shows for a tab: nothing for the new tab page, so it is ready to
+    /// type in, gergur://history and the like for the browser's own pages rather than a
+    /// file path into the build output, and the url for everything else.
+    /// </summary>
+    private static string AddressFor(Tab? tab)
+    {
+        if (tab is null || HomePage.IsHome(tab.Url))
+            return "";
+        return InternalPages.Identify(tab.Url) is { } page ? InternalPages.AddressOf(page) : tab.Url;
+    }
+
+    /// <summary>
+    /// Shows one of the browser's own pages: the tab already showing it in this window if
+    /// there is one, a new tab otherwise. Opening History twice used to give two windows'
+    /// worth of the same list; now it is one tab, like any other browser.
+    /// </summary>
+    private async Task OpenOwnPageAsync(InternalPages.Page page)
+    {
+        if (Tabs is null)
+            return;
+        if (Tabs.Tabs.FirstOrDefault(t => t.ShownPage == page) is { } open)
+        {
+            await Tabs.ActivateAsync(open);
+            return;
+        }
+        await Tabs.CreateTabAsync(InternalPages.UrlOf(page));
+    }
+
+    /// <summary>What the browser's own page in this tab may act on.</summary>
+    private InternalPages.Services? PageServicesFor(Tab tab)
+    {
+        if (_session is null || Tabs is not { } manager)
+            return null;
+        return new InternalPages.Services(
+            _session.History,
+            _session.Bookmarks,
+            _session.Downloads,
+            // A plain click replaces the page in its own tab; Ctrl or middle click opens a
+            // tab behind it, as a link does anywhere else.
+            (url, newTab) => _ = newTab ? (Task)manager.CreateTabAsync(url, activate: false) : tab.NavigateAsync(url));
     }
 
     /// <summary>The running count the button is currently painted for.</summary>
@@ -348,8 +494,9 @@ public sealed class MainForm : Form
         for (int i = 0; i < rightHand.Length; i++)
             rightHand[i].Location = new Point(lefts[i], (_toolbar.Height - rightHand[i].Height) / 2);
 
-        _addressBar.Location = new Point(Scaled(120), (_toolbar.Height - _addressBar.Height) / 2);
-        _addressBar.Width = Math.Max(Scaled(100), lefts[^1] - gap - _addressBar.Left);
+        _addressPill.Height = Scaled(34);
+        _addressPill.Location = new Point(Scaled(124), (_toolbar.Height - _addressPill.Height) / 2);
+        _addressPill.Width = Math.Max(Scaled(100), lefts[^1] - Scaled(8) - _addressPill.Left);
     }
 
     /// <summary>
@@ -379,7 +526,7 @@ public sealed class MainForm : Form
 
     private void BuildMenu()
     {
-        _menu = new ContextMenuStrip();
+        _menu = new ContextMenuStrip { Renderer = new ChromeRenderer() };
         RebuildMenuItems();
     }
 
@@ -400,6 +547,11 @@ public sealed class MainForm : Form
 
         var bookmarks = new ToolStripMenuItem("Bookmarks");
         bookmarks.DropDownItems.Add(new ToolStripMenuItem("Bookmark this page\tCtrl+D", null, (_, _) => ToggleBookmark()));
+        bookmarks.DropDownItems.Add(new ToolStripMenuItem("Show bookmarks bar\tCtrl+Shift+B", null, (_, _) => ToggleBookmarksBar())
+        {
+            Checked = _settings.ShowBookmarksBar,
+        });
+        bookmarks.DropDownItems.Add(new ToolStripMenuItem("Manage bookmarks\tCtrl+Shift+O", null, (_, _) => OpenBookmarks()));
         if (_session is { Bookmarks.Items.Count: > 0 })
         {
             bookmarks.DropDownItems.Add(new ToolStripSeparator());
@@ -512,7 +664,10 @@ public sealed class MainForm : Form
             // runs: the downloads are shared across windows, so the button that reports
             // them has to be live in every one of them.
             session.Downloads.Changed += OnDownloadsChanged;
+            session.Bookmarks.Changed += OnBookmarksChanged;
+            _bookmarksBar.SetBookmarks(session.Bookmarks.Items);
             UpdateDownloadsButton();
+            _pagePushTimer.Tick += (_, _) => PushToOwnPages();
 
             Tabs = new TabManager(session.Env, _hostPanel, session.Blocker);
             Tabs.Changed += (_, _) => UpdateChrome();
@@ -640,6 +795,7 @@ public sealed class MainForm : Form
             if (window.WindowState == FormWindowState.Minimized)
                 window.WindowState = FormWindowState.Normal;
             window.Activate();
+            window.ClaimForPerson();
             _ = window.NewTabAsync(UrlHeuristics.ToNavigableUrl(url, window._settings.SearchUrlTemplate));
         });
     }
@@ -652,7 +808,9 @@ public sealed class MainForm : Form
         Tab? toActivate = null;
         for (int i = 0; i < window.Tabs.Count; i++)
         {
-            var tab = Tabs.AddSnapshotTab(new TabSnapshot(window.Tabs[i].Url, window.Tabs[i].Title));
+            // gergur:// names back into this install's own pages; anything else as it was.
+            string url = InternalPages.Resolve(window.Tabs[i].Url) ?? window.Tabs[i].Url;
+            var tab = Tabs.AddSnapshotTab(new TabSnapshot(url, window.Tabs[i].Title));
             if (i == window.ActiveIndex)
                 toActivate = tab;
         }
@@ -775,6 +933,8 @@ public sealed class MainForm : Form
         if (Tabs is null || from.Tabs is null)
             return;
         bool sourceEmpties = from.Tabs.Tabs.Count == 1;
+        if (!from.OpenedByAgent)
+            ClaimForPerson();   // their tab, so their window now
 
         await from.Tabs.ReleaseAsync(tab);
         Tabs.Adopt(tab);
@@ -809,6 +969,7 @@ public sealed class MainForm : Form
         // OnFormClosing, because that one can still be cancelled, and a live window with
         // a disposed menu would throw on the next click of the button.
         _menu.Dispose();
+        _memoryLabel.Dispose();   // in no strip now, so nothing else disposes it
         base.OnFormClosed(e);
     }
 
@@ -831,7 +992,10 @@ public sealed class MainForm : Form
         {
             _session.Drop.ItemAdded -= OnDropItemArrived;
             _session.Downloads.Changed -= OnDownloadsChanged;
+            _session.Bookmarks.Changed -= OnBookmarksChanged;
         }
+        _pagePushTimer.Stop();
+        _pagePushTimer.Dispose();
 
         Tabs?.DisposeAll(); // engine processes exit promptly once the last WebView is gone
         _session?.RemoveWindow(this); // stops the agent and tunnel when this was the last
@@ -1102,12 +1266,32 @@ public sealed class MainForm : Form
         // A sign-in popup closing itself is the normal end of an OAuth handshake.
         // It still goes on the reopen stack, so a surprise close is one Ctrl+Shift+T away.
         tab.CloseRequested += (_, _) => _ = CloseTabAsync(tab);
+        tab.PageRequest += (_, request) =>
+        {
+            if (PageServicesFor(tab) is { } services)
+                tab.PostToPage(InternalPages.Answer(request.Page, request.Json, services), request.Page);
+        };
         tab.DownloadStarted += (_, operation) =>
         {
             if (_session is null)
                 return;
             var item = _session.Downloads.Track(operation);
             ShowMessage($"Downloading {item.FileName}…");
+            if (Tabs is { } manager
+                && (manager.IsSetAside(tab) || Tab.OnlyOpenedForADownload(tab.Opener is not null, tab.Url, tab.Title)))
+            {
+                // Its view stays alive, out of sight, until the download is done with.
+                var finished = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                item.Changed += (_, _) =>
+                {
+                    if (!item.IsRunning)
+                        finished.TrySetResult();
+                };
+                if (!item.IsRunning)
+                    finished.TrySetResult();
+                // After the engine's event has returned, not inside it.
+                BeginInvoke(() => _ = manager.SetAsideAsync(tab, finished.Task));
+            }
             item.Changed += (_, _) =>
             {
                 if (!item.IsRunning && !_closing)
@@ -1218,7 +1402,7 @@ public sealed class MainForm : Form
         {
             _preFullScreenState = WindowState;
             _preFullScreenBorder = FormBorderStyle;
-            _tabStrip.Visible = _toolbar.Visible = _statusStrip.Visible = false;
+            _tabStrip.Visible = _toolbar.Visible = _statusStrip.Visible = _bookmarksBar.Visible = false;
             _findBar.Visible = false;
             FormBorderStyle = FormBorderStyle.None;
             // Maximized -> Maximized does not re-apply the new border style, so drop out first.
@@ -1230,6 +1414,7 @@ public sealed class MainForm : Form
             FormBorderStyle = _preFullScreenBorder;
             WindowState = _preFullScreenState;
             _tabStrip.Visible = _toolbar.Visible = _statusStrip.Visible = true;
+            _bookmarksBar.Visible = _settings.ShowBookmarksBar;
         }
     }
 
@@ -1247,7 +1432,10 @@ public sealed class MainForm : Form
         // Skip the URL refresh only when the user is actively editing the address bar,
         // never when a tab close incidentally parked focus here (forceAddressBar).
         if (forceAddressBar || !_addressBar.Focused)
-            _addressBar.Text = active is null || HomePage.IsHome(active.Url) ? "" : active.Url;
+            _addressBar.Text = AddressFor(active);
+        // The committed page, not an address still loading: a typed https url would otherwise
+        // show the lock over the http page still on screen, and keep it if the load stopped.
+        _addressPill.Secure = active?.CommittedUrl.StartsWith("https://", StringComparison.OrdinalIgnoreCase) == true;
         _backButton.Enabled = active?.CanGoBack ?? false;
         _forwardButton.Enabled = active?.CanGoForward ?? false;
         bool bookmarked = active is not null && _session?.Bookmarks.Contains(active.Url) == true;
@@ -1349,18 +1537,32 @@ public sealed class MainForm : Form
     public void OpenDevTools() => Tabs?.ActiveTab?.OpenDevTools();
 
     /// <summary>Modeless so browsing continues behind it; one window, reused.</summary>
-    public void OpenHistory()
+    public void OpenHistory() => _ = OpenOwnPageAsync(InternalPages.Page.History);
+
+    public void OpenBookmarks() => _ = OpenOwnPageAsync(InternalPages.Page.Bookmarks);
+
+    /// <summary>Shows or hides the bookmarks bar in every window, and remembers which.</summary>
+    public void ToggleBookmarksBar()
     {
-        if (_historyWindow is { IsDisposed: false })
+        _settings.ShowBookmarksBar = !_settings.ShowBookmarksBar;
+        // Just the bars, not ApplyLiveSettings, which would push every page setting into
+        // every tab of every window to show or hide one strip.
+        foreach (var window in _session?.Windows ?? [this])
         {
-            _historyWindow.Activate();
-            return;
+            if (!window._isPageFullScreen)
+                window._bookmarksBar.Visible = _settings.ShowBookmarksBar;
         }
-        if (_session is null)
+        SaveSettingsOrSay(StillInForce);
+    }
+
+    private async Task OpenBookmarkAsync(string url, bool newTab)
+    {
+        if (Tabs is null)
             return;
-        _historyWindow = new HistoryForm(_session.History, url => _ = NewTabAsync(url));
-        _historyWindow.FormClosed += (_, _) => _historyWindow = null;
-        _historyWindow.Show(this);
+        if (newTab)
+            await Tabs.CreateTabAsync(url, activate: false);
+        else
+            await NavigateActiveAsync(url);
     }
 
     /// <summary>
@@ -1385,6 +1587,8 @@ public sealed class MainForm : Form
         foreach (var window in session.Windows)
         {
             window._addressBar.SearchUrlTemplate = session.Settings.SearchUrlTemplate;
+            if (!window._isPageFullScreen)
+                window._bookmarksBar.Visible = session.Settings.ShowBookmarksBar;
             if (window._lifecycle is { } lifecycle)
             {
                 lifecycle.SuspendAfter = TimeSpan.FromMinutes(Math.Max(1, session.Settings.SuspendAfterMinutes));
@@ -1585,27 +1789,52 @@ public sealed class MainForm : Form
     }
 
     /// <summary>Modeless, one window, shared across every browser window's downloads.</summary>
-    public void OpenDownloads()
-    {
-        if (_session is null)
-            return;
-        if (_downloadsWindow is { IsDisposed: false })
-        {
-            _downloadsWindow.Activate();
-            return;
-        }
-        _downloadsWindow = new DownloadsForm(_session.Downloads);
-        _downloadsWindow.FormClosed += (_, _) => _downloadsWindow = null;
-        _downloadsWindow.Show(this);
-    }
+    public void OpenDownloads() => _ = OpenOwnPageAsync(InternalPages.Page.Downloads);
 
     public void ToggleBookmark()
     {
         if (_session is null || Tabs?.ActiveTab is not { } active || HomePage.IsHome(active.Url))
             return;
-        bool added = _session.Bookmarks.Toggle(active.Url, active.Title);
-        ShowMessage(added ? "Bookmarked." : "Bookmark removed.");
+        if (InternalPages.Identify(active.Url) is not null)
+        {
+            // Its address is a path into this install, which a moved or rebuilt Gergur no
+            // longer has; gergur:// names are typed, not bookmarked.
+            ShowMessage("Gergur's own pages cannot be bookmarked. Type gergur://history and the like instead.");
+            return;
+        }
+        try
+        {
+            bool added = _session.Bookmarks.Toggle(active.Url, active.Title);
+            ShowMessage(added ? "Bookmarked." : "Bookmark removed.");
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            SayBookmarkNotSaved(ex, "The bookmark could not be saved: something else has the bookmarks file open.");
+        }
         UpdateChrome();
+    }
+
+    // Once a run, across every window: the box says why and what to do, and saying it again
+    // at every click would be a box to dismiss each time.
+    private static bool _toldBookmarksUnreadable;
+
+    /// <summary>
+    /// Says a bookmark change was not saved. An unreadable bookmarks file gets a box the
+    /// first time, not only the status bar: its label shares one line with five others,
+    /// and the half that gets clipped is the half that says what to do.
+    /// </summary>
+    private void SayBookmarkNotSaved(Exception ex, string whenLocked)
+    {
+        if (ex is not BookmarkStore.UnreadableException)
+        {
+            ShowMessage(whenLocked);
+            return;
+        }
+        ShowMessage("Bookmarks are not being saved this run: bookmarks.json could not be read.");
+        if (_toldBookmarksUnreadable)
+            return;
+        _toldBookmarksUnreadable = true;
+        MessageBox.Show(this, ex.Message, "Gergur", MessageBoxButtons.OK, MessageBoxIcon.Warning);
     }
 
     protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
@@ -1692,7 +1921,10 @@ public sealed class MainForm : Form
         if (Tabs is null)
             return;
         int sleeping = Tabs.Tabs.Count(t => t.State is TabState.Suspended or TabState.Discarded);
-        _sleepLabel.Text = $"{sleeping}/{Tabs.Tabs.Count} tabs asleep";
+        // Said only when there is something to say; "0/3 tabs asleep" was noise on every glance.
+        _sleepLabel.Text = sleeping == 0 ? "" : $"{sleeping} asleep";
+        string detail = $"{_memoryLabel.Text}\n{sleeping} of {Tabs.Tabs.Count} tabs asleep";
+        _sleepLabel.ToolTipText = _blockedLabel.ToolTipText = _vpnLabel.ToolTipText = detail;
     }
 
     private void DumpMemoryCsv()

@@ -1,7 +1,10 @@
 <!doctype html>
-<html>
+<html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- Only the Assets folder may be reached from here; see history.html. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src file: 'unsafe-inline'; style-src file: 'unsafe-inline'; img-src file:; base-uri 'none'; form-action 'none'">
 <title>New tab</title>
 <!-- The ?v is not decoration, and it is not a number anyone has to remember. Favicons
      are cached per profile by the engine, keyed on the icon url, and that cache outlives
@@ -11,11 +14,93 @@
      hex of the icon's own sha256, and HomePageIconTests fails when the two disagree. To
      change the icon, change the file, then paste the token the test asks for. -->
 <link rel="icon" href="favicon.png?v=235fd424">
-<style>
-  html, body { margin: 0; height: 100%; background: #0a0406; overflow: hidden; }
-  body { display: grid; place-items: center; }
-  img { width: min(46vmin, 400px); user-select: none; -webkit-user-drag: none; }
-</style>
+<link rel="stylesheet" href="pages.css">
 </head>
-<body><img src="logo.png" alt="Gergur"></body>
+<body class="home">
+<main class="home-main">
+  <img class="home-logo" src="logo.png" alt="Gergur">
+  <nav id="tiles" class="tiles" aria-label="Bookmarks"></nav>
+  <p id="hint" class="hint" hidden>Press <kbd>Ctrl+D</kbd> on any page to bookmark it.</p>
+  <p id="status" class="home-status" hidden></p>
+  <div class="more"><button id="more" class="btn btn-ghost" type="button" hidden></button></div>
+</main>
+
+<script src="bridge.js"></script>
+<script>
+(function () {
+    "use strict";
+    var g = window.gergur;
+    var d = g.dom;
+    // A wall of every bookmark is not what a new tab is for; the rest are one click away.
+    var LIMIT = 24;
+
+    var tiles = document.getElementById("tiles");
+    var hint = document.getElementById("hint");
+    var status = document.getElementById("status");
+    var more = document.getElementById("more");
+
+    var items = [];
+    var expanded = false;
+    var seq = 0;
+
+    function load(retried) {
+        var mark = ++seq;
+        g.call("bookmarks.list", {}).then(function (result) {
+            if (mark !== seq) return;
+            items = Array.isArray(result) ? result : [];
+            status.hidden = true;
+            render();
+        }, function (err) {
+            if (mark !== seq) return;
+            // The first tab of a launch can ask before the browser is listening; one
+            // quiet second try covers that without showing anything.
+            if (err && err.code === "timeout" && !retried) { load(true); return; }
+            d.clear(tiles);
+            hint.hidden = true;
+            more.hidden = true;
+            status.textContent = "Bookmarks could not be loaded. " + g.describeError(err);
+            status.hidden = false;
+        });
+    }
+
+    function render() {
+        var focus = d.captureFocus(tiles);
+        d.clear(tiles);
+        hint.hidden = items.length > 0;
+        var shown = expanded ? items : items.slice(0, LIMIT);
+        var frag = document.createDocumentFragment();
+        shown.forEach(function (b) { frag.appendChild(tile(b)); });
+        tiles.appendChild(frag);
+        more.hidden = items.length <= LIMIT;
+        more.textContent = expanded ? "Show fewer" : "Show all " + items.length;
+        d.restoreFocus(tiles, focus);
+    }
+
+    function tile(b) {
+        var title = g.displayTitle(b.title, b.url);
+        var node = d.el("a", "tile");
+        node.dataset.key = b.url;
+        node.dataset.part = "link";
+        node.appendChild(d.avatar(b.title, b.url, true));
+        var text = d.el("span", "tile-text");
+        text.appendChild(d.el("span", "title", title));
+        text.appendChild(d.el("span", "host", g.siteOf(b.url)));
+        node.appendChild(text);
+        d.linkTo(node, b.url);
+        node.title = g.clip(title, 200) + "\n" + g.clip(b.url, 2048);
+        return node;
+    }
+
+    more.addEventListener("click", function () {
+        expanded = !expanded;
+        render();
+    });
+
+    g.on("bookmarks", function () { load(); });
+    // The browser skips pushes to a sleeping tab, so a page coming back into view asks again.
+    document.addEventListener("visibilitychange", function () { if (!document.hidden) load(); });
+    load();
+})();
+</script>
+</body>
 </html>

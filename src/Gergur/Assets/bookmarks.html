@@ -1,0 +1,238 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- Only the Assets folder may be reached from here; see history.html. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src file: 'unsafe-inline'; style-src file: 'unsafe-inline'; img-src file:; base-uri 'none'; form-action 'none'">
+<title>Bookmarks</title>
+<link rel="icon" href="favicon.png?v=235fd424">
+<link rel="stylesheet" href="pages.css">
+</head>
+<body class="bookmarks">
+<main class="page">
+  <header class="page-head">
+    <h1>Bookmarks</h1>
+    <span id="count" class="count"></span>
+  </header>
+
+  <div class="bar">
+    <div class="search" role="search">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="7" cy="7" r="4.6" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M10.5 10.5L14 14" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+      <input id="filter" type="search" placeholder="Filter bookmarks" aria-label="Filter bookmarks" autocomplete="off" spellcheck="false" autofocus>
+    </div>
+  </div>
+
+  <div id="list" aria-label="Bookmarks"></div>
+</main>
+
+<script src="bridge.js"></script>
+<script>
+(function () {
+    "use strict";
+    var g = window.gergur;
+    var d = g.dom;
+
+    var list = document.getElementById("list");
+    var filter = document.getElementById("filter");
+    var count = document.getElementById("count");
+
+    var items = [];
+    var seq = 0;
+    var shown = false;
+    var editing = null;
+    var undo = null;
+    var focusNext = null;
+
+    function refresh() {
+        var mark = ++seq;
+        var slow = window.setTimeout(function () { if (!shown && mark === seq) d.showLoading(list); }, 300);
+        g.call("bookmarks.list", {}).then(function (result) {
+            window.clearTimeout(slow);
+            if (mark !== seq) return;
+            items = Array.isArray(result) ? result : [];
+            // A rename in progress keeps its row; the list catches up when it ends.
+            if (!editing) render();
+        }, function (err) {
+            window.clearTimeout(slow);
+            if (mark !== seq) return;
+            // A rename in progress keeps its row here too: showing the error removes the list,
+            // and a removed input never blurs, so the rename never finished and none could
+            // open again until the page was reloaded. Say it quietly instead.
+            if (editing) {
+                d.toast("Could not refresh the list. " + g.describeError(err));
+                return;
+            }
+            shown = false;
+            count.textContent = "";
+            d.showError(list, "Could not load your bookmarks", err, refresh);
+        });
+    }
+
+    function render(focusAfter) {
+        var focus = focusAfter || d.captureFocus(list);
+        // A bookmark brought back by Undo takes the focus the vanished toast had.
+        if (!focus && focusNext && (!document.activeElement || document.activeElement === document.body)) focus = focusNext;
+        focusNext = null;
+        shown = true;
+        var visible = items.filter(function (b) { return g.matches(b, filter.value); });
+        count.textContent = filter.value.trim() && items.length
+            ? visible.length + " of " + items.length
+            : items.length === 1 ? "1 bookmark" : items.length ? items.length + " bookmarks" : "";
+        d.clear(list);
+
+        if (!items.length) {
+            d.notice(list, "No bookmarks yet", "Press Ctrl+D on any page to bookmark it.");
+            return;
+        }
+        if (!visible.length) {
+            d.notice(list, "No matches", "No bookmark matches “" + g.clip(filter.value.trim(), 80) + "”.");
+            return;
+        }
+        var ul = d.el("ul", "list");
+        visible.forEach(function (b) { ul.appendChild(buildRow(b)); });
+        list.appendChild(ul);
+        d.restoreFocus(list, focus);
+    }
+
+    function buildRow(b) {
+        var row = d.el("li", "row bm");
+        row.dataset.key = b.url;
+
+        var link = d.el("a", "link");
+        link.dataset.part = "link";
+        link.appendChild(d.el("span", "title", g.displayTitle(b.title, b.url)));
+        link.appendChild(d.el("span", "url", g.clip(b.url, 400)));
+        d.linkTo(link, b.url);
+
+        var actions = d.el("div", "row-actions");
+        var rename = d.el("button", "btn btn-ghost btn-sm", "Rename");
+        rename.type = "button";
+        rename.dataset.part = "rename";
+        rename.setAttribute("aria-label", "Rename " + g.displayTitle(b.title, b.url));
+        rename.addEventListener("click", function () { startRename(b, row, link); });
+        var remove = d.el("button", "btn btn-ghost btn-sm btn-danger", "Delete");
+        remove.type = "button";
+        remove.dataset.part = "delete";
+        remove.setAttribute("aria-label", "Delete " + g.displayTitle(b.title, b.url));
+        remove.addEventListener("click", function () { deleteBookmark(b); });
+        actions.appendChild(rename);
+        actions.appendChild(remove);
+
+        row.appendChild(d.avatar(b.title, b.url));
+        row.appendChild(link);
+        row.appendChild(actions);
+        return row;
+    }
+
+    // ---------------------------------------------------------------- rename
+
+    function startRename(b, row, link) {
+        if (editing) return;
+        editing = b.url;
+        var input = document.createElement("input");
+        input.type = "text";
+        input.className = "rename";
+        input.value = b.title || "";
+        input.maxLength = 1000;
+        input.dataset.part = "rename-input";
+        input.setAttribute("aria-label", "New name for this bookmark. Enter saves, Escape cancels.");
+        row.replaceChild(input, link);
+        input.focus();
+        input.select();
+
+        var done = false;
+        function finish(save) {
+            if (done) return;
+            done = true;
+            editing = null;
+            var title = input.value.trim();
+            var current = items.filter(function (x) { return x.url === b.url; })[0];
+            var back = { key: b.url, part: "rename", index: 0 };
+            if (!save || !current || title === (current.title || "").trim()) {
+                render(back);
+                return;
+            }
+            if (!title) {
+                render(back);
+                d.toast("A bookmark needs a name, so it kept its old one.");
+                return;
+            }
+            var before = current.title;
+            current.title = title;
+            render(back);
+            g.call("bookmarks.rename", { url: b.url, title: title }).catch(function (err) {
+                current.title = before;
+                if (!editing) render();
+                d.toast("Could not rename it. " + g.describeError(err));
+            });
+        }
+        input.addEventListener("keydown", function (e) {
+            if (e.key === "Enter") { e.preventDefault(); finish(true); }
+            else if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); finish(false); }
+        });
+        input.addEventListener("blur", function () { finish(true); });
+    }
+
+    // ---------------------------------------------------------------- delete, undo
+
+    function deleteBookmark(b) {
+        var at = items.findIndex(function (x) { return x.url === b.url; });
+        if (at === -1) return;
+        items.splice(at, 1);
+        render();
+        g.call("bookmarks.remove", { url: b.url }).then(function () {
+            if (undo) undo.toast.dismiss();
+            var entry = { run: function () { restore(b, at); } };
+            entry.toast = d.toast("Deleted “" + g.clip(g.displayTitle(b.title, b.url), 60) + "”.", {
+                action: "Undo",
+                duration: 7000,
+                onAction: function () { entry.run(); },
+                onDismiss: function () { if (undo === entry) undo = null; },
+            });
+            undo = entry;
+        }, function (err) {
+            d.toast("Could not delete it. " + g.describeError(err));
+            refresh();
+        });
+    }
+
+    function restore(b, at) {
+        // The address stands in for a missing title, which the browser would refuse.
+        g.call("bookmarks.add", { url: b.url, title: b.title || b.url, index: at }).then(function () {
+            focusNext = { key: b.url, part: "link", index: at };
+            refresh();
+        }, function (err) {
+            d.toast("Could not bring it back. " + g.describeError(err));
+        });
+    }
+
+    document.addEventListener("keydown", function (e) {
+        var typing = e.target && (e.target.tagName === "INPUT" || e.target.isContentEditable);
+        if (undo && !typing && (e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === "z") {
+            e.preventDefault();
+            var entry = undo;
+            entry.toast.dismiss();
+            entry.run();
+        }
+    });
+
+    // ---------------------------------------------------------------- filter
+
+    filter.addEventListener("input", function () { render(); });
+    filter.addEventListener("keydown", function (e) {
+        if (e.key === "Escape" && filter.value) {
+            e.preventDefault();
+            filter.value = "";
+            render();
+        }
+    });
+
+    g.on("bookmarks", refresh);
+    // The browser skips pushes to a sleeping tab, so a page coming back into view asks again.
+    document.addEventListener("visibilitychange", function () { if (!document.hidden) refresh(); });
+    refresh();
+})();
+</script>
+</body>
+</html>

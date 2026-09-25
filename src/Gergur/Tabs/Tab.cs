@@ -119,6 +119,7 @@ public sealed class Tab : ITabHandle, IDisposable
         : this(owner)
     {
         Url = snapshot.Url;
+        _committedSource = snapshot.Url;
         Title = snapshot.Title;
     }
 
@@ -695,8 +696,12 @@ public sealed class Tab : ITabHandle, IDisposable
     {
         try
         {
+            // Handled only when something is listening to track it; otherwise the engine's
+            // own flyout shows it, rather than the file downloading with nothing saying so.
+            if (DownloadStarted is null)
+                return;
             e.Handled = true;
-            DownloadStarted?.Invoke(this, e.DownloadOperation);
+            DownloadStarted.Invoke(this, e.DownloadOperation);
         }
         catch
         {
@@ -748,6 +753,7 @@ public sealed class Tab : ITabHandle, IDisposable
         FindStatusChanged = null;
         FullScreenChanged = null;
         ViewBuildFailed = null;
+        PageRequest = null;
     }
 
     /// <summary>
@@ -1445,6 +1451,7 @@ public sealed class Tab : ITabHandle, IDisposable
             var core = Core;
             if (!Readable(core is not null, ready))
                 return ("null", false);
+            RefuseOwnPage();
 
             var (result, inTime) = await WithBudget(core!.ExecuteScriptAsync(js), Remaining(deadline), "null");
             return (result ?? "null", inTime);
@@ -1662,6 +1669,9 @@ public sealed class Tab : ITabHandle, IDisposable
     {
         if (Core is null)
             return Failed("the tab has no view");
+        // Before the probe, which runs the agent's source too. Outside every try below, so the
+        // refusal reaches the agent server as a 403 rather than a quiet "could not run that".
+        RefuseOwnPage();
 
         var deadline = DateTime.UtcNow + timeout;
 
@@ -1694,6 +1704,8 @@ public sealed class Tab : ITabHandle, IDisposable
             var core = Core;
             if (core is null)
                 return Failed("the tab was closed while the script was running");
+            // Again: the probe's await was long enough for the tab to arrive at one.
+            RefuseOwnPage();
             try
             {
                 var (outcome, inTime) = await WithBudget(
@@ -1713,6 +1725,9 @@ public sealed class Tab : ITabHandle, IDisposable
             }
         }
 
+        // And here for the expression path, after the probe's await and before anything is
+        // registered, so a refusal leaves nothing waiting behind it.
+        RefuseOwnPage();
         string token = Guid.NewGuid().ToString("n")[..12];
         var waiting = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
         lock (_awaitedScripts)
@@ -1825,6 +1840,7 @@ public sealed class Tab : ITabHandle, IDisposable
             var core = Core;
             if (!WorthCapturing(core is not null, ready))
                 return ([], false);
+            RefuseOwnPage();
 
             var (png, inTime) = await WithBudget(
                 CaptureAsync(core!), Remaining(deadline), Array.Empty<byte>());
@@ -1929,6 +1945,7 @@ public sealed class Tab : ITabHandle, IDisposable
     private void OnSourceChanged(object? sender, CoreWebView2SourceChangedEventArgs e)
     {
         Url = Core?.Source ?? Url;
+        _committedSource = Url;
         RaiseUpdated();
     }
 
@@ -1963,6 +1980,8 @@ public sealed class Tab : ITabHandle, IDisposable
     {
         if (e.IsUserInitiated || !e.IsRedirected)
             _recentErrors.Clear(); // fresh page, fresh slate for the error indicator
+        // Redirects included: the same navigation, now heading somewhere else.
+        NoteNavigationUnderWay(e.NavigationId, e.Uri);
 
         // Hand this navigation to whoever asked for this url. Redirects are skipped: the
         // engine keeps the same NavigationId across one, so re-stamping would be a no-op
@@ -1995,6 +2014,7 @@ public sealed class Tab : ITabHandle, IDisposable
         // it was. Anyone waiting for a different navigation is left waiting for it.
         ReleaseLoadWaiters(e.NavigationId, e.IsSuccess);
         NoteNavigationFinished(e.NavigationId, e.IsSuccess);
+        NoteNavigationOver(e.NavigationId);
         RaiseUpdated();
     }
 
@@ -2076,10 +2096,126 @@ public sealed class Tab : ITabHandle, IDisposable
         });
     }
 
+    /// <summary>
+    /// A request from one of the browser's own pages (History, Downloads, Bookmarks, the new
+    /// tab page), with which page asked. Raised only for those files, by exact path, so a
+    /// site posting the same message is ignored: see <see cref="InternalPages"/>.
+    /// </summary>
+    public event EventHandler<(InternalPages.Page Page, string Json)>? PageRequest;
+
+    /// <summary>The tab whose page opened this one as a new window, or null.</summary>
+    internal Tab? Opener { get; set; }
+
+    /// <summary>
+    /// Whether a tab that just started a download exists only for it: opened by a page as a
+    /// new window, and never shown a page of its own. That is what a download link with
+    /// target=_blank makes, and it stayed behind as an empty tab. A new window that showed
+    /// a page first, a download page that starts the file after a moment, is kept. So is one
+    /// its opener wrote a report or a print view into: that stays at about:blank too, but
+    /// with a title of its own.
+    /// </summary>
+    internal static bool OnlyOpenedForADownload(bool openedByAPage, string url, string title)
+        => openedByAPage && url == "about:blank" && title is "" or "New tab" or "about:blank";
+
+    /// <summary>
+    /// Posts json to the browser's own page in this tab, but only when the document the
+    /// tab is actually showing is that page. Not what Url says: Url moves to a new address
+    /// the moment a navigation starts, so a reply or a downloads push could otherwise land
+    /// in the site that tab was leaving, or stay with it for good when the site keeps the
+    /// person with a "leave this page?" prompt.
+    /// </summary>
+    public void PostToPage(string json, InternalPages.Page expected)
+    {
+        if (ShownPage != expected)
+            return;
+        try { Core?.PostWebMessageAsJson(json); }
+        catch { }
+    }
+
+    /// <summary>
+    /// The address of the document this tab has committed to showing, or Url when it has
+    /// no view. What the lock and the page routing go by, rather than an address still loading.
+    /// </summary>
+    internal string CommittedUrl
+    {
+        get
+        {
+            try { return Core?.Source ?? Url; }
+            catch { return Url; }
+        }
+    }
+
+    /// <summary>Which of the browser's own pages this tab is showing, or null.</summary>
+    internal InternalPages.Page? ShownPage => InternalPages.Identify(CommittedUrl);
+
+    // The committed address, kept in a plain field so the agent server can read it from its
+    // own threads, where Core must not be touched. Url alone is not enough there: it moves
+    // to a new address when a navigation starts and stays there if it never commits, with
+    // the old page, one of the browser's own perhaps, still on screen.
+    private volatile string _committedSource = "about:blank";
+
+    /// <summary>The committed address, for other threads. See <see cref="ShownPage"/> on the UI thread.</summary>
+    internal string CommittedSourceForOtherThreads => _committedSource;
+
+    // The main-frame navigation the engine has announced and not yet finished. The engine
+    // cannot commit a navigation before this thread has handled its NavigationStarting, but
+    // it can commit one before this thread has handled the SourceChanged after it, so for a
+    // moment the document on screen is newer than CommittedUrl. A Back click to one of the
+    // browser's own pages is like that and never moves Url either. UI thread only.
+    private (ulong Id, string Uri)? _navigationUnderWay;
+
+    internal void NoteNavigationUnderWay(ulong navigationId, string uri) => _navigationUnderWay = (navigationId, uri);
+
+    internal void NoteNavigationOver(ulong navigationId)
+    {
+        if (_navigationUnderWay?.Id == navigationId)
+            _navigationUnderWay = null;
+    }
+
+    /// <summary>
+    /// Throws when one of the browser's own pages is on screen, or on its way: by the address
+    /// the host sent the tab to, or by a navigation the engine has started. Called by the
+    /// agent API's script and capture paths at the moment they would run, after the wait for
+    /// the page, which is long enough for the tab to arrive at one of those pages. A tab on
+    /// its way from one of them to anywhere else is "leaving", which the agent server answers
+    /// as not ready rather than forbidden.
+    /// </summary>
+    internal void RefuseOwnPage()
+    {
+        if (RefusalFor(Url, _navigationUnderWay?.Uri, CommittedUrl) is { } refused)
+            throw refused;
+    }
+
+    /// <summary>
+    /// The refusal for agent code or a capture, or null when it may go ahead. The decision
+    /// <see cref="RefuseOwnPage"/> makes, apart from the tab, so each address can be tested:
+    /// with no view the committed page is Url, and no test could tell the two apart.
+    /// </summary>
+    /// <param name="url">Where the host last sent the tab.</param>
+    /// <param name="underWay">Where a navigation the engine has announced is heading, if one is.</param>
+    /// <param name="committed">The document on screen.</param>
+    internal static InternalPages.OwnPageRefusedException? RefusalFor(string url, string? underWay, string committed)
+    {
+        bool heading = InternalPages.Identify(url) is not null || InternalPages.Identify(underWay) is not null;
+        if (!heading && InternalPages.Identify(committed) is null)
+            return null;
+        return new InternalPages.OwnPageRefusedException(leaving: !heading);
+    }
+
     private void OnWebMessageReceived(object? sender, CoreWebView2WebMessageReceivedEventArgs e)
     {
         try
         {
+            // Our own pages post objects; everything else here is a string.
+            if (InternalPages.Identify(e.Source) is { } page)
+            {
+                string json = e.WebMessageAsJson;
+                if (json.StartsWith('{'))
+                {
+                    PageRequest?.Invoke(this, (page, json));
+                    return;
+                }
+            }
             var message = e.TryGetWebMessageAsString();
             if (message is null)
                 return;
@@ -2133,7 +2269,7 @@ public sealed class Tab : ITabHandle, IDisposable
         try
         {
             e.Handled = true;
-            var tab = await _owner.CreatePopupTabAsync();
+            var tab = await _owner.CreatePopupTabAsync(opener: this);
             if (tab?.Core is not null)
                 e.NewWindow = tab.Core; // the opener drives navigation; preserves window.open semantics
             else
@@ -2189,6 +2325,8 @@ public sealed class Tab : ITabHandle, IDisposable
     {
         var webView = _webView;
         _webView = null;
+        _committedSource = Url;   // no document now; the address is what a rebuild shows
+        _navigationUnderWay = null;
         _ensureLiveTask = null;
         _lowMemoryApplied = false;
         // Belongs to the engine going away; holding it kept that engine's wrapper alive
@@ -2217,6 +2355,7 @@ public sealed class Tab : ITabHandle, IDisposable
         if (_disposed)
             return;
         _disposed = true;
+        Opener = null;   // a closed popup lets go of its opener; TabManager clears the other direction
         DetachAndDisposeWebView();
         State = TabState.Discarded;
         Favicon?.Dispose();

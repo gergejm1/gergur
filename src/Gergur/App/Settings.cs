@@ -65,6 +65,10 @@ public sealed class Settings
     [Description("Where a non-url address-bar entry goes. {0} is replaced with the query.")]
     public string SearchUrlTemplate { get; set; } = UrlHeuristics.DefaultSearchUrlTemplate;
 
+    [Category(Browsing), DisplayName("Show bookmarks bar")]
+    [Description("The strip of bookmarks under the address bar. Ctrl+Shift+B shows or hides it.")]
+    public bool ShowBookmarksBar { get; set; } = true;
+
     [Category(Privacy), DisplayName("Tracking prevention")]
     [Description("Engine-level tracking prevention: None, Basic, Balanced or Strict. Applies at once, open tabs included.")]
     public string TrackingPrevention { get; set; } = "Strict"; // None | Basic | Balanced | Strict

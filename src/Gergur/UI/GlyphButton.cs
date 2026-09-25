@@ -32,7 +32,7 @@ public sealed class GlyphButton : Control
         _glyph = glyph;
         SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer
             | ControlStyles.UserPaint | ControlStyles.SupportsTransparentBackColor, true);
-        Size = new Size(32, 30);
+        Size = new Size(34, 32);
         Font = Theme.IconFont(9.75f);
         BackColor = Theme.ToolbarBg;
         Cursor = Cursors.Hand;
@@ -52,7 +52,8 @@ public sealed class GlyphButton : Control
             using var path = new System.Drawing.Drawing2D.GraphicsPath();
             var r = ClientRectangle;
             r.Inflate(-1, -1);
-            int d = 10;
+            // Fully round, matching the pill address bar beside it.
+            int d = Math.Min(r.Width, r.Height);
             path.AddArc(r.X, r.Y, d, d, 180, 90);
             path.AddArc(r.Right - d, r.Y, d, d, 270, 90);
             path.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
