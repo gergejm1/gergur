@@ -578,6 +578,41 @@ public sealed class OwnPagesWiringTests
     }
 
     [Fact]
+    public void TheAddressBarKeepsOnlyWhatIsBeingTypedForTheTabItShows()
+    {
+        // Typing in progress for this tab: kept.
+        Assert.False(Gergur.UI.MainForm.ShouldRefreshAddress(force: false, focused: true, sameTab: true, edited: true));
+        // A switch to another tab while the bar has focus, which a new tab leaves it with:
+        // that tab's address, not the last one's, and not blank.
+        Assert.True(Gergur.UI.MainForm.ShouldRefreshAddress(force: false, focused: true, sameTab: false, edited: true));
+        Assert.True(Gergur.UI.MainForm.ShouldRefreshAddress(force: false, focused: true, sameTab: false, edited: false));
+        // Focused but untouched, as a new tab's placeholder address is: updated as it loads.
+        Assert.True(Gergur.UI.MainForm.ShouldRefreshAddress(force: false, focused: true, sameTab: true, edited: false));
+        Assert.True(Gergur.UI.MainForm.ShouldRefreshAddress(force: false, focused: false, sameTab: true, edited: true));
+        Assert.True(Gergur.UI.MainForm.ShouldRefreshAddress(force: true, focused: true, sameTab: true, edited: true));
+
+        // And every address the bar is given goes through the one place that records it.
+        string form = Code("src", "Gergur", "UI", "MainForm.cs");
+        Assert.Single(Regex.Matches(form, @"_addressBar\.Text\s*=(?!=)"));
+        string show = Body(form, "private void ShowAddress(");
+        Assert.Contains("_addressBar.Text = _addressShownText;", show);
+        // In this order: record which tab the text belongs to (what keeps typing: without it
+        // every update from any tab counts as a switch and wipes it), leave an unchanged bar
+        // alone (so a placed caret stays), and after a rewrite under focus select it all, so
+        // typing replaces the url rather than landing in front of it. Recording after the
+        // early return would bring back a new tab showing the old address.
+        Assert.Matches(@"(?:_addressShownText = AddressFor\(tab\);\s*_addressShownFor = tab;|_addressShownFor = tab;\s*_addressShownText = AddressFor\(tab\);)\s*"
+            + @"if \(_addressBar\.Text == _addressShownText\)\s*return;\s*"
+            + @"_addressBar\.Text = _addressShownText;\s*if \(_addressBar\.Focused\)\s*_addressBar\.SelectAll\(\);", show);
+        // Escape puts the tab's address back.
+        Assert.Matches(@"Escaped \+= \(_, _\) =>\s*\{[^}]*ShowAddress\(Tabs\?\.ActiveTab\);", form);
+        // And what a refresh shows is the active tab: showing the one it already showed would
+        // leave sameTab false for good and the bar stuck on the first tab's address.
+        Assert.Matches(@"ShouldRefreshAddress\(forceAddressBar, _addressBar\.Focused,\s*sameTab: active == _addressShownFor, edited: _addressBar\.Text != _addressShownText\)\)\s*ShowAddress\(active\);",
+            Body(form, "private void UpdateChrome("));
+    }
+
+    [Fact]
     public void TheStatusBarShowsItsTooltips()
     {
         // Off by default on a StatusStrip, so the memory figures moved into tooltips showed nowhere.

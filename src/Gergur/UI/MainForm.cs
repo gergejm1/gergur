@@ -236,7 +236,7 @@ public sealed class MainForm : Form
         _addressBar.NavigationRequested += async (_, url) => { ClaimForPerson(); await NavigateActiveAsync(url); };
         _addressBar.Escaped += (_, _) =>
         {
-            _addressBar.Text = AddressFor(Tabs?.ActiveTab);
+            ShowAddress(Tabs?.ActiveTab);
             Tabs?.ActiveTab?.FocusPage();
         };
 
@@ -1426,13 +1426,43 @@ public sealed class MainForm : Form
         tab.FocusPage();
     }
 
+    // The tab whose address the address bar was last given, and the text it was given, so
+    // typing can be told from focus: it is only kept for that tab, and only once changed.
+    private Tab? _addressShownFor;
+    private string _addressShownText = "";
+
+    /// <summary>
+    /// Whether the address bar should be given the active tab's address now. Left alone only
+    /// while the person is typing in it for the tab it already shows. A new tab focuses the
+    /// address bar and clicking the tab strip does not take focus, so going by focus alone
+    /// left a switched-to tab showing the previous tab's text, or nothing, and a new tab
+    /// opened from a focused address bar showing the old tab's address.
+    /// </summary>
+    internal static bool ShouldRefreshAddress(bool force, bool focused, bool sameTab, bool edited)
+        => force || !focused || !sameTab || !edited;
+
+    private void ShowAddress(Tab? tab)
+    {
+        _addressShownText = AddressFor(tab);
+        _addressShownFor = tab;
+        if (_addressBar.Text == _addressShownText)
+            return;   // leaves a caret or selection the person placed where it is
+        _addressBar.Text = _addressShownText;
+        // New text puts the caret at the start. Under a focused bar nobody has typed in yet
+        // (Ctrl+L while a page loads, say), the next keystroke would land in front of the
+        // url rather than replace it, so it is selected again, ready to be typed over.
+        if (_addressBar.Focused)
+            _addressBar.SelectAll();
+    }
+
     private void UpdateChrome(bool forceAddressBar = false)
     {
         var active = Tabs?.ActiveTab;
-        // Skip the URL refresh only when the user is actively editing the address bar,
-        // never when a tab close incidentally parked focus here (forceAddressBar).
-        if (forceAddressBar || !_addressBar.Focused)
-            _addressBar.Text = AddressFor(active);
+        // Skip the URL refresh only when the user is actively editing the address bar for
+        // this tab, never when a tab close incidentally parked focus here (forceAddressBar).
+        if (ShouldRefreshAddress(forceAddressBar, _addressBar.Focused,
+                sameTab: active == _addressShownFor, edited: _addressBar.Text != _addressShownText))
+            ShowAddress(active);
         // The committed page, not an address still loading: a typed https url would otherwise
         // show the lock over the http page still on screen, and keep it if the load stopped.
         _addressPill.Secure = active?.CommittedUrl.StartsWith("https://", StringComparison.OrdinalIgnoreCase) == true;
