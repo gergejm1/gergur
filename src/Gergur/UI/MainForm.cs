@@ -682,6 +682,9 @@ public sealed class MainForm : Form
             Microsoft.Win32.SystemEvents.SessionSwitch += OnSessionSwitch;
             _lifecycleTimer.Start();
             _statusTimer.Start();
+            // Once for the app. A freeze leaves nothing in the log by itself; this writes what
+            // the browser had last been doing when the window stops answering.
+            UiWatchdog.Start(this);
             _ready.TrySetResult(); // a torn-off tab can be handed over from here on
 
             if (_restore is not null)
@@ -741,6 +744,7 @@ public sealed class MainForm : Form
         }
         _session = await AppSession.CreateAsync(_settings, vpn);
         _session.Env.Core.BrowserProcessExited += OnBrowserProcessExited;
+        _session.Env.Core.NewBrowserVersionAvailable += OnNewBrowserVersionAvailable;
         _session.StartAgent();
         _session.StartPhoneBridge();
         // Only the first window listens, or an arrival would notify once per window.
@@ -948,6 +952,25 @@ public sealed class MainForm : Form
             from.Close();
         else
             from.UpdateChrome(forceAddressBar: true);
+    }
+
+    /// <summary>
+    /// The browser engine updated itself while Gergur was running, which it does every few
+    /// days. The running one keeps working and a restart picks up the new one, which is what
+    /// Microsoft asks of an app here. Whether running on through an update is behind the
+    /// "Class not registered" view build failure in the log is not established: it is one
+    /// line from a day when this may have happened, and this at least puts the two side by
+    /// side next time. Said in every window.
+    /// </summary>
+    private void OnNewBrowserVersionAvailable(object? sender, object e)
+    {
+        DebugLog.WriteAlways("the browser engine was updated while Gergur was running");
+        Breadcrumbs.Note("browser engine updated underneath the running one");
+        foreach (var window in _session?.Windows.ToList() ?? [])
+        {
+            if (!window.IsDisposed)
+                window.ShowMessage("The browser engine was updated. Restart Gergur to use it.");
+        }
     }
 
     private void OnBrowserProcessExited(object? sender, CoreWebView2BrowserProcessExitedEventArgs e)

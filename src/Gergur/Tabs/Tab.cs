@@ -1,4 +1,4 @@
-﻿using System.Text.Json;
+using System.Text.Json;
 using Gergur.App;
 using Gergur.Diagnostics;
 using Microsoft.Web.WebView2.Core;
@@ -248,11 +248,20 @@ public sealed class Tab : ITabHandle, IDisposable
     /// </summary>
     private async Task BuildAndCountAsync(bool navigateToStoredUrl, int generation)
     {
+        var watch = System.Diagnostics.Stopwatch.StartNew();
+        Breadcrumbs.Note($"{Id} building its view");
+        // A build that never finishes says nothing by itself, and the tab that waits on it
+        // never wakes. Said at fifteen seconds, while it is still hanging.
+        using var stillRunning = new CancellationTokenSource();
+        _ = Task.Delay(SlowBuild, stillRunning.Token).ContinueWith(
+            _ => DebugLog.WriteAlways($"a tab's view ({Id}) is still being built after {SlowBuild.TotalSeconds:0}s"),
+            CancellationToken.None, TaskContinuationOptions.OnlyOnRanToCompletion, TaskScheduler.Default);
         try
         {
             await CreateWebViewAsync(navigateToStoredUrl);
             _failedBuilds = 0;
             LastBuildFailure = null;
+            Breadcrumbs.Note($"{Id} view built in {watch.ElapsedMilliseconds}ms");
         }
         catch (Exception ex)
         {
@@ -282,9 +291,17 @@ public sealed class Tab : ITabHandle, IDisposable
             _failedBuilds++;
             _lastFailedBuildUtc = DateTime.UtcNow;
             LastBuildFailure = ex.Message;
+            Breadcrumbs.Note($"{Id} view failed to build after {watch.ElapsedMilliseconds}ms");
             RaiseBuildFailed();
         }
+        finally
+        {
+            stillRunning.Cancel();
+        }
     }
+
+    /// <summary>How long a view may take to build before the log says it is still going.</summary>
+    internal static readonly TimeSpan SlowBuild = TimeSpan.FromSeconds(15);
 
     /// <summary>
     /// Whether a failure to start is told to the person, through the window's status bar.
@@ -541,9 +558,20 @@ public sealed class Tab : ITabHandle, IDisposable
         if (_disposed)
             return;
         int failedBefore = _failedBuilds;
+        Breadcrumbs.Note($"{Id} show ({State})");
         await EnsureLiveAsync();
         if (_disposed)
             return;
+        // The person went to another tab while this one was waking, which for a discarded
+        // tab is seconds of building a view. Showing it now would put its page over the tab
+        // the strip says is selected, and every tab clicked after it would be fighting it.
+        // Built and left hidden is what the lifecycle manager expects of a background tab.
+        if (_webView is not null && _owner is { } manager && manager.ActiveTab != this)
+        {
+            Breadcrumbs.Note($"{Id} woke after the person moved on, left hidden");
+            LastActiveUtc = DateTime.UtcNow;   // built just now: not due to sleep on an old timestamp
+            return;
+        }
         if (_webView is null)
         {
             // Clicked during the back-off after a failed build: nothing was attempted, so
@@ -685,7 +713,15 @@ public sealed class Tab : ITabHandle, IDisposable
     }
 
     private void OnWindowCloseRequested(object? sender, object e)
-        => CloseRequested?.Invoke(this, EventArgs.Empty);
+    {
+        Breadcrumbs.Note($"{Id} page asked to close itself");
+        // After the callback returns: closing the tab disposes the view that is calling.
+        AfterCallback(() =>
+        {
+            if (!_disposed)
+                CloseRequested?.Invoke(this, EventArgs.Empty);
+        });
+    }
 
     /// <summary>
     /// Keeps the engine's own save location and behaviour, but hides its download
@@ -1881,7 +1917,9 @@ public sealed class Tab : ITabHandle, IDisposable
         {
             if (_lowMemoryApplied)
                 SetLowMemoryTarget(false); // docs: don't mix manual Low with suspension
+            Breadcrumbs.Note($"{Id} asking the engine to suspend it");
             bool suspended = await core.TrySuspendAsync();
+            Breadcrumbs.Note($"{Id} suspend answered: {suspended}");
             if (suspended && IsBeingRead)
             {
                 // Checked again: a read that arrived during the await would otherwise
@@ -1908,6 +1946,7 @@ public sealed class Tab : ITabHandle, IDisposable
         if (_webView is null)
             return;
         bool wasActive = State == TabState.Active;
+        Breadcrumbs.Note($"{Id} discarded ({State})");
         DetachAndDisposeWebView();
         State = TabState.Discarded;
         RaiseUpdated();
@@ -2265,6 +2304,7 @@ public sealed class Tab : ITabHandle, IDisposable
     private async void OnNewWindowRequested(object? sender, CoreWebView2NewWindowRequestedEventArgs e)
     {
         DebugLog.Write($"NewWindowRequested from={Url} target={e.Uri}");
+        Breadcrumbs.Note($"{Id} page opened a new window");
         var deferral = e.GetDeferral();
         try
         {
@@ -2288,12 +2328,43 @@ public sealed class Tab : ITabHandle, IDisposable
     private void OnProcessFailed(object? sender, CoreWebView2ProcessFailedEventArgs e)
     {
         DebugLog.Write($"ProcessFailed url={Url} kind={e.ProcessFailedKind}");
+        // Always recorded, and without an address: what the engine says went wrong, which
+        // is the one thing a hung or dead tab leaves to be found afterwards.
+        DebugLog.WriteAlways($"engine process failed ({Id}): {e.ProcessFailedKind}, {e.Reason}, exit {e.ExitCode}");
+        Breadcrumbs.Note($"{Id} engine process failed: {e.ProcessFailedKind}");
         // GPU/utility failures recover on their own; only a dead/hung renderer needs us.
         if (e.ProcessFailedKind is CoreWebView2ProcessFailedKind.RenderProcessExited
             or CoreWebView2ProcessFailedKind.RenderProcessUnresponsive)
         {
-            Discard();
+            // Not from inside the callback: this disposes the very view that is calling
+            // back, and the engine's callbacks are not written for that. And only if it is
+            // still that view by then, so a tab already rebuilt is not discarded again.
+            var failing = sender as CoreWebView2;
+            AfterCallback(() =>
+            {
+                if (_webView is not null && ReferenceEquals(Core, failing))
+                    Discard();
+            });
         }
+    }
+
+    /// <summary>
+    /// Runs something once the engine callback that asked for it has returned. A view must
+    /// not be disposed, nor its tab closed, from inside one of its own events: a page that
+    /// closes itself (a sign-in popup, once the account is chosen) and a renderer that dies
+    /// both arrive that way, and the window froze around them.
+    /// </summary>
+    private void AfterCallback(Action action)
+    {
+        var host = _owner.Host;
+        if (host.IsDisposed || !host.IsHandleCreated)
+        {
+            // The window is gone, and the tab with it. Said, so that a dead view left
+            // standing by a window that has no handle yet is not a silent one.
+            Breadcrumbs.Note($"{Id} an engine callback arrived with no window to act in");
+            return;
+        }
+        host.BeginInvoke(action);
     }
 
     private void OnWebViewKeyDown(object? sender, KeyEventArgs e) => WebViewKeyDown?.Invoke(this, e);

@@ -46,6 +46,13 @@ public sealed class BrowserEnvironment
         return new BrowserEnvironment(core, settings, proxied);
     }
 
+    /// <summary>The address ranges of a home or office network, which never go through the tunnel.</summary>
+    internal static readonly string[] PrivateNetworks = ["192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12"];
+
+    /// <summary>The same ranges as text patterns, which is all the resolver rule can match.</summary>
+    internal static readonly string[] PrivateNetworkPatterns =
+        ["192.168.*", "10.*", .. Enumerable.Range(16, 16).Select(second => $"172.{second}.*")];
+
     internal static string BuildBrowserArguments(Settings settings)
     {
         var flags = new List<string>();
@@ -67,8 +74,13 @@ public sealed class BrowserEnvironment
         {
             flags.Add($"--proxy-server=socks5://127.0.0.1:{settings.VpnLocalPort}");
 
-            // Hosts that skip the tunnel and connect directly.
+            // Hosts that skip the tunnel and connect directly. The home network is always
+            // among them: the tunnel's far end is somewhere else, so a machine on the same
+            // network is unreachable through it. Listing one address (the user's had their
+            // own PC's) left every other device on the network, their streaming server
+            // included, going into the tunnel and never answering.
             var bypassHosts = new List<string> { "localhost", "127.0.0.1" };
+            bypassHosts.AddRange(PrivateNetworks);
             if (!string.IsNullOrWhiteSpace(settings.VpnBypassHosts))
                 bypassHosts.AddRange(settings.VpnBypassHosts.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
             flags.Add($"--proxy-bypass-list=\"{string.Join(';', bypassHosts)}\"");
@@ -85,10 +97,20 @@ public sealed class BrowserEnvironment
             var resolver = new List<string> { "MAP * ~NOTFOUND" };
             foreach (var host in bypassHosts)
             {
+                // A range is not a pattern this rule can match; its own addresses are, below.
+                if (host.Contains('/'))
+                    continue;
                 resolver.Add("EXCLUDE " + host);
                 if (host.StartsWith("*.", StringComparison.Ordinal))
                     resolver.Add("EXCLUDE " + host[2..]);
             }
+            // The rule above blackholes every name it does not exclude, IP addresses included,
+            // so a bypassed address that is not excluded fails to resolve before it can bypass.
+            // These are text patterns, the only kind the rule has, so a real name that starts
+            // with such a label (10.example.com) is excluded too and resolves on the local DNS.
+            // Its traffic still goes into the tunnel, which the bypass list does not match.
+            foreach (var pattern in PrivateNetworkPatterns)
+                resolver.Add("EXCLUDE " + pattern);
             flags.Add($"--host-resolver-rules=\"{string.Join(" , ", resolver)}\"");
         }
         // Chromium honors only one instance of each feature switch, so join lists.

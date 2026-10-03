@@ -85,6 +85,31 @@ public sealed class BrowserArgumentsTests
     }
 
     [Fact]
+    public void TheHomeNetworkNeverGoesThroughTheTunnel()
+    {
+        // The streaming server on 192.168.0.29 timed out through the tunnel while the PC's own
+        // 192.168.0.20 was the only address on the list. A tunnel cannot reach the LAN.
+        foreach (string bypass in new[] { "", "192.168.0.20", "*.google.com" })
+        {
+            var args = BrowserEnvironment.BuildBrowserArguments(new Settings { VpnEnabled = true, VpnBypassHosts = bypass });
+            string list = System.Text.RegularExpressions.Regex.Match(args, "--proxy-bypass-list=\"([^\"]*)\"").Groups[1].Value;
+            foreach (string range in new[] { "192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12" })
+                Assert.Contains(range, list.Split(';'));
+            // The blackhole rule would fail a bypassed address before it could bypass.
+            foreach (string pattern in new[] { "192.168.*", "10.*", "172.16.*", "172.20.*", "172.31.*" })
+                Assert.Contains("EXCLUDE " + pattern, args);
+            Assert.DoesNotContain("EXCLUDE 192.168.0.0/16", args);
+        }
+        // The ranges are the private ones and no others: 172.32 and 11.x are on the internet.
+        var all = BrowserEnvironment.BuildBrowserArguments(new Settings { VpnEnabled = true });
+        Assert.DoesNotContain("EXCLUDE 172.32.*", all);
+        Assert.DoesNotContain("EXCLUDE 172.15.*", all);
+        Assert.DoesNotContain("EXCLUDE 11.*", all);
+        // And nothing is added when there is no tunnel.
+        Assert.DoesNotContain("192.168", BrowserEnvironment.BuildBrowserArguments(new Settings()));
+    }
+
+    [Fact]
     public void TogglesRemoveTheirFlags()
     {
         var settings = new Settings

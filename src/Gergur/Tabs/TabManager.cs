@@ -96,6 +96,8 @@ public sealed class TabManager
         bool wasActive = ActiveTab == tab;
         if (wasActive)
             ActiveTab = null;
+        if (_shown == tab)
+            _shown = null;
         tab.Deactivate();
         if (wasActive)
             await ActivateAsync(back ?? _tabs[Math.Min(index, _tabs.Count - 1)]);
@@ -148,11 +150,38 @@ public sealed class TabManager
             return;
         var previous = ActiveTab;
         ActiveTab = tab;
+        Diagnostics.Breadcrumbs.Note($"switching from {previous?.Id ?? "none"} to {tab.Id}");
         await tab.ActivateAsync(); // show new first, then hide old: no blank flash
-        if (previous is not null && previous != tab)
-            previous.Deactivate();
+        if (ActiveTab == tab)
+        {
+            // The tab whose view is on screen, which is not always the one in front when this
+            // began: a slow wake overtaken by another click leaves the tab before it showing.
+            var toHide = TabToHide(ActiveTab, tab, _shown);
+            _shown = tab.State == TabState.Active ? tab : null;
+            toHide?.Deactivate();
+        }
         RaiseChanged();
     }
+
+    // The tab whose view is showing in this window, or null when none is. Set when an activation
+    // finishes and finds itself the newest. Not "the tab in front when it began": B clicked and
+    // slow, then C clicked, records B, while A is the view actually on screen, and A was never
+    // hidden. And not a sweep that hides every other tab, which would restart the sleep timer of
+    // all of them at every switch.
+    private Tab? _shown;
+
+    /// <summary>
+    /// The tab an activation hides when it finishes: the one showing, and only when this
+    /// activation is still the newest. A slow wake that finishes after the person has moved on
+    /// hides nothing (B was clicked and is still building, A is clicked back, B arrives: A, the
+    /// active tab, must stay), and the newest one hides whatever was showing, not whatever it
+    /// remembers being in front.
+    /// </summary>
+    /// <param name="active">The active tab now, after the wait.</param>
+    /// <param name="activated">The tab this activation was for.</param>
+    /// <param name="shown">The tab whose view is showing.</param>
+    internal static Tab? TabToHide(Tab? active, Tab activated, Tab? shown)
+        => active == activated && shown is not null && shown != activated ? shown : null;
 
     public async Task ReactivateAsync(Tab tab)
     {
@@ -215,6 +244,12 @@ public sealed class TabManager
         bool wasActive = ActiveTab == tab;
         if (wasActive)
             ActiveTab = null;
+        // Read before it is disposed, which forgets it. A popup that closes itself, a
+        // sign-in window once the account is chosen, goes back to the page that opened it
+        // rather than to whichever tab sat next to it.
+        var opener = tab.Opener;
+        if (_shown == tab)
+            _shown = null;
         tab.Dispose();
         // Popups it opened stop pointing at it, or a closed tab stays reachable from each.
         foreach (var other in _tabs.Concat(_setAside.Keys))
@@ -233,7 +268,9 @@ public sealed class TabManager
         {
             var next = activateInstead is not null && _tabs.Contains(activateInstead)
                 ? activateInstead
-                : _tabs[Math.Min(index, _tabs.Count - 1)];
+                : opener is not null && _tabs.Contains(opener)
+                    ? opener
+                    : _tabs[Math.Min(index, _tabs.Count - 1)];
             await ActivateAsync(next);
         }
         else
@@ -253,6 +290,8 @@ public sealed class TabManager
         if (index < 0)
             return;
         _tabs.RemoveAt(index);
+        if (_shown == tab)
+            _shown = null;
         // Leaving this window: popups here stop pointing at it, and it at its opener here.
         foreach (var other in _tabs.Concat(_setAside.Keys))
         {
@@ -325,6 +364,7 @@ public sealed class TabManager
         foreach (var tab in _setAside.Keys)
             tab.Dispose();
         _setAside.Clear();
+        _shown = null;
         ActiveTab = null;
     }
 
