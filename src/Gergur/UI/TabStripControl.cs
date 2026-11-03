@@ -84,6 +84,31 @@ public sealed class TabStripControl : Control
 
     private int _externalDropIndex = -1;
 
+    private bool _agentWindow;
+    private Font? _agentBadgeFont;
+
+    /// <summary>
+    /// Whether this strip is an agent's window, so every tab in it wears the AGENT pill. A
+    /// tab an agent opened in one of the person's windows wears it on its own
+    /// (<see cref="Tab.AgentName"/>).
+    /// </summary>
+    [System.ComponentModel.Browsable(false)]
+    [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
+    public bool AgentWindow
+    {
+        get => _agentWindow;
+        set
+        {
+            if (_agentWindow == value)
+                return;
+            _agentWindow = value;
+            Invalidate();
+        }
+    }
+
+    /// <summary>Whether a tab wears the AGENT pill: every tab of an agent's window, and any tab an agent opened.</summary>
+    internal static bool ShowsAgentBadge(bool agentWindow, string? agentName) => agentWindow || agentName != null;
+
     /// <summary>This strip in screen coordinates, for cross-window hit testing.</summary>
     public Rectangle ScreenBounds => RectangleToScreen(ClientRectangle);
 
@@ -115,6 +140,23 @@ public sealed class TabStripControl : Control
         SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer
             | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
         BackColor = Theme.TabStripBg;
+    }
+
+    protected override void OnDpiChangedAfterParent(EventArgs e)
+    {
+        base.OnDpiChangedAfterParent(e);
+        _agentBadgeFont?.Dispose();   // in points, but made again so it follows the new scale
+        _agentBadgeFont = null;
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            _agentBadgeFont?.Dispose();
+            _agentBadgeFont = null;
+        }
+        base.Dispose(disposing);
     }
 
     public void Bind(TabManager tabs)
@@ -355,6 +397,24 @@ public sealed class TabStripControl : Control
                 textLeft = iconRect.Right + S(6);
             }
             catch { }
+        }
+
+        // AGENT, in white on the agent's blue, before the title: only where there is room
+        // for some of the title after it as well.
+        if (ShowsAgentBadge(_agentWindow, tab.AgentName) && rect.Width >= S(110))
+        {
+            _agentBadgeFont ??= new Font("Segoe UI", 7f, FontStyle.Bold);
+            const string badge = "AGENT";
+            var size = TextRenderer.MeasureText(g, badge, _agentBadgeFont, Size.Empty, TextFormatFlags.NoPadding);
+            int visible = isActive ? rect.Height : rect.Height - S(3);
+            int height = size.Height + S(2);
+            var badgeRect = new Rectangle(textLeft, rect.Top + (visible - height) / 2, size.Width + S(10), height);
+            using (var fill = new SolidBrush(Theme.Agent))
+            using (var path = RoundedRect(badgeRect, Math.Max(1, height / 2)))
+                g.FillPath(fill, path);
+            TextRenderer.DrawText(g, badge, _agentBadgeFont, badgeRect, Color.White,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix);
+            textLeft = badgeRect.Right + S(6);
         }
 
         bool showClose = isActive || isHover || rect.Width > S(110);

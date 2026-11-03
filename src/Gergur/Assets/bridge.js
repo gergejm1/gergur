@@ -406,6 +406,58 @@
             return names;
         }
 
+        var agents = [
+            {
+                key: "mcp:demo1", name: "Claude Code", kind: "MCP", task: "Uploading the 2.4 build to App Store Connect",
+                active: true, firstSeenUtc: iso(started - 1000 * 60 * 42), lastSeenUtc: iso(started - 4000), actionCount: 37,
+                recent: [
+                    { atUtc: iso(started - 4000), text: "Clicked in t12", tabId: "t12" },
+                    { atUtc: iso(started - 9000), text: "Typed in t12", tabId: "t12" },
+                    { atUtc: iso(started - 15000), text: "Took a screenshot in t12", tabId: "t12" },
+                    { atUtc: iso(started - 60000), text: "Went to appstoreconnect.apple.com in t12", tabId: "t12" },
+                    { atUtc: iso(started - 65000), text: "Said what it is doing", tabId: null },
+                    { atUtc: iso(started - 70000), text: "Opened a window", tabId: null },
+                ],
+                tabs: [
+                    { id: "t12", title: "App Store Connect", url: "https://appstoreconnect.apple.com/apps", hidden: true, agentWindow: true, asleep: false },
+                    { id: "t13", title: "Release notes draft", url: "https://docs.example.com/notes", hidden: true, agentWindow: true, asleep: true },
+                ],
+            },
+            {
+                key: "name:script", name: "Price watcher", kind: "API", task: null,
+                active: false, firstSeenUtc: iso(started - 1000 * 60 * 60 * 3), lastSeenUtc: iso(started - 1000 * 60 * 18), actionCount: 4,
+                recent: [
+                    { atUtc: iso(started - 1000 * 60 * 18), text: "Read the page in t4", tabId: "t4" },
+                    { atUtc: iso(started - 1000 * 60 * 19), text: "Opened example.com", tabId: "t4" },
+                ],
+                tabs: [
+                    { id: "t4", title: "Example Store: Headphones", url: "https://example.com/headphones", hidden: false, agentWindow: false, asleep: false },
+                ],
+            },
+        ];
+
+        function agentTab(args) {
+            var id = text(args, "tabId");
+            var found = null;
+            agents.forEach(function (a) { a.tabs.forEach(function (t) { if (t.id === id) found = t; }); });
+            if (!found) throw refusal("No agent has worked in that tab.");
+            return found;
+        }
+
+        /** A picture to stand in for a tab: its title on a band of its own colour. */
+        function demoPicture(tab) {
+            var hue = hueOf(tab.url);
+            var svg = "<svg xmlns='http://www.w3.org/2000/svg' width='560' height='315'>"
+                + "<rect width='560' height='315' fill='hsl(" + hue + ",30%,92%)'/>"
+                + "<rect width='560' height='48' fill='hsl(" + hue + ",45%,40%)'/>"
+                + "<rect x='32' y='84' width='300' height='22' rx='4' fill='hsl(" + hue + ",20%,70%)'/>"
+                + "<rect x='32' y='124' width='460' height='12' rx='3' fill='hsl(" + hue + ",15%,80%)'/>"
+                + "<rect x='32' y='148' width='420' height='12' rx='3' fill='hsl(" + hue + ",15%,80%)'/>"
+                + "<rect x='32' y='196' width='140' height='36' rx='8' fill='hsl(" + hue + ",60%,50%)'/>"
+                + "</svg>";
+            return "data:image/svg+xml," + encodeURIComponent(svg);
+        }
+
         var ticker = null;
 
         function describe(d) {
@@ -568,6 +620,29 @@
                 case "settings.showPairing":
                 case "settings.restart":
                     return {};
+                case "agents.list":
+                    return { apiLine: "Agent API on 127.0.0.1:24002 \u00b7 token protected", nowUtc: iso(options.now ? options.now() : Date.now()), agents: agents };
+                case "agents.show": {
+                    var shown = agentTab(args);
+                    shown.hidden = false;
+                    changed("agents");
+                    return {};
+                }
+                case "agents.hide": {
+                    var hiding = agentTab(args);
+                    if (!hiding.agentWindow) throw refusal("That tab is in one of your own windows, which are never hidden.");
+                    hiding.hidden = true;
+                    changed("agents");
+                    return {};
+                }
+                case "agents.devtools":
+                    agentTab(args);
+                    return {};
+                case "agents.snapshot": {
+                    var pictured = agentTab(args);
+                    push({ event: "snapshot", tabId: pictured.id, image: pictured.asleep ? null : demoPicture(pictured) });
+                    return {};
+                }
                 default:
                     throw refusal("there is no " + op);
             }

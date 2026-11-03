@@ -32,6 +32,9 @@ public sealed class AppSession
 
     /// <summary>What agents have done since the browser started, for the agents panel.</summary>
     public AgentActivity Agents { get; } = new();
+
+    /// <summary>Questions agents are waiting on the person for, shown in a bar across their windows.</summary>
+    public AgentAsks Asks { get; } = new();
     public BookmarkStore Bookmarks { get; } = new();
     public DownloadManager Downloads { get; } = new();
     public DropStore Drop { get; } = new();

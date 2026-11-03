@@ -12,9 +12,10 @@ public sealed record AgentCaller(string Key, string Name, string Kind);
 public sealed record AgentAction(DateTime AtUtc, string Text, string? TabId);
 
 /// <summary>An agent as the panel shows it, copied out so the panel never holds the live record.</summary>
+/// <param name="Task">What the agent says it is doing, in its own words; null until it says.</param>
 public sealed record AgentSnapshot(
     string Key, string Name, string Kind, DateTime FirstSeenUtc, DateTime LastSeenUtc,
-    int ActionCount, IReadOnlyList<AgentAction> Recent, IReadOnlyList<string> TabIds)
+    int ActionCount, IReadOnlyList<AgentAction> Recent, IReadOnlyList<string> TabIds, string? Task = null)
 {
     public bool IsActive(DateTime nowUtc) => nowUtc - LastSeenUtc < AgentActivity.ActiveFor;
 }
@@ -43,6 +44,7 @@ public sealed class AgentActivity
     internal const int MaxTabs = 8;
     internal const int MaxSessions = 64;
     internal const int MaxNameLength = 40;
+    internal const int MaxTaskLength = 100;
 
     private readonly object _gate = new();
     private readonly Dictionary<string, Entry> _agents = new(StringComparer.Ordinal);
@@ -57,6 +59,7 @@ public sealed class AgentActivity
         public int Count;
         public readonly List<AgentAction> Recent = new();
         public readonly List<string> Tabs = new();
+        public string? Task;
     }
 
     /// <summary>Raised after every recorded action, on the thread that recorded it.</summary>
@@ -108,17 +111,7 @@ public sealed class AgentActivity
     {
         lock (_gate)
         {
-            if (!_agents.TryGetValue(caller.Key, out var entry))
-            {
-                if (_agents.Count >= MaxAgents)
-                {
-                    // The one gone quiet longest makes room.
-                    var oldest = _agents.MinBy(a => a.Value.LastSeenUtc).Key;
-                    _agents.Remove(oldest);
-                }
-                entry = new Entry { Caller = caller, FirstSeenUtc = nowUtc };
-                _agents[caller.Key] = entry;
-            }
+            var entry = EntryFor(caller, nowUtc);
             entry.LastSeenUtc = nowUtc;
             entry.Count++;
             entry.Recent.Insert(0, new AgentAction(nowUtc, action, tabId));
@@ -135,6 +128,78 @@ public sealed class AgentActivity
         Changed?.Invoke();
     }
 
+    /// <summary>
+    /// Records what <paramref name="caller"/> says it is doing, shown to the person beside
+    /// its name. An agent driving the browser is asked to say so before it acts (see the
+    /// agent server), so the person can see "Researching flights to Tokyo" and not only
+    /// which site it is on. False when there was nothing printable to record.
+    /// </summary>
+    public bool SetTask(AgentCaller caller, string? task, DateTime nowUtc)
+    {
+        string? clean = CleanTask(task);
+        if (clean is null)
+            return false;
+        lock (_gate)
+        {
+            var entry = EntryFor(caller, nowUtc);
+            entry.Task = clean;
+            entry.LastSeenUtc = nowUtc;
+        }
+        Changed?.Invoke();
+        return true;
+    }
+
+    /// <summary>What the agent known by <paramref name="key"/> last said it was doing, or null.</summary>
+    public string? TaskOf(string key)
+    {
+        lock (_gate)
+            return _agents.TryGetValue(key, out var entry) ? entry.Task : null;
+    }
+
+    /// <summary>
+    /// A task fit to show: printable, one line, at most <see cref="MaxTaskLength"/>, or null
+    /// when nothing is left. The caller's own words otherwise; it chose them for the person.
+    /// </summary>
+    internal static string? CleanTask(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw))
+            return null;
+        var sb = new StringBuilder();
+        bool space = false;
+        foreach (char c in raw.Trim())
+        {
+            if (sb.Length >= MaxTaskLength)
+                break;
+            if (char.IsWhiteSpace(c) || char.IsControl(c) || c is '\u2028' or '\u2029')
+            {
+                space = sb.Length > 0;
+                continue;
+            }
+            if (space)
+                sb.Append(' ');
+            space = false;
+            sb.Append(c);
+        }
+        return sb.Length == 0 ? null : sb.ToString();
+    }
+
+    /// <summary>The live record for <paramref name="caller"/>, made if it is new. Under the gate.</summary>
+    private Entry EntryFor(AgentCaller caller, DateTime nowUtc)
+    {
+        if (!_agents.TryGetValue(caller.Key, out var entry))
+        {
+            if (_agents.Count >= MaxAgents)
+            {
+                // The one gone quiet longest makes room.
+                var oldest = _agents.MinBy(a => a.Value.LastSeenUtc).Key;
+                _agents.Remove(oldest);
+            }
+            entry = new Entry { Caller = caller, FirstSeenUtc = nowUtc, LastSeenUtc = nowUtc };
+            _agents[caller.Key] = entry;
+        }
+        return entry;
+    }
+
     /// <summary>Every agent seen, the most recently active first.</summary>
     public IReadOnlyList<AgentSnapshot> Snapshot()
     {
@@ -143,7 +208,7 @@ public sealed class AgentActivity
             return _agents.Values
                 .OrderByDescending(e => e.LastSeenUtc)
                 .Select(e => new AgentSnapshot(e.Caller.Key, e.Caller.Name, e.Caller.Kind, e.FirstSeenUtc, e.LastSeenUtc,
-                    e.Count, e.Recent.ToArray(), e.Tabs.ToArray()))
+                    e.Count, e.Recent.ToArray(), e.Tabs.ToArray(), e.Task))
                 .ToArray();
         }
     }
@@ -213,6 +278,17 @@ public sealed class AgentActivity
             ("POST", "/eval") => $"Ran a script{on}",
             ("POST", "/click") => $"Clicked{on}",
             ("POST", "/type") => $"Typed{on}",
+            ("POST", "/key") => $"Pressed a key{on}",
+            ("POST", "/hover") => $"Hovered{on}",
+            ("POST", "/scroll") => $"Scrolled{on}",
+            ("POST", "/select") => $"Chose an option{on}",
+            ("POST", "/wait") => $"Waited for the page{on}",
+            ("POST", "/upload") => $"Uploaded files{on}",
+            ("GET" or "POST", "/dialogs") => $"Checked page dialogs{on}",
+            ("GET", "/downloads") => "Checked its downloads",
+            ("POST", "/ask") => "Asked you something",
+            ("POST", "/login") => $"Tried a saved login{on}",
+            ("POST", "/task") => "Said what it is doing",
             _ => $"{method} {path}",
         };
     }

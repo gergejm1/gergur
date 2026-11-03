@@ -5,7 +5,7 @@ using Microsoft.Web.WebView2.Core;
 namespace Gergur.App;
 
 /// <summary>
-/// The browser's own pages: the new tab page, History, Downloads, Bookmarks and Settings. They are
+/// The browser's own pages: the new tab page, History, Downloads, Bookmarks, Settings and Agents. They are
 /// files in Assets shown in a tab like any page, and they reach the browser only through
 /// web messages, which this answers.
 ///
@@ -16,7 +16,7 @@ namespace Gergur.App;
 /// </summary>
 public static class InternalPages
 {
-    public enum Page { Home, History, Downloads, Bookmarks, Settings }
+    public enum Page { Home, History, Downloads, Bookmarks, Settings, Agents }
 
     private static readonly string AssetsDir = Path.Combine(AppContext.BaseDirectory, "Assets");
 
@@ -28,6 +28,7 @@ public static class InternalPages
         Page.History => "history.html",
         Page.Downloads => "downloads.html",
         Page.Settings => "settings.html",
+        Page.Agents => "agents.html",
         _ => "bookmarks.html",
     });
 
@@ -92,6 +93,7 @@ public static class InternalPages
             Page.Downloads => op.StartsWith("downloads.", StringComparison.Ordinal),
             Page.Bookmarks => op.StartsWith("bookmarks.", StringComparison.Ordinal),
             Page.Settings => op.StartsWith("settings.", StringComparison.Ordinal),
+            Page.Agents => op.StartsWith("agents.", StringComparison.Ordinal),
             _ => false,
         };
     }
@@ -111,7 +113,8 @@ public static class InternalPages
         BookmarkStore Bookmarks,
         DownloadManager Downloads,
         Action<string, bool> Open,
-        ISettingsHost? Settings = null);
+        ISettingsHost? Settings = null,
+        IAgentsHost? Agents = null);
 
     /// <summary>
     /// Answers one request from one of these pages, as the json posted back to it:
@@ -267,6 +270,28 @@ public static class InternalPages
                 SettingsHost(s).Restart();
                 return new { };
 
+            case "agents.list":
+                return AgentsPage.Describe(AgentsHost(s), DateTime.UtcNow);
+            case "agents.show":
+                AgentsHost(s).Show(AgentTabOf(args, s));
+                return new { };
+            case "agents.hide":
+            {
+                var host = AgentsHost(s);
+                string tabId = AgentTabOf(args, s);
+                if (host.Tab(tabId) is not { InAgentWindow: true })
+                    throw new PageRequestException("That tab is in one of your own windows, which are never hidden.");
+                host.Hide(tabId);
+                return new { };
+            }
+            case "agents.devtools":
+                AgentsHost(s).DevTools(AgentTabOf(args, s));
+                return new { };
+            case "agents.snapshot":
+                // Answered at once; the picture follows as a "snapshot" push when it is taken.
+                AgentsHost(s).Snapshot(AgentTabOf(args, s));
+                return new { };
+
             default:
                 throw new PageRequestException($"there is no {op}");
         }
@@ -274,6 +299,24 @@ public static class InternalPages
 
     private static ISettingsHost SettingsHost(Services s)
         => s.Settings ?? throw new PageRequestException("settings cannot be changed from this window yet");
+
+    private static IAgentsHost AgentsHost(Services s)
+        => s.Agents ?? throw new PageRequestException("agents cannot be shown from this window yet");
+
+    /// <summary>
+    /// The tab a request from the agents page names, which must be open and one an agent has
+    /// worked in: the page acts on agents' tabs, never on any tab the person has open.
+    /// </summary>
+    private static string AgentTabOf(JsonElement args, Services s)
+    {
+        string id = Text(args, "tabId");
+        var host = AgentsHost(s);
+        if (!host.Agents.Any(a => a.TabIds.Contains(id, StringComparer.Ordinal)))
+            throw new PageRequestException("No agent has worked in that tab.");
+        if (host.Tab(id) is null)
+            throw new PageRequestException("That tab has closed.");
+        return id;
+    }
 
     /// <summary>One download as the page shows it. Also what a "downloads" push carries.</summary>
     internal static object Describe(DownloadItem item) => new
@@ -328,7 +371,7 @@ public static class InternalPages
     /// and saying "cannot be read" there sent an agent away from a site it could read.</param>
     public sealed class OwnPageRefusedException(bool leaving = false) : Exception(leaving ? LeavingText : Text)
     {
-        public const string Text = "the browser's own pages (history, downloads, bookmarks, settings, the new tab page) cannot be read or scripted through this API";
+        public const string Text = "the browser's own pages (history, downloads, bookmarks, settings, agents, the new tab page) cannot be read or scripted through this API";
         public const string LeavingText = "that tab is still leaving one of the browser's own pages, which cannot be read or scripted through this API; "
             + "navigate with wait: true, or try again once the new page has loaded. "
             + "If that navigation does not produce a page (a download, say), navigate the tab somewhere else";

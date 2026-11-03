@@ -1,0 +1,416 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- Only the Assets folder may be reached from here; see history.html. The pictures of
+     agents' tabs arrive as data: images posted by the browser, so data: is allowed for
+     images and nothing else. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src file: 'unsafe-inline'; style-src file: 'unsafe-inline'; img-src file: data:; base-uri 'none'; form-action 'none'">
+<title>Agents</title>
+<link rel="icon" href="favicon.png?v=235fd424">
+<link rel="stylesheet" href="pages.css">
+<style>
+    :root { --agent: #3d7bfa; --agent-wash: rgba(61, 123, 250, 0.14); --live: #57cc8c; }
+    .agents .page { max-width: 1100px; }
+    .api-line { color: var(--dim); font-size: 13px; margin: -8px 0 22px; }
+    .agent {
+        background: var(--surface);
+        border: 1px solid var(--border-soft);
+        border-radius: var(--radius-lg);
+        padding: 18px 20px 20px;
+        margin: 0 0 18px;
+    }
+    .agent.is-active { border-color: rgba(61, 123, 250, 0.55); box-shadow: 0 0 0 1px rgba(61, 123, 250, 0.2) inset; }
+    .agent-head { display: flex; align-items: center; gap: 14px; }
+    .agent-avatar {
+        position: relative; flex: none; width: 44px; height: 44px; border-radius: 50%;
+        display: grid; place-items: center; font: 600 18px/1 var(--font-display);
+        background: hsl(var(--hue, 220), 38%, 26%); color: hsl(var(--hue, 220), 75%, 88%);
+    }
+    .agent-avatar .dot {
+        position: absolute; right: -1px; bottom: -1px; width: 13px; height: 13px; border-radius: 50%;
+        background: var(--live); border: 2px solid var(--surface);
+    }
+    .agent-who { min-width: 0; flex: 1; }
+    .agent-name { font: 600 17px/1.3 var(--font-display); display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .pill {
+        font: 700 10px/1 var(--font); letter-spacing: 0.06em; text-transform: uppercase;
+        padding: 4px 7px; border-radius: 999px; background: var(--agent); color: #fff;
+    }
+    .pill.is-quiet { background: var(--card); color: var(--dim); }
+    .agent-meta { color: var(--dim); font-size: 12.5px; }
+    .agent-meta .is-live { color: var(--live); }
+    .agent-task {
+        margin: 14px 0 0; padding: 10px 14px; border-radius: var(--radius-sm);
+        background: var(--agent-wash); border-left: 3px solid var(--agent);
+        font-size: 15px;
+    }
+    .agent-task.is-unsaid { color: var(--dim); font-style: italic; background: var(--card); border-left-color: var(--border); }
+    .agent-body { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 20px; margin-top: 16px; }
+    @media (max-width: 860px) { .agent-body { grid-template-columns: 1fr; } }
+    .section-label { color: var(--dim); font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; margin: 0 0 8px; }
+    .shots { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 14px; }
+    .shot { background: var(--card); border: 1px solid var(--border-soft); border-radius: var(--radius); overflow: hidden; display: flex; flex-direction: column; }
+    .shot-frame {
+        position: relative; aspect-ratio: 16 / 9; background: #000; display: grid; place-items: center;
+        color: var(--dim); font-size: 12.5px; text-align: center; padding: 0;
+    }
+    .shot-frame img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; object-position: top; }
+    .shot-frame .badge {
+        position: absolute; top: 8px; left: 8px; z-index: 1;
+        font: 700 10px/1 var(--font); letter-spacing: 0.06em; text-transform: uppercase;
+        padding: 4px 7px; border-radius: 999px; background: rgba(10, 4, 6, 0.8); color: var(--text);
+    }
+    .shot-text { padding: 10px 12px 4px; min-width: 0; }
+    .shot-title { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .shot-site { color: var(--dim); font-size: 12.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .shot-actions { display: flex; gap: 6px; padding: 8px 12px 12px; flex-wrap: wrap; }
+    .timeline { list-style: none; margin: 0; padding: 0; }
+    .timeline li { display: grid; grid-template-columns: 64px 1fr; gap: 10px; padding: 6px 0; border-bottom: 1px solid var(--border-soft); font-size: 13px; }
+    .timeline li:last-child { border-bottom: 0; }
+    .timeline time { color: var(--dim); font-variant-numeric: tabular-nums; }
+    .no-tabs { color: var(--dim); font-size: 13px; padding: 10px 0; }
+</style>
+</head>
+<body class="agents">
+<main class="page">
+  <header class="page-head">
+    <h1>Agents</h1>
+    <span id="count" class="count"></span>
+  </header>
+  <p id="api-line" class="api-line"></p>
+  <div id="list" aria-label="Agents" aria-live="polite"></div>
+</main>
+
+<script src="bridge.js"></script>
+<script>
+(function () {
+    "use strict";
+    var g = window.gergur;
+    var d = g.dom;
+
+    var list = document.getElementById("list");
+    var count = document.getElementById("count");
+    var apiLine = document.getElementById("api-line");
+
+    // Cards are kept by agent and by tab and updated in place: the list is read again every
+    // few seconds, and rebuilding it would take the keyboard focus off a button each time
+    // and flash every picture.
+    var cards = new Map();
+    var shots = new Map();
+    var pictures = new Map();     // tab id -> last picture, kept across a card being rebuilt
+    var inFlight = new Set();     // tabs with a picture asked for and not yet come
+    var lastAsked = new Map();    // tab id -> when its picture was last asked for
+    var onScreen = new Set();     // tabs whose card can be seen
+    var MAX_IN_FLIGHT = 2;
+    var EVERY_MS = 8000;
+    var seeing = "IntersectionObserver" in window ? new IntersectionObserver(function (entries) {
+        entries.forEach(function (entry) {
+            var id = entry.target.dataset.tab;
+            if (entry.isIntersecting) onScreen.add(id); else onScreen.delete(id);
+        });
+        snapshots();
+    }) : null;
+    var lastTabs = [];
+    var shown = false;
+    var loading = false;
+
+    function setText(node, text) {
+        if (node.textContent !== text) node.textContent = text;
+    }
+
+    function clock(value) {
+        var at = new Date(value);
+        if (isNaN(at.getTime())) return "";
+        var h = at.getHours(), m = at.getMinutes(), s = at.getSeconds();
+        return (h < 10 ? "0" : "") + h + ":" + (m < 10 ? "0" : "") + m + ":" + (s < 10 ? "0" : "") + s;
+    }
+
+    function render(answer) {
+        shown = true;
+        var agents = Array.isArray(answer.agents) ? answer.agents : [];
+        setText(apiLine, String(answer.apiLine || ""));
+        var active = agents.filter(function (a) { return a.active; }).length;
+        setText(count, agents.length ? (active === 0 ? "none active" : active + " active") : "");
+        if (!agents.length) {
+            cards.clear();
+            shots.clear();
+            lastTabs = [];
+            d.notice(list, "No agent has used Gergur since it started",
+                "Agents connect through the local agent API. Each one shows up here with what it says it is doing, what it did, and live pictures of its tabs.");
+            return;
+        }
+        if (list.querySelector(".notice")) d.clear(list);
+
+        var seenAgents = new Set(), seenTabs = new Set();
+        var tabs = [];
+        agents.forEach(function (agent, i) {
+            var card = cards.get(agent.key);
+            if (!card) {
+                card = buildAgent(agent);
+                cards.set(agent.key, card);
+            }
+            updateAgent(card, agent, seenTabs, tabs);
+            seenAgents.add(agent.key);
+            var at = list.children[i];
+            if (at !== card.root) list.insertBefore(card.root, at || null);
+        });
+        cards.forEach(function (card, key) {
+            if (seenAgents.has(key)) return;
+            if (card.root.parentNode) card.root.parentNode.removeChild(card.root);
+            cards.delete(key);
+        });
+        shots.forEach(function (shot, id) {
+            if (seenTabs.has(id)) return;
+            if (shot.root.parentNode) shot.root.parentNode.removeChild(shot.root);
+            if (seeing) seeing.unobserve(shot.root);
+            shots.delete(id);
+            pictures.delete(id);
+            lastAsked.delete(id);
+            onScreen.delete(id);
+        });
+        lastTabs = tabs;
+    }
+
+    function buildAgent(agent) {
+        var root = d.el("section", "agent");
+        var head = d.el("div", "agent-head");
+        var avatar = d.el("span", "agent-avatar");
+        avatar.setAttribute("aria-hidden", "true");
+        var letter = d.el("span", null, "");
+        var dot = d.el("span", "dot");
+        avatar.appendChild(letter);
+        avatar.appendChild(dot);
+        var who = d.el("div", "agent-who");
+        var name = d.el("h2", "agent-name");
+        name.style.margin = "0";
+        var nameText = d.el("span");
+        var kind = d.el("span", "pill is-quiet");
+        name.appendChild(nameText);
+        name.appendChild(kind);
+        var meta = d.el("div", "agent-meta");
+        who.appendChild(name);
+        who.appendChild(meta);
+        head.appendChild(avatar);
+        head.appendChild(who);
+
+        var task = d.el("p", "agent-task");
+
+        var body = d.el("div", "agent-body");
+        var tabsCol = d.el("div");
+        tabsCol.appendChild(d.el("h3", "section-label", "Tabs"));
+        var shotsGrid = d.el("div", "shots");
+        var noTabs = d.el("div", "no-tabs", "None of its tabs are open.");
+        tabsCol.appendChild(shotsGrid);
+        tabsCol.appendChild(noTabs);
+        var timeCol = d.el("div");
+        timeCol.appendChild(d.el("h3", "section-label", "What it did"));
+        var timeline = d.el("ol", "timeline");
+        timeCol.appendChild(timeline);
+        body.appendChild(tabsCol);
+        body.appendChild(timeCol);
+
+        root.appendChild(head);
+        root.appendChild(task);
+        root.appendChild(body);
+        return { root: root, avatar: avatar, letter: letter, dot: dot, nameText: nameText, kind: kind, meta: meta,
+            task: task, shots: shotsGrid, noTabs: noTabs, timeline: timeline, timelineKey: "" };
+    }
+
+    function updateAgent(card, agent, seenTabs, tabs) {
+        var name = g.clip(String(agent.name || "Agent"), 60);
+        setText(card.letter, name.charAt(0).toUpperCase());
+        card.avatar.style.setProperty("--hue", String(g.hueOf(name)));
+        card.dot.hidden = !agent.active;
+        card.root.classList.toggle("is-active", !!agent.active);
+        setText(card.nameText, name);
+        setText(card.kind, String(agent.kind || ""));
+        card.root.setAttribute("aria-label", name);
+
+        var actions = agent.actionCount === 1 ? "1 action" : (agent.actionCount || 0).toLocaleString() + " actions";
+        var since = "here since " + clock(agent.firstSeenUtc);
+        d.clear(card.meta);
+        var when = d.el("span", agent.active ? "is-live" : null,
+            agent.active ? "active now" : "last seen " + g.shortWhen(agent.lastSeenUtc, new Date()));
+        card.meta.appendChild(when);
+        card.meta.appendChild(document.createTextNode(" \u00b7 " + actions + " \u00b7 " + since));
+
+        if (agent.task) {
+            setText(card.task, g.clip(String(agent.task), 200));
+            card.task.classList.remove("is-unsaid");
+        } else {
+            setText(card.task, "It has not said what it is doing.");
+            card.task.classList.add("is-unsaid");
+        }
+
+        var agentTabs = Array.isArray(agent.tabs) ? agent.tabs : [];
+        card.noTabs.hidden = agentTabs.length > 0;
+        agentTabs.forEach(function (tab, i) {
+            var shot = shots.get(tab.id);
+            if (!shot) {
+                shot = buildShot(tab.id);
+                shots.set(tab.id, shot);
+            }
+            updateShot(shot, tab);
+            seenTabs.add(tab.id);
+            tabs.push(tab);
+            var at = card.shots.children[i];
+            if (at !== shot.root) card.shots.insertBefore(shot.root, at || null);
+        });
+
+        // The timeline only when it changed: it has no buttons, but rebuilding it every few
+        // seconds would make a screen reader read it again each time.
+        var recent = Array.isArray(agent.recent) ? agent.recent : [];
+        var key = JSON.stringify(recent);
+        if (key !== card.timelineKey) {
+            card.timelineKey = key;
+            d.clear(card.timeline);
+            recent.forEach(function (r) {
+                var li = d.el("li");
+                var t = d.el("time", null, clock(r.atUtc));
+                t.dateTime = String(r.atUtc || "");
+                li.appendChild(t);
+                li.appendChild(d.el("span", null, g.clip(String(r.text || ""), 160)));
+                card.timeline.appendChild(li);
+            });
+            if (!recent.length) card.timeline.appendChild(d.el("li", null, "Nothing yet."));
+        }
+    }
+
+    function buildShot(id) {
+        var root = d.el("article", "shot");
+        var frame = d.el("div", "shot-frame");
+        var badge = d.el("span", "badge", "Hidden");
+        var empty = d.el("span", null, "Taking a picture\u2026");
+        var img = d.el("img");
+        img.alt = "";
+        img.hidden = true;
+        frame.appendChild(empty);
+        frame.appendChild(img);
+        frame.appendChild(badge);
+        var text = d.el("div", "shot-text");
+        var title = d.el("div", "shot-title");
+        var site = d.el("div", "shot-site");
+        text.appendChild(title);
+        text.appendChild(site);
+        var actions = d.el("div", "shot-actions");
+        var show = button("Show", "agents.show", id);
+        var hide = button("Hide", "agents.hide", id);
+        var tools = button("DevTools", "agents.devtools", id);
+        actions.appendChild(show);
+        actions.appendChild(hide);
+        actions.appendChild(tools);
+        root.appendChild(frame);
+        root.appendChild(text);
+        root.appendChild(actions);
+        root.dataset.tab = id;
+        if (seeing) seeing.observe(root); else onScreen.add(id);
+        var shot = { root: root, frame: frame, badge: badge, empty: empty, img: img, title: title, site: site, show: show, hide: hide, tools: tools, id: id };
+        var known = pictures.get(id);
+        if (known) setPicture(shot, known);
+        return shot;
+    }
+
+    function updateShot(shot, tab) {
+        var title = g.clip(String(tab.title || tab.url || "Untitled"), 200);
+        setText(shot.title, title);
+        shot.title.title = title;
+        setText(shot.site, g.siteOf(tab.url) || String(tab.url || ""));
+        shot.site.title = g.clip(String(tab.url || ""), 2048);
+        // Every tab says where it is: hidden in the agent's window, in the agent's window on
+        // screen, or in one of the person's own, where Show and DevTools act on their window.
+        var where = !tab.agentWindow ? "Your window" : tab.hidden ? "Hidden" : "Agent window";
+        setText(shot.badge, tab.asleep ? where + " \u00b7 asleep" : where);
+        shot.hide.hidden = !(tab.agentWindow && !tab.hidden);
+        shot.show.setAttribute("aria-label", (tab.hidden ? "Show the hidden window with " : "Go to ") + title);
+        shot.hide.setAttribute("aria-label", "Hide the window with " + title);
+        shot.tools.setAttribute("aria-label", "Open DevTools on " + title);
+        shot.tab = tab;
+        if (tab.asleep && !pictures.has(tab.id)) setText(shot.empty, "Asleep: no picture until it wakes.");
+    }
+
+    function setPicture(shot, image) {
+        if (shot.img.getAttribute("src") !== image) shot.img.src = image;
+        shot.img.hidden = false;
+        shot.empty.hidden = true;
+    }
+
+    function button(text, op, id) {
+        var b = d.el("button", "btn btn-sm", text);
+        b.type = "button";
+        // Not disabled while it works: a disabled button drops the keyboard focus.
+        var busy = false;
+        b.addEventListener("click", function () {
+            if (busy) return;
+            busy = true;
+            g.call(op, { tabId: id }).then(function () {
+                if (op !== "agents.devtools") window.setTimeout(refresh, 400);
+            }, function (err) {
+                d.toast(g.describeError(err));
+            }).then(function () { busy = false; });
+        });
+        return b;
+    }
+
+    function refresh() {
+        if (loading) return;
+        loading = true;
+        var slow = window.setTimeout(function () { if (!shown) d.showLoading(list); }, 300);
+        g.call("agents.list", {}).then(function (answer) {
+            window.clearTimeout(slow);
+            render(answer || {});
+        }, function (err) {
+            window.clearTimeout(slow);
+            shown = false;
+            cards.clear();
+            shots.clear();
+            d.showError(list, "Could not load the agents", err, refresh);
+        }).then(function () { loading = false; });
+    }
+
+    // Each picture is a capture on the browser's UI thread and a resize, so they are
+    // rationed: two at most under way, each tab at most every eight seconds, only the cards
+    // that can be seen, and never a tab asleep, since taking its picture would mean waking it.
+    // Pushes, which come with every agent action, read the list and take no pictures.
+    function snapshots() {
+        if (document.hidden) return;
+        var now = Date.now();
+        lastTabs.forEach(function (tab) {
+            if (inFlight.size >= MAX_IN_FLIGHT) return;
+            if (tab.asleep || inFlight.has(tab.id) || !onScreen.has(tab.id)) return;
+            if (now - (lastAsked.get(tab.id) || 0) < EVERY_MS) return;
+            lastAsked.set(tab.id, now);
+            inFlight.add(tab.id);
+            g.call("agents.snapshot", { tabId: tab.id }).then(null, function () { inFlight.delete(tab.id); });
+            // In case the picture never comes (the tab closed meanwhile), stop waiting for it.
+            window.setTimeout(function () { inFlight.delete(tab.id); }, 8000);
+        });
+    }
+
+    g.on("snapshot", function (message) {
+        var id = String(message.tabId || "");
+        inFlight.delete(id);
+        window.setTimeout(snapshots, 0);   // a slot came free
+        var shot = shots.get(id);
+        if (typeof message.image === "string" && message.image.indexOf("data:image/") === 0) {
+            pictures.set(id, message.image);
+            if (shot) setPicture(shot, message.image);
+        } else if (shot && !pictures.has(id)) {
+            setText(shot.empty, shot.tab && shot.tab.asleep ? "Asleep: no picture until it wakes." : "No picture: nothing on screen in it yet.");
+        }
+    });
+
+    var pushed = g.dom.debounce(refresh, 250);
+    g.on("agents", function () { pushed(); });
+    // Pushes are skipped while the tab sleeps, so a page coming back into view asks again.
+    document.addEventListener("visibilitychange", function () { if (!document.hidden) refresh(); });
+    // Pictures go stale with nobody acting, and "last seen" moves on: read again every few seconds.
+    window.setInterval(function () { if (!document.hidden) refresh(); }, 4000);
+    window.setInterval(snapshots, 1000);
+
+    refresh();
+})();
+</script>
+</body>
+</html>

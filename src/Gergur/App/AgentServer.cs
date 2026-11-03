@@ -267,6 +267,10 @@ public sealed class AgentServer
             headers.TryGetValue("x-gergur-agent", out var agentName);
             var context = new RequestContext { Caller = _session.Agents.Identify(sessionId, agentName, viaMcp: path == "/mcp") };
             CurrentRequest.Value = context;
+            // A plain script can say what it is doing on any request; an MCP client says it
+            // with gergur_set_task, which comes back through here as /task.
+            if (headers.TryGetValue("x-gergur-task", out var taskHeader))
+                _session.Agents.SetTask(context.Caller, taskHeader, DateTime.UtcNow);
 
             var (status, contentType, payload) = await RouteAsync(method, path, query, body);
             await WriteAsync(stream, status, contentType, payload, context.SessionToSend);
@@ -321,6 +325,10 @@ public sealed class AgentServer
         {
             return Refusal(refused);
         }
+        catch (TabInput.InputFailedException failed)
+        {
+            return (503, "application/json", JsonSerializer.SerializeToUtf8Bytes(new { error = failed.Message }));
+        }
     }
 
     /// <summary>
@@ -338,7 +346,13 @@ public sealed class AgentServer
             var caller = CurrentRequest.Value?.Caller ?? _session.Agents.Identify(null, null, viaMcp: false);
             string? tabId = StringValue(query, body, "id");
             if (path is "/open" or "/window")
+            {
                 tabId = IdIn(payload) ?? tabId;
+                NoteDriver(tabId);
+            }
+            // Waiting again for an answer is not something new to show in the person's log.
+            if (path == "/ask" && StringValue(query, body, "id") is { Length: > 0 })
+                return;
             // The caller's own text otherwise, shown in the person's panel: only a tab id goes in.
             if (!AgentActivity.IsTabId(tabId))
                 tabId = null;
@@ -351,6 +365,46 @@ public sealed class AgentServer
             DebugLog.Write($"agents panel note failed: {ex.Message}");
         }
     }
+
+    /// <summary>
+    /// An endpoint that acts on a tab is about to: the window is told it was an agent (see
+    /// <see cref="Tab.NoteAgentAction"/>), and the tab is put down as driven by this caller, so
+    /// a download it sets off is listed to that agent. Only acting endpoints, on the tab they
+    /// resolved, so naming it by index or not at all counts, and a read never does: a download
+    /// the person starts after an agent merely read their tab stays theirs.
+    /// </summary>
+    private static void Acting(Tab tab)
+    {
+        tab.NoteAgentAction();
+        if (CurrentRequest.Value?.Caller is { } caller)
+            tab.NoteDrivenBy(caller.Key);
+    }
+
+    /// <summary>Marks a tab an /open or /window just made as driven by its caller.</summary>
+    private void NoteDriver(string? tabId)
+    {
+        if (!AgentActivity.IsTabId(tabId) || CurrentRequest.Value?.Caller is not { } caller)
+            return;
+        try
+        {
+            AllTabs().FirstOrDefault(e => e.Tab.Id == tabId).Tab?.NoteDrivenBy(caller.Key);
+        }
+        catch (Exception ex)
+        {
+            DebugLog.Write($"noting who drives a tab failed: {ex.Message}");
+        }
+    }
+
+    /// <summary>How long after an agent's request a download in that tab is still put down to it.</summary>
+    internal static readonly TimeSpan DownloadDriverWindow = TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    /// Whose download it is: the agent whose window it started in, else the agent that acted
+    /// in its tab within <see cref="DownloadDriverWindow"/>, else the person's (null), and an
+    /// agent is never shown one of the person's.
+    /// </summary>
+    internal static string? DownloadOwner(bool inAgentWindow, string? windowOwner, string? recentDriver)
+        => inAgentWindow && windowOwner is not null ? windowOwner : recentDriver;
 
     /// <summary>The "id" a response carries, for the tab an /open or /window just made.</summary>
     internal static string? IdIn(byte[] payload)
@@ -408,6 +462,91 @@ public sealed class AgentServer
                 : null;
 
         byte[] Json(object o) => JsonSerializer.SerializeToUtf8Bytes(o);
+
+        // Signs in with what the engine filled in from the person's saved passwords. Nothing
+        // here reads the password: the page is asked whether its field holds something, and
+        // the form's own button (or Enter in the field) sends it. See "Saved passwords".
+        async Task<(int, string, byte[])> LoginAsync()
+        {
+            if (Target() is not { } tab)
+                return (404, "application/json", Json(new { error = "no such tab" }));
+            if (OwnPageRefused(tab) is { } refused)
+                return refused;
+            Acting(tab);
+            string nonce = Convert.ToHexString(System.Security.Cryptography.RandomNumberGenerator.GetBytes(8)).ToLowerInvariant();
+            var (raw, ready) = await OnUiAsync(() => tab.ReadScriptAsync(LoginStateJs(nonce), Tab.WakeTimeout));
+            if (!ready)
+                return (503, "application/json", Json(new { error = "that tab's page did not finish loading in time" }));
+            var state = ParseLoginState(raw);
+            if (LoginStop(state, submit: BoolFrom("submit") != false, tab.AgentScriptedThisDocument) is { } stop)
+                return (stop.Status, "application/json", Quiet(stop.Answer));
+            bool hasButton = state!.Button;   // LoginStop stops on no state
+
+            int dialogMark = tab.DialogCount;
+            string? via = null, note = null;
+            if (hasButton)
+            {
+                string button = $"[data-gergur-login=\"go-{nonce}\"]";
+                var (first, _) = await LocateAsync(tab, button, animate: true);
+                if (first is not null)
+                {
+                    await Task.Delay(CursorGlide);
+                    var (spot, _) = await LocateAsync(tab, button, animate: false);
+                    if (spot is { CanClickAt: true })
+                    {
+                        // Looked at again directly before acting: a script run since the
+                        // first look could have pointed the form somewhere else.
+                        if (tab.AgentScriptedThisDocument)
+                            return (409, "application/json", Json(new { error = ScriptedLoginPage }));
+                        try
+                        {
+                            await OnUiAsync(() => TabInput.ClickAsync(tab, spot.X, spot.Y));
+                            via = "button";
+                        }
+                        catch (TabInput.InputFailedException failed) when (failed.Busy)
+                        {
+                            return (503, "application/json", Json(new { error = failed.Message }));
+                        }
+                        catch (TabInput.InputFailedException failed) when (failed.MayHaveLanded)
+                        {
+                            // Never pressed again with Enter: that would send it twice.
+                            via = "button";
+                            note = $"{failed.Message}. The click may still have landed, so it was not tried again.";
+                        }
+                        catch (TabInput.InputFailedException)
+                        {
+                            // Nothing went down, so Enter in the field is still the one try.
+                        }
+                    }
+                }
+            }
+            if (via is null)
+            {
+                var (focused, _) = await OnUiAsync(() => tab.ReadScriptAsync(FocusJs($"[data-gergur-login=\"pass-{nonce}\"]", selectAll: false), Tab.WakeTimeout));
+                if (focused != "true")
+                    return (200, "application/json", Json(new { ok = false, filled = true, error = "the password field would not take the keyboard focus to press Enter in, and there is no sign-in button to click" }));
+                if (tab.AgentScriptedThisDocument)
+                    return (409, "application/json", Json(new { error = ScriptedLoginPage }));
+                await OnUiAsync(async () => { await TabInput.PressAsync(tab, TrustedInput.ParseChord("Enter")!); return true; });
+                via = "enter";
+            }
+            await Task.Delay(1500); // for the page to move on, or say the password was wrong
+            var (stillRaw, _) = await OnUiAsync(() => tab.ReadScriptAsync(StillAskingJs(nonce), TimeSpan.FromSeconds(3)));
+            return (200, "application/json", Quiet(new
+            {
+                ok = true,
+                filled = true,
+                user = state.User,
+                submitted = true,
+                via,
+                // The same password field still on screen: refused (a wrong password, a captcha
+                // or a code to enter), or a page that signs in without leaving. Read the page.
+                stillAsking = stillRaw == "true",
+                note,
+                url = tab.CommittedSourceForOtherThreads,
+                dialogs = DialogsOut(tab.DialogsSince(dialogMark)),
+            }));
+        }
 
         switch ((method, path))
         {
@@ -547,7 +686,9 @@ public sealed class AgentServer
                     return (503, "application/json", Json(new { error = "no window is ready" }));
                 bool focus = BoolFrom("focus") ?? false;
                 bool muted = BoolFrom("muted") ?? false;
-                var opened = await OnUiAsync(() => MainForm.OpenWindowAsync(_session, focus));
+                // Whose window it is, for the banner across it and the agents panel.
+                var owner = CurrentRequest.Value?.Caller;
+                var opened = await OnUiAsync(() => MainForm.OpenWindowAsync(_session, focus, owner));
                 if (opened.Tabs is not { } manager)
                 {
                     // Closed here too, not only when its page fails: an empty window with
@@ -647,6 +788,9 @@ public sealed class AgentServer
                     activate: !background, muted: mutedTab));
                 if (tab is null)
                     return PageCouldNotStart(null, DateTime.UtcNow);
+                // Badged as an agent's on the tab strip, even in the person's own window.
+                var opener = CurrentRequest.Value?.Caller;
+                await OnUiAsync(() => { window.MarkOpenedByAgent(tab, opener?.Name ?? "An agent"); return Task.FromResult(true); });
                 return (200, "application/json", Json(new
                 {
                     id = tab.Id,
@@ -665,7 +809,10 @@ public sealed class AgentServer
                 await OnUiAsync(async () =>
                 {
                     await entry.Window.Tabs.ActivateAsync(entry.Tab);
-                    entry.Window.Activate(); // bring its window forward too
+                    // Its window forward too, unless it is an agent's hidden one: only the
+                    // person shows that, from the agents panel. The tab is still switched to.
+                    if (!entry.Window.HiddenForAgent)
+                        entry.Window.Activate();
                     return true;
                 });
                 return (200, "application/json", Json(new { ok = true }));
@@ -682,10 +829,22 @@ public sealed class AgentServer
                 return (200, "application/json", Json(new { ok = true }));
             }
 
+            case ("POST", "/task"):
+            {
+                // Always set by the time a request is routed; see HandleClientAsync.
+                if (CurrentRequest.Value?.Caller is not { } who)
+                    return (500, "application/json", Json(new { error = "the caller could not be told apart" }));
+                if (!_session.Agents.SetTask(who, BodyString("task"), DateTime.UtcNow))
+                    return (400, "application/json", Json(new { error = "task required: a few words on what you are doing, such as \"Researching flights to Tokyo\"" }));
+                return (200, "application/json", Json(new { ok = true, task = _session.Agents.TaskOf(who.Key) }));
+            }
+
             case ("POST", "/navigate"):
             {
                 if (Target() is not { } tab)
                     return (404, "application/json", Json(new { error = "no such tab" }));
+                if (CurrentRequest.Value?.Caller is { } navigator)
+                    tab.NoteDrivenBy(navigator.Key);
                 string url = BodyString("url") ?? "";
                 if (url.Length == 0)
                     return (400, "application/json", Json(new { error = "url required" }));
@@ -803,6 +962,11 @@ public sealed class AgentServer
                     {
                         error = "that tab's page did not finish loading in time to photograph",
                     }));
+                // A password shown as plain text (a "show password" eye pressed) would be in
+                // the picture; dots are fine.
+                var (shownPassword, _) = await OnUiAsync(() => shot.Tab.ReadScriptAsync(PasswordStateJs, TimeSpan.FromSeconds(3)));
+                if (ShowsPasswordAsText(shownPassword))
+                    return (409, "application/json", Json(new { error = PasswordInPlainText }));
                 if (activate && !isOnScreen)
                     await OnUiAsync(async () => { await Task.Delay(250); return true; }); // let it paint
 
@@ -855,35 +1019,69 @@ public sealed class AgentServer
                     return (400, "application/json", Json(new { error = "js required" }));
                 // Script the engine runs counts as the person's own click for what a page may
                 // ask of the window, so the window is told who was acting.
-                tab.NoteAgentAction();
+                Acting(tab);
 
-                // The result of a promise used to come back as {}, so anything async had
-                // to park its answer on a global and be polled for from outside. Awaited
-                // by default now; await=0 keeps the old immediate read for a caller who
-                // wants the expression and not what it settles to.
-                if (BoolFrom("await") == false)
+                // A password in a field here (filled in from the person's saved ones, most
+                // likely) is not read out by an agent's script: the person asked that agents
+                // can sign in with what they saved and never see it. /login signs in.
+                var (passwordBefore, checkable) = await OnUiAsync(() => tab.ReadScriptAsync(PasswordStateJs, Tab.WakeTimeout));
+                if (!checkable)
+                    return (503, "application/json", Json(new { error = "that tab's page did not finish loading in time to run a script in" }));
+                if (!HoldsNoPassword(passwordBefore))
+                    return (409, "application/json", Json(new { error = PasswordOnPage }));
+                tab.AgentScriptStarting();
+                try
                 {
-                    var (immediate, readable) = await OnUiAsync(
-                        () => tab.ReadScriptAsync(js, Tab.WakeTimeout));
-                    // Ready is not dropped here either. It was: a tab whose page never
-                    // arrived answered {"ok": true, "result": null}, which is exactly what
-                    // a script returning null looks like, on the one endpoint that is
-                    // supposed to tell those apart.
-                    if (!readable)
-                        return (503, "application/json", Json(new
-                        {
-                            error = "that tab's page did not finish loading in time to read",
-                        }));
-                    // Same shape either way, and built in one place: this was a fifth
-                    // hand-rolled copy of the envelope in the change that added the helper
-                    // because four copies were four chances to drift.
-                    return Evaluated(Tab.Succeeded(immediate));
+                    var answer = await EvaluateAsync();
+                    // A refusal or a failure carries no value from the page: passed on as it is.
+                    // EvaluateAsync's only one is a fixed 503; a script that threw answers 200
+                    // (Evaluated, ok false, with its message), so that goes through the look below.
+                    if (answer.Item1 != 200)
+                        return answer;
+                    // Looked at again once it has run: the page can move on, or draw a sign-in
+                    // form the engine then fills, between the look above and the script. Its
+                    // answer is then kept back, since it may hold what was filled in.
+                    var (passwordAfter, _) = await OnUiAsync(() => tab.ReadScriptAsync(PasswordStateJs, TimeSpan.FromSeconds(3)));
+                    return HoldsNoPassword(passwordAfter) ? answer : (409, "application/json", Json(new { error = PasswordDuringScript }));
+                }
+                finally
+                {
+                    tab.AgentScriptOver();
                 }
 
-                var settled = TimeSpan.FromSeconds(Math.Clamp(NumberFrom("timeout") ?? 15, 1, 120));
-                string outcome = await OnUiAsync(() => tab.ExecuteScriptAwaitingAsync(js, settled));
-                return Evaluated(outcome);
+                async Task<(int, string, byte[])> EvaluateAsync()
+                {
+                    // The result of a promise used to come back as {}, so anything async had
+                    // to park its answer on a global and be polled for from outside. Awaited
+                    // by default now; await=0 keeps the old immediate read for a caller who
+                    // wants the expression and not what it settles to.
+                    if (BoolFrom("await") == false)
+                    {
+                        var (immediate, readable) = await OnUiAsync(
+                            () => tab.ReadScriptAsync(js, Tab.WakeTimeout));
+                        // Ready is not dropped here either. It was: a tab whose page never
+                        // arrived answered {"ok": true, "result": null}, which is exactly what
+                        // a script returning null looks like, on the one endpoint that is
+                        // supposed to tell those apart.
+                        if (!readable)
+                            return (503, "application/json", Json(new
+                            {
+                                error = "that tab's page did not finish loading in time to read",
+                            }));
+                        // Same shape either way, and built in one place: this was a fifth
+                        // hand-rolled copy of the envelope in the change that added the helper
+                        // because four copies were four chances to drift.
+                        return Evaluated(Tab.Succeeded(immediate));
+                    }
+
+                    var settled = TimeSpan.FromSeconds(Math.Clamp(NumberFrom("timeout") ?? 15, 1, 120));
+                    string outcome = await OnUiAsync(() => tab.ExecuteScriptAwaitingAsync(js, settled));
+                    return Evaluated(outcome);
+                }
             }
+
+            case ("POST", "/login"):
+                return await LoginAsync();
 
             case ("POST", "/click"):
             {
@@ -892,30 +1090,71 @@ public sealed class AgentServer
                 if (OwnPageRefused(tab) is { } refused)
                     return refused;
                 string selector = BodyString("selector") ?? "";
-                string js = $$"""
-                    (() => {
-                        const el = document.querySelector({{JsonSerializer.Serialize(selector)}});
-                        if (!el) return false;
-                        el.scrollIntoView({ block: 'center', behavior: 'instant' });
-                        {{CursorJs}}
-                        const r = el.getBoundingClientRect();
-                        __gergurCursorTo(r.left + r.width / 2, r.top + r.height / 2, () => {
-                            const prev = el.style.outline;
-                            el.style.outline = '2px solid #3D7BFA';
-                            setTimeout(() => { el.style.outline = prev; }, 600);
-                            el.click();
-                        });
-                        return true;
-                    })()
-                    """;
-                var (clicked, clickable) = await ActOnPageAsync(tab, js);
+                if (selector.Length == 0)
+                    return (400, "application/json", Json(new { error = "selector required" }));
+                Acting(tab);
+                var (first, clickable) = await LocateAsync(tab, selector, animate: true);
                 if (!clickable)
-                    return (503, "application/json", Json(new
+                    return (503, "application/json", Json(new { error = "that tab's page did not finish loading in time to click" }));
+                if (first is null)
+                    return (200, "application/json", Json(new { ok = false, error = NothingMatches }));
+                await Task.Delay(CursorGlide);
+                // Measured again: the page may have moved it while the cursor was on its way.
+                var (spot, _) = await LocateAsync(tab, selector, animate: false);
+                if (spot is null)
+                    return (200, "application/json", Json(new { ok = false, error = WentAway }));
+
+                int dialogMark = tab.DialogCount;
+                var openedBefore = await OpenedFromAsync(tab);
+                bool trusted = false, chooser = false;
+                string? note = null;
+                if (spot.CanClickAt)
+                {
+                    try
                     {
-                        error = "that tab's page did not finish loading in time to click",
-                    }));
-                await Task.Delay(900); // let the cursor glide and the click land before responding
-                return (200, "application/json", Json(new { ok = clicked }));
+                        chooser = await OnUiAsync(() => TabInput.ClickAsync(tab, spot.X, spot.Y));
+                        trusted = true;
+                    }
+                    catch (TabInput.InputFailedException failed) when (failed.Busy)
+                    {
+                        return (503, "application/json", Json(new { error = failed.Message }));
+                    }
+                    catch (TabInput.InputFailedException failed) when (failed.MayHaveLanded)
+                    {
+                        // Not tried again another way: a second click on a "Pay" or "Delete" is the one thing worse than none.
+                        trusted = true;
+                        note = $"{failed.Message}. The click may still have landed, so it was not tried again; a dialog in the person's window can hold a page like this.";
+                    }
+                    catch (TabInput.InputFailedException failed)
+                    {
+                        note = $"a real click could not be sent ({failed.Message}), so the element's click() was called instead";
+                    }
+                }
+                else
+                {
+                    note = spot.Covered
+                        ? $"something covers it ({spot.CoveredBy}), so rather than click that, the element's click() was called. Close whatever is over it for a real click."
+                        : "it is not visible on screen, so the element's click() was called instead of a real click";
+                }
+                if (!trusted)
+                {
+                    var (clicked, _) = await ActOnPageAsync(tab, SyntheticClickJs(selector));
+                    if (!clicked)
+                        return (200, "application/json", Json(new { ok = false, error = WentAway }));
+                    await Task.Delay(400); // for a dialog or a tab it opens to show up in the answer
+                }
+                return (200, "application/json", Quiet(new
+                {
+                    ok = true,
+                    trusted,
+                    note,
+                    covered = spot.Covered ? spot.CoveredBy : null,
+                    fileChooser = chooser
+                        ? "the click opened a file chooser, which was closed unseen; use gergur_upload with this selector to choose files"
+                        : null,
+                    opened = await NewlyOpenedAsync(tab, openedBefore),
+                    dialogs = DialogsOut(tab.DialogsSince(dialogMark)),
+                }));
             }
 
             case ("POST", "/type"):
@@ -926,37 +1165,408 @@ public sealed class AgentServer
                     return refused;
                 string selector = BodyString("selector") ?? "";
                 string text = BodyString("text") ?? "";
-                string js = $$"""
-                    (() => {
-                        const el = document.querySelector({{JsonSerializer.Serialize(selector)}});
-                        if (!el) return false;
-                        el.scrollIntoView({ block: 'center', behavior: 'instant' });
-                        {{CursorJs}}
-                        const r = el.getBoundingClientRect();
-                        __gergurCursorTo(r.left + r.width / 2, r.top + r.height / 2, () => {
-                            el.focus();
-                            const prev = el.style.outline;
-                            el.style.outline = '2px solid #3D7BFA';
-                            setTimeout(() => { el.style.outline = prev; }, 600);
-                            const proto = el instanceof HTMLTextAreaElement
-                                ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-                            const desc = Object.getOwnPropertyDescriptor(proto, 'value');
-                            if (desc && desc.set) desc.set.call(el, {{JsonSerializer.Serialize(text)}});
-                            else el.value = {{JsonSerializer.Serialize(text)}};
-                            el.dispatchEvent(new Event('input', { bubbles: true }));
-                            el.dispatchEvent(new Event('change', { bubbles: true }));
-                        });
-                        return true;
-                    })()
-                    """;
-                var (typed, typeable) = await ActOnPageAsync(tab, js);
+                if (selector.Length == 0)
+                    return (400, "application/json", Json(new { error = "selector required" }));
+                bool clear = BoolFrom("clear") ?? true;
+                Acting(tab);
+                var (spot, typeable) = await LocateAsync(tab, selector, animate: true);
                 if (!typeable)
-                    return (503, "application/json", Json(new
+                    return (503, "application/json", Json(new { error = "that tab's page did not finish loading in time to type into" }));
+                if (spot is null)
+                    return (200, "application/json", Json(new { ok = false, error = NothingMatches }));
+                if (spot.Tag == "select")
+                    return (400, "application/json", Json(new { error = "that is a drop-down list; use gergur_select_option" }));
+                if (spot.FileInput)
+                    return (400, "application/json", Json(new { error = "that is a file input; use gergur_upload" }));
+                await Task.Delay(CursorGlide);
+
+                var (focused, _) = await OnUiAsync(() => tab.ReadScriptAsync(FocusJs(selector, selectAll: clear), Tab.WakeTimeout));
+                bool trusted = false;
+                string? note = null;
+                if (focused == "true")
+                {
+                    try
                     {
-                        error = "that tab's page did not finish loading in time to type into",
+                        await OnUiAsync(async () =>
+                        {
+                            // Typed over what is selected, which with clear is everything in it.
+                            if (text.Length > 0)
+                                await TabInput.InsertTextAsync(tab, text);
+                            else if (clear)
+                                await TabInput.PressAsync(tab, TrustedInput.ParseChord("Backspace")!);
+                            return true;
+                        });
+                        trusted = true;
+                    }
+                    catch (TabInput.InputFailedException failed) when (failed.MayHaveLanded)
+                    {
+                        // Not set again another way, which with clear false would add it twice.
+                        trusted = true;
+                        note = $"{failed.Message}. The text may still have gone in, so it was not set again; check the field.";
+                    }
+                    catch (TabInput.InputFailedException failed)
+                    {
+                        note = $"real typing could not be sent ({failed.Message}), so the value was set directly";
+                    }
+                }
+                else
+                {
+                    note = "it would not take the keyboard focus, so the value was set directly";
+                }
+                if (!trusted)
+                {
+                    var (set, _) = await ActOnPageAsync(tab, SetValueJs(selector, text, clear));
+                    if (!set)
+                        return (200, "application/json", Json(new { ok = false, error = WentAway }));
+                }
+                if (BoolFrom("submit") == true)
+                {
+                    try
+                    {
+                        await OnUiAsync(async () => { await TabInput.PressAsync(tab, TrustedInput.ParseChord("Enter")!); return true; });
+                    }
+                    catch (TabInput.InputFailedException failed)
+                    {
+                        note = (note is null ? "" : note + "; ") + $"Enter could not be pressed: {failed.Message}";
+                    }
+                }
+                // Whether the field now says what was meant, without the text itself coming back:
+                // it may be a password, and the answer goes into the agent's transcript.
+                var (valueRaw, _) = await OnUiAsync(() => tab.ReadScriptAsync(ValueJs(selector), Tab.WakeTimeout));
+                string? now = valueRaw == "null" ? null : AsString(valueRaw);
+                return (200, "application/json", Quiet(new { ok = true, trusted, note, matches = Matches(now, text, clear) }));
+            }
+
+            case ("POST", "/key"):
+            {
+                if (Target() is not { } tab)
+                    return (404, "application/json", Json(new { error = "no such tab" }));
+                if (OwnPageRefused(tab) is { } refused)
+                    return refused;
+                string key = BodyString("key") ?? "";
+                if (TrustedInput.ParseChord(key) is not { } chord)
+                    return (400, "application/json", Json(new { error = UnknownKey(key) }));
+                int times = (int)Math.Clamp(NumberFrom("times") ?? 1, 1, 50);
+                Acting(tab);
+                string? selector = BodyString("selector");
+                if (!string.IsNullOrEmpty(selector))
+                {
+                    var (spot, ready) = await LocateAsync(tab, selector, animate: true);
+                    if (!ready)
+                        return (503, "application/json", Json(new { error = "that tab's page did not finish loading in time" }));
+                    if (spot is null)
+                        return (200, "application/json", Json(new { ok = false, error = NothingMatches }));
+                    await Task.Delay(CursorGlide);
+                    var (focused, _) = await OnUiAsync(() => tab.ReadScriptAsync(FocusJs(selector, selectAll: false), Tab.WakeTimeout));
+                    if (focused != "true")
+                        return (200, "application/json", Json(new { ok = false, error = "it would not take the keyboard focus" }));
+                }
+                else
+                {
+                    // Woken and loaded first: a key sent to a page still on its way goes nowhere.
+                    var (_, ready) = await OnUiAsync(() => tab.ReadScriptAsync("true", Tab.WakeTimeout));
+                    if (!ready)
+                        return (503, "application/json", Json(new { error = "that tab's page did not finish loading in time" }));
+                }
+                int dialogMark = tab.DialogCount;
+                var openedBefore = await OpenedFromAsync(tab);
+                await OnUiAsync(async () => { await TabInput.PressAsync(tab, chord, times); return true; });
+                await Task.Delay(300);
+                return (200, "application/json", Quiet(new
+                {
+                    ok = true,
+                    opened = await NewlyOpenedAsync(tab, openedBefore),
+                    dialogs = DialogsOut(tab.DialogsSince(dialogMark)),
+                }));
+            }
+
+            case ("POST", "/hover"):
+            {
+                if (Target() is not { } tab)
+                    return (404, "application/json", Json(new { error = "no such tab" }));
+                if (OwnPageRefused(tab) is { } refused)
+                    return refused;
+                string selector = BodyString("selector") ?? "";
+                if (selector.Length == 0)
+                    return (400, "application/json", Json(new { error = "selector required" }));
+                Acting(tab);
+                var (first, ready) = await LocateAsync(tab, selector, animate: true);
+                if (!ready)
+                    return (503, "application/json", Json(new { error = "that tab's page did not finish loading in time" }));
+                if (first is null)
+                    return (200, "application/json", Json(new { ok = false, error = NothingMatches }));
+                await Task.Delay(CursorGlide);
+                var (spot, _) = await LocateAsync(tab, selector, animate: false);
+                if (spot is null)
+                    return (200, "application/json", Json(new { ok = false, error = WentAway }));
+                if (!spot.InView)
+                    return (200, "application/json", Json(new { ok = false, error = "it is not visible on screen, so there is nothing to point at" }));
+                await OnUiAsync(async () => { await TabInput.HoverAsync(tab, spot.X, spot.Y); return true; });
+                await Task.Delay(300); // for a menu that opens on hover to be there when the agent looks
+                return (200, "application/json", Quiet(new { ok = true, covered = spot.Covered ? spot.CoveredBy : null }));
+            }
+
+            case ("POST", "/scroll"):
+            {
+                if (Target() is not { } tab)
+                    return (404, "application/json", Json(new { error = "no such tab" }));
+                if (OwnPageRefused(tab) is { } refused)
+                    return refused;
+                string? selector = BodyString("selector") is { Length: > 0 } named ? named : null;
+                string? to = BodyString("to");
+                double? dx = NumberFrom("dx"), dy = NumberFrom("dy");
+                if (to is not null and not ("top" or "bottom"))
+                    return (400, "application/json", Json(new { error = "to is \"top\" or \"bottom\"" }));
+                Acting(tab);
+                const string notReady = "that tab's page did not finish loading in time";
+                if (to is not null)
+                {
+                    string js = to == "top" ? "(window.scrollTo(0, 0), true)" : "(window.scrollTo(0, document.documentElement.scrollHeight), true)";
+                    var (_, ready) = await OnUiAsync(() => tab.ReadScriptAsync(js, Tab.WakeTimeout));
+                    if (!ready)
+                        return (503, "application/json", Json(new { error = notReady }));
+                }
+                else if (selector is not null && dx is null && dy is null)
+                {
+                    // Finding it scrolls it to the middle of the view.
+                    var (spot, ready) = await LocateAsync(tab, selector, animate: false);
+                    if (!ready)
+                        return (503, "application/json", Json(new { error = notReady }));
+                    if (spot is null)
+                        return (200, "application/json", Json(new { ok = false, error = NothingMatches }));
+                }
+                else
+                {
+                    double x, y;
+                    if (selector is not null)
+                    {
+                        // The wheel over an element scrolls what it is in: a list or panel of its own.
+                        var (spot, ready) = await LocateAsync(tab, selector, animate: false);
+                        if (!ready)
+                            return (503, "application/json", Json(new { error = notReady }));
+                        if (spot is null)
+                            return (200, "application/json", Json(new { ok = false, error = NothingMatches }));
+                        (x, y) = (spot.X, spot.Y);
+                    }
+                    else
+                    {
+                        var (middle, ready) = await OnUiAsync(() => tab.ReadScriptAsync("[innerWidth / 2, innerHeight / 2]", Tab.WakeTimeout));
+                        if (!ready)
+                            return (503, "application/json", Json(new { error = notReady }));
+                        (x, y) = ParsePoint(middle) ?? (400, 300);
+                    }
+                    double byX = dx ?? 0, byY = dy ?? (dx is null ? 600 : 0);
+                    try
+                    {
+                        await OnUiAsync(async () => { await TabInput.WheelAsync(tab, x, y, byX, byY); return true; });
+                    }
+                    catch (TabInput.InputFailedException)
+                    {
+                        await ActOnPageAsync(tab, string.Create(CultureInfo.InvariantCulture, $"(window.scrollBy({byX}, {byY}), true)"));
+                    }
+                }
+                await Task.Delay(350); // smooth scrolling takes a moment to arrive
+                var (where, _) = await OnUiAsync(() => tab.ReadScriptAsync(ScrollStateJs, Tab.WakeTimeout));
+                return (200, "application/json", where == "null" ? Json(new { ok = true }) : Encoding.UTF8.GetBytes(where));
+            }
+
+            case ("POST", "/select"):
+            {
+                if (Target() is not { } tab)
+                    return (404, "application/json", Json(new { error = "no such tab" }));
+                if (OwnPageRefused(tab) is { } refused)
+                    return refused;
+                string selector = BodyString("selector") ?? "";
+                string? value = BodyString("value"), label = BodyString("label");
+                if (selector.Length == 0)
+                    return (400, "application/json", Json(new { error = "selector required" }));
+                if (value is null && label is null)
+                    return (400, "application/json", Json(new { error = "value or label required" }));
+                Acting(tab);
+                var (spot, ready) = await LocateAsync(tab, selector, animate: true);
+                if (!ready)
+                    return (503, "application/json", Json(new { error = "that tab's page did not finish loading in time" }));
+                if (spot is null)
+                    return (200, "application/json", Json(new { ok = false, error = NothingMatches }));
+                if (spot.Tag != "select")
+                    return (400, "application/json", Json(new
+                    {
+                        error = "that is not a <select>. A drop-down a site builds itself is ordinary elements: gergur_click it, then gergur_click the option.",
                     }));
-                await Task.Delay(900);
-                return (200, "application/json", Json(new { ok = typed }));
+                await Task.Delay(CursorGlide);
+                var (chosen, _) = await OnUiAsync(() => tab.ReadScriptAsync(SelectJs(selector, value, label), Tab.WakeTimeout));
+                return (200, "application/json", chosen == "null" ? Json(new { ok = false, error = WentAway }) : Encoding.UTF8.GetBytes(chosen));
+            }
+
+            case ("POST", "/wait"):
+            {
+                if (Target() is not { } tab)
+                    return (404, "application/json", Json(new { error = "no such tab" }));
+                if (OwnPageRefused(tab) is { } refused)
+                    return refused;
+                string? selector = BodyString("selector") is { Length: > 0 } named ? named : null;
+                string? text = BodyString("text") is { Length: > 0 } words ? words : null;
+                if (selector is null && text is null)
+                    return (400, "application/json", Json(new { error = "selector or text required" }));
+                bool gone = BoolFrom("gone") ?? false;
+                double seconds = Math.Clamp(NumberFrom("timeout") ?? 10, 0.5, 60);
+                string js = WaitJs(selector, text);
+                var started = DateTime.UtcNow;
+                var deadline = started + TimeSpan.FromSeconds(seconds);
+                bool met = false, everReady = false;
+                while (true)
+                {
+                    var left = Tab.Remaining(deadline);
+                    var (seen, ready) = await OnUiAsync(() => tab.ReadScriptAsync(js, left > MinRead ? left : MinRead));
+                    everReady |= ready;
+                    if (ready && seen == "\"invalid selector\"")
+                        return (400, "application/json", Json(new { error = "that is not a valid CSS selector" }));
+                    // A page between loads says nothing either way, "gone" included.
+                    if (ready && (seen == "true") != gone)
+                    {
+                        met = true;
+                        break;
+                    }
+                    if (DateTime.UtcNow >= deadline)
+                        break;
+                    await Task.Delay(250);
+                }
+                return (200, "application/json", Quiet(new
+                {
+                    ok = true,
+                    met,
+                    waitedSeconds = Math.Round((DateTime.UtcNow - started).TotalSeconds, 1),
+                    note = everReady ? null : "the page never finished loading while this waited",
+                }));
+            }
+
+            case ("POST", "/upload"):
+            {
+                if (Target() is not { } tab)
+                    return (404, "application/json", Json(new { error = "no such tab" }));
+                if (OwnPageRefused(tab) is { } refused)
+                    return refused;
+                string selector = BodyString("selector") ?? "";
+                if (selector.Length == 0)
+                    return (400, "application/json", Json(new { error = "selector required" }));
+                var files = FilesIn(body);
+                if (TrustedInput.CheckFiles(files) is { } badFiles)
+                    return (400, "application/json", Json(new { error = badFiles }));
+                Acting(tab);
+                var (spot, ready) = await LocateAsync(tab, selector, animate: true);
+                if (!ready)
+                    return (503, "application/json", Json(new { error = "that tab's page did not finish loading in time" }));
+                if (spot is null)
+                    return (200, "application/json", Json(new { ok = false, error = NothingMatches }));
+                if (spot.FileInput)
+                {
+                    // Works hidden or not, which is how most sites keep theirs.
+                    if (!await OnUiAsync(() => TabInput.SetFilesAsync(tab, selector, files)))
+                        return (200, "application/json", Json(new { ok = false, error = WentAway }));
+                    var (count, _) = await OnUiAsync(() => tab.ReadScriptAsync(FileCountJs(selector), Tab.WakeTimeout));
+                    return (200, "application/json", Quiet(new
+                    {
+                        ok = true,
+                        via = "the file input",
+                        files = files.Count,
+                        inputHas = int.TryParse(count, out int n) ? n : (int?)null,
+                    }));
+                }
+                await Task.Delay(CursorGlide);
+                var (button, _) = await LocateAsync(tab, selector, animate: false);
+                if (button is null)
+                    return (200, "application/json", Json(new { ok = false, error = WentAway }));
+                if (!button.CanClickAt)
+                    return (200, "application/json", Json(new
+                    {
+                        ok = false,
+                        error = (button.Covered ? $"something covers it ({button.CoveredBy}); close that first" : "it is not visible on screen")
+                            + ". Or name the <input type=file> itself, which works even when the page hides it.",
+                    }));
+                bool chose = await OnUiAsync(() => TabInput.UploadThroughChooserAsync(tab, button.X, button.Y, files, TimeSpan.FromSeconds(3)));
+                return chose
+                    ? (200, "application/json", Json(new { ok = true, via = "the file chooser that clicking it opened", files = files.Count }))
+                    : (200, "application/json", Json(new
+                    {
+                        ok = false,
+                        error = "clicking it opened no file chooser. Name the <input type=file> itself; it often sits hidden next to the button, and gergur_read_html shows it.",
+                    }));
+            }
+
+            case ("GET", "/dialogs"):
+            case ("POST", "/dialogs"):
+            {
+                if (TargetEntry() is not { } entry)
+                    return (404, "application/json", Json(new { error = "no such tab" }));
+                var tab = entry.Tab;
+                if (OwnPageRefused(tab) is { } refused)
+                    return refused;
+                if (method == "POST")
+                {
+                    var (accept, answer) = tab.DialogPolicy;
+                    if (BoolFrom("accept") is { } yes)
+                        accept = yes;
+                    // Present and null clears it back to each prompt's own default.
+                    if (body is { RootElement.ValueKind: JsonValueKind.Object } && body.RootElement.TryGetProperty("text", out var said))
+                        answer = said.ValueKind == JsonValueKind.String ? said.GetString() : null;
+                    tab.DialogPolicy = (accept, answer);
+                }
+                var policy = tab.DialogPolicy;
+                bool answeredHere = await OnUiAsync(() => Task.FromResult(entry.Window.OpenedByAgent));
+                return (200, "application/json", Quiet(new
+                {
+                    answeredForYou = answeredHere,
+                    note = answeredHere ? null : "this tab is in the person's window, so its dialogs are shown to them rather than answered here",
+                    confirm = policy.Accept ? "OK" : "Cancel",
+                    promptAnswer = policy.PromptAnswer,
+                    recent = DialogsOut(tab.RecentDialogs) ?? [],
+                }));
+            }
+
+            case ("POST", "/ask"):
+            {
+                var caller = CurrentRequest.Value?.Caller ?? _session.Agents.Identify(null, null, viaMcp: false);
+                string? id = BodyString("id") is { Length: > 0 } given ? given : null;
+                var wait = TimeSpan.FromSeconds(Math.Clamp(NumberFrom("timeout") ?? 18, 0, 600));
+                if (id is null)
+                {
+                    if (AgentAsks.Clean(BodyString("question")) is not { } question)
+                        return (400, "application/json", Json(new { error = "question required" }));
+                    if (_session.Asks.Ask(caller, question, DateTime.UtcNow) is not { } asked)
+                        return (429, "application/json", Json(new
+                        {
+                            error = $"{AgentAsks.MaxPending} questions are already waiting for the person; wait for those first",
+                        }));
+                    id = asked.Id;
+                }
+                var (known, reply) = await _session.Asks.WaitAsync(id, caller.Key, wait);
+                if (!known)
+                    return (404, "application/json", Json(new
+                    {
+                        error = "no question of yours with that id; answers are kept for an hour, and each is handed over once",
+                    }));
+                return (200, "application/json", reply is null
+                    ? Json(new
+                    {
+                        id,
+                        answered = false,
+                        note = "The person has not answered yet; the question is in a bar across their window. Call gergur_ask_person with this id to keep waiting.",
+                    })
+                    : Json(new { id, answered = true, done = reply.Done, reply = reply.Text }));
+            }
+
+            case ("GET", "/downloads"):
+            {
+                var caller = CurrentRequest.Value?.Caller ?? _session.Agents.Identify(null, null, viaMcp: false);
+                bool wait = BoolFrom("wait") ?? false;
+                var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(Math.Clamp(NumberFrom("timeout") ?? 15, 0, 60));
+                while (true)
+                {
+                    var (running, listed) = await OnUiAsync(() => Task.FromResult(DownloadsOf(caller.Key)));
+                    if (!wait || running == 0 || DateTime.UtcNow >= deadline)
+                        return (200, "application/json", Json(new { running, downloads = listed }));
+                    await Task.Delay(500);
+                }
             }
 
             default:
@@ -1209,6 +1819,13 @@ public sealed class AgentServer
         "gergur_change_settings" => ["settings"],
         "gergur_click" => ["selector"],
         "gergur_type_text" => ["selector", "text"],
+        "gergur_set_task" => ["task"],
+        "gergur_press_key" => ["key"],
+        "gergur_hover" => ["selector"],
+        "gergur_select_option" => ["selector", "value|label"],
+        "gergur_wait_for" => ["selector|text"],
+        "gergur_upload" => ["selector", "files"],
+        "gergur_ask_person" => ["question|id"],
         _ => [],
     };
 
@@ -1216,7 +1833,7 @@ public sealed class AgentServer
     /// Arguments where an empty string cannot mean anything. Deliberately excludes
     /// "text": clearing a field by typing nothing into it is a real action.
     /// </summary>
-    private static bool EmptyIsMeaningless(string key) => key is "url" or "js" or "selector";
+    private static bool EmptyIsMeaningless(string key) => key is "url" or "js" or "selector" or "task" or "key" or "question";
 
     /// <summary>The first required argument this call is missing, or null when complete.</summary>
     internal static string? MissingRequiredArg(string name, JsonElement? args)
@@ -1262,12 +1879,53 @@ public sealed class AgentServer
         "gergur_read_settings" => ("GET", "/settings"),
         "gergur_change_settings" => ("POST", "/settings"),
         "gergur_page_errors" => ("GET", "/console"),
+        "gergur_set_task" => ("POST", "/task"),
+        "gergur_press_key" => ("POST", "/key"),
+        "gergur_hover" => ("POST", "/hover"),
+        "gergur_scroll" => ("POST", "/scroll"),
+        "gergur_select_option" => ("POST", "/select"),
+        "gergur_wait_for" => ("POST", "/wait"),
+        "gergur_upload" => ("POST", "/upload"),
+        "gergur_dialogs" => ("POST", "/dialogs"),
+        "gergur_downloads" => ("GET", "/downloads"),
+        "gergur_ask_person" => ("POST", "/ask"),
+        "gergur_login" => ("POST", "/login"),
         _ => ("", ""),
     };
+
+    /// <summary>
+    /// The tools an MCP agent may use before it has said what it is doing: saying it, and
+    /// looking around first. Everything else is refused until then, so the person watching
+    /// always sees "Researching flights to Tokyo" beside an agent's name and on its window,
+    /// not only which site it is on.
+    /// </summary>
+    internal static bool NeedsTask(string tool) => tool is not ("gergur_set_task" or "gergur_list_tabs" or "gergur_read_settings");
+
+    internal const string TaskFirstText =
+        "Say what you are doing first: call gergur_set_task with a few words, such as \"Researching flights to Tokyo\" "
+        + "or \"Uploading screenshots to App Store Connect\". The person using Gergur sees it beside your name and across "
+        + "your window. Call it again whenever the task changes. If gergur_set_task is not among your tools, your tool "
+        + "list is from an older Gergur: ask the person to reconnect the gergur MCP server (in Claude Code: /mcp, choose "
+        + "gergur, Reconnect) or to restart your session, which loads the current tools.";
+
+    /// <summary>What an MCP client is told in initialize, for clients that show server instructions to the model.</summary>
+    internal const string McpInstructions =
+        "Gergur is the user's own browser, logged in as them. Before acting, call gergur_set_task with a few words on what "
+        + "you are doing; the user sees it. Work in your own window (gergur_open_window): it stays hidden from the user "
+        + "unless they choose to look. To sign in to a site, load its sign-in page and call gergur_login: the person's "
+        + "saved passwords fill in by themselves and you never see them.";
+
+    /// <summary>The refusal for an MCP agent that has not said what it is doing, or null when it may go ahead.</summary>
+    internal static object? TaskRefusal(string tool, AgentCaller? caller, Func<string, string?> taskOf)
+        => caller is { Kind: "MCP" } && NeedsTask(tool) && taskOf(caller.Key) is null ? McpError(TaskFirstText) : null;
 
     /// <summary>Every tool maps onto an endpoint this server already serves.</summary>
     internal static object[] McpTools() =>
     [
+        Tool("gergur_set_task",
+            "Say what you are doing, in a few words the user can read, such as \"Researching flights to Tokyo\". Required before the other tools work (listing tabs and reading settings aside); call it again whenever the task changes.",
+            new { task = Text("What you are doing, in a few words.") },
+            ["task"]),
         Tool("gergur_list_tabs",
             "List every open tab across all Gergur windows: flat index, which window, url, title, sleep state, and any errors the page reported.",
             new { }, []),
@@ -1312,13 +1970,118 @@ public sealed class AgentServer
             },
             []),
         Tool("gergur_run_javascript",
-            "Evaluate JavaScript in a page and return the result. A promise is awaited, so fetch and the like come back with their value rather than an empty object.",
+            "Evaluate JavaScript in a page and return the result. A promise is awaited, so fetch and the like come back with their value rather than an empty object. Refused on a page where a password is filled in: use gergur_login there.",
             new { js = Text("The expression to evaluate."), id = Id(), index = Index() }, ["js"]),
-        Tool("gergur_click", "Click the first element matching a CSS selector. Animates a visible cursor to it first.",
+        Tool("gergur_click",
+            "Click the first element matching a CSS selector with a real mouse click, the kind sites accept as a person's. Scrolls it into view and animates a visible cursor there first. Reports anything covering it (then it calls the element's click() instead of clicking the cover), a file chooser the click opened (closed unseen: use gergur_upload), tabs it opened, and page dialogs it answered.",
             new { selector = Text("A CSS selector."), id = Id(), index = Index() }, ["selector"]),
-        Tool("gergur_type_text", "Fill an input or textarea, in a way React and similar frameworks notice.",
-            new { selector = Text("A CSS selector for the field."), text = Text("The text to enter."), id = Id(), index = Index() },
+        Tool("gergur_type_text",
+            "Type into an input, textarea or editable element as the keyboard does, so every framework sees it. Replaces what is there unless clear is false. Reports whether the field then holds the text, without echoing it back.",
+            new
+            {
+                selector = Text("A CSS selector for the field."),
+                text = Text("The text to enter. Empty with clear empties the field."),
+                clear = new { type = "boolean", description = "Replace what is in the field. Defaults to true; false adds to the end." },
+                submit = new { type = "boolean", description = "Press Enter afterwards." },
+                id = Id(),
+                index = Index(),
+            },
             ["selector", "text"]),
+        Tool("gergur_press_key",
+            "Press a key or chord, such as Enter, Escape, Tab, ArrowDown, PageDown, F5, a single character, Ctrl+A or Shift+Tab. Goes to the element a selector names, or to whatever has the focus.",
+            new
+            {
+                key = Text("The key or chord."),
+                selector = Text("Optional: focus this element first."),
+                times = new { type = "integer", description = "Press it this many times, up to 50. Defaults to 1." },
+                id = Id(),
+                index = Index(),
+            },
+            ["key"]),
+        Tool("gergur_hover",
+            "Move the mouse over an element and leave it there, for menus and tooltips that open on hover.",
+            new { selector = Text("A CSS selector."), id = Id(), index = Index() }, ["selector"]),
+        Tool("gergur_scroll",
+            "Scroll the page or something in it. With only a selector, brings that element to the middle of the view. With dx/dy, turns the mouse wheel by that many pixels, over the selector's element (to scroll a list or panel) or the middle of the page. With to, goes to the top or bottom. With nothing, scrolls down 600 pixels. Answers where the page is now.",
+            new
+            {
+                selector = Text("Optional element to bring into view, or to scroll inside."),
+                dx = new { type = "number", description = "Pixels right (negative: left)." },
+                dy = new { type = "number", description = "Pixels down (negative: up)." },
+                to = new { type = "string", @enum = new[] { "top", "bottom" }, description = "Go to the top or bottom of the page." },
+                id = Id(),
+                index = Index(),
+            },
+            []),
+        Tool("gergur_select_option",
+            "Choose an option in a <select> drop-down, by its value or by the words shown on it. When none fits, the options there are come back. Drop-downs a site builds from ordinary elements are clicked instead.",
+            new
+            {
+                selector = Text("A CSS selector for the <select>."),
+                value = Text("The option's value attribute."),
+                label = Text("The words shown on the option."),
+                id = Id(),
+                index = Index(),
+            },
+            ["selector"]),
+        Tool("gergur_wait_for",
+            "Wait until an element is on the page and visible, or some words are in its text, or with gone until they are not. Answers met:false at the timeout rather than failing.",
+            new
+            {
+                selector = Text("A CSS selector to wait for."),
+                text = Text("Words to wait for in the page's visible text."),
+                gone = new { type = "boolean", description = "Wait for it to go away instead." },
+                timeout = new { type = "number", description = "Seconds to wait, up to 18. Defaults to 10." },
+                id = Id(),
+                index = Index(),
+            },
+            []),
+        Tool("gergur_upload",
+            "Upload files from this computer: give the <input type=file> (it works even when the page hides it), or the button that opens the file chooser, and the files' absolute paths. The chooser never appears on screen.",
+            new
+            {
+                selector = Text("A CSS selector for the file input, or for the button that opens the chooser."),
+                files = new { type = "array", items = new { type = "string" }, description = "Absolute paths to the files." },
+                id = Id(),
+                index = Index(),
+            },
+            ["selector", "files"]),
+        Tool("gergur_dialogs",
+            "In your own window, page dialogs (alert, confirm, prompt, \"leave this page?\") are answered for you, never shown. This reads the recent ones and sets how the next are answered: accept for confirm and prompt (default true), and text for prompts.",
+            new
+            {
+                accept = new { type = "boolean", description = "OK (true) or Cancel (false) for the next confirm and prompt dialogs." },
+                text = Text("What the next prompt dialogs are answered with. null goes back to each prompt's default."),
+                id = Id(),
+                index = Index(),
+            },
+            []),
+        Tool("gergur_login",
+            "Sign in with a password the person saved in Gergur. When the person logs in to a site in their own window, Gergur asks whether to save it; a saved login then fills in by itself as that site's sign-in page loads, in your windows too. This checks that it did and presses the form's sign-in button (or Enter in the password field). The password never comes back to you. Call it on a freshly loaded sign-in page, before typing in it or running scripts there. If nothing is filled, no login is saved for the site: ask the person with gergur_ask_person. For a site that asks for the username on one page and the password on the next, type the username and continue yourself, then call this. Reports the account it signed in as and where the page went.",
+            new
+            {
+                submit = new { type = "boolean", description = "Press sign in (true, the default), or only check whether a saved login is filled in (false)." },
+                id = Id(),
+                index = Index(),
+            },
+            []),
+        Tool("gergur_ask_person",
+            "Ask the person at the computer for something only they can do or decide: a code from their phone, a captcha, a login, a choice. It appears in a bar across their window with a reply box, Done and Can't, and a button to show your window. Waits up to the timeout; if they have not answered by then, call again with the id it gave to keep waiting.",
+            new
+            {
+                question = Text("What you need from them, in a sentence. Say where to look, such as \"in the agent window\"."),
+                id = Text("The id of a question already asked, to keep waiting for its answer instead of asking again."),
+                timeout = new { type = "number", description = "Seconds to wait this time, up to 18. Defaults to 18." },
+            },
+            []),
+        Tool("gergur_downloads",
+            "List the downloads that came from your own windows and tabs, with where each was saved and how far along it is. Set wait to come back once none is still running.",
+            new
+            {
+                wait = new { type = "boolean", description = "Wait until none is running, up to the timeout." },
+                timeout = new { type = "number", description = "Seconds to wait, up to 18. Defaults to 15." },
+            },
+            []),
         Tool("gergur_open_window",
             "Open another browser window on the same session. Leave focus false to work in it without taking the screen from whoever is using the browser.",
             new
@@ -1410,6 +2173,7 @@ public sealed class AgentServer
                         protocolVersion = McpProtocolVersion,
                         capabilities = new { tools = new { listChanged = false } },
                         serverInfo = new { name = "gergur", version = "1.0.0" },
+                        instructions = McpInstructions,
                     },
                 }));
 
@@ -1436,6 +2200,8 @@ public sealed class AgentServer
     {
         if (RejectBadToolCall(request, out string name) is { } rejection)
             return rejection;
+        if (TaskRefusal(name, CurrentRequest.Value?.Caller, _session.Agents.TaskOf) is { } sayFirst)
+            return sayFirst;
         var (httpMethod, path) = RouteForTool(name);
 
         JsonDocument? args = null;
@@ -1597,6 +2363,507 @@ public sealed class AgentServer
         }
         """;
 
+    private const string NothingMatches = "nothing on the page matches that selector (or it is not a valid CSS selector)";
+    private const string WentAway = "the element went away before it could be reached";
+
+    internal const string PasswordOnPage =
+        "a password is filled in on this page, so scripts are not run here: an agent signs in with the person's saved "
+        + "passwords without ever reading them. Use gergur_login to sign in, or the other tools to work on the page.";
+
+    internal const string NoPasswordField =
+        "there is no password field on this page. If it asks for the username first, type it and continue, then call "
+        + "gergur_login on the page that asks for the password. A sign-in form inside a frame from another site, which "
+        + "some sites use, cannot be reached either: then ask the person with gergur_ask_person.";
+
+    internal const string PasswordElsewhere =
+        "the password field on this page is inside a frame or a component that gergur_login cannot reach, so it cannot sign "
+        + "in here. Ask the person with gergur_ask_person to sign in.";
+
+    internal const string SeveralPasswordFields =
+        "this page shows more than one password field (a sign-up or change-password form, most likely), so a saved "
+        + "password is not sent from it. Check with gergur_login and submit false, or ask the person.";
+
+    internal const string NoSavedLogin =
+        "the password field is empty, so the person has no saved login for this site (or the page cleared it). "
+        + "Saved logins fill in as the sign-in page loads, so load it again (gergur_navigate) and call gergur_login "
+        + "before typing in it. Still empty: ask the person with gergur_ask_person to sign in, or to sign in once in "
+        + "their own window and choose Save.";
+
+    internal const string ScriptedLoginPage =
+        "a script was run in this page (gergur_run_javascript) since it loaded, or the tab went back or forward since "
+        + "one was, so a saved password is not sent from it: the script could have changed where the form goes. Load "
+        + "the page again (gergur_navigate) and call gergur_login before running scripts in it.";
+
+    internal const string PasswordDuringScript =
+        "a password was filled in on this page by the time the script finished, so its answer is kept back: it could "
+        + "hold the password. Nothing was undone; the script did run. (Also said when the page could not be looked at "
+        + "afterwards, because it was still loading.)";
+
+    internal const string PasswordInPlainText =
+        "a password is shown as plain text on this page (a \"show password\" switch is on), so it is not photographed. "
+        + "Switch it back, or read the page with gergur_read_page.";
+
+    /// <summary>
+    /// Whether the page holds a password, as a number (the engine hands a string back quoted):
+    /// 0 none, 1 one in a password field (shown as dots), 2 one shown as plain text. A field counts as a password field when it is one, or was one
+    /// and a "show password" switch made it text: its autocomplete says current-password or
+    /// new-password, its name or id says password, or /login marked it. Searched in the
+    /// document, open shadow roots, and frames this page can reach, since a script here could
+    /// read those as well. Anything that throws counts as a password, not as none.
+    /// </summary>
+    internal const string PasswordStateJs = """
+        (() => {
+            try {
+                // A "show password" or "remember password" checkbox is named like one and
+                // holds "on"; buttons and files hold no typed secret either.
+                const notTyped = ['checkbox', 'radio', 'submit', 'button', 'image', 'reset', 'file'];
+                const secret = i => i.type === 'password'
+                    || (!notTyped.includes(i.type) && /\b(current|new)-password\b/i.test(i.getAttribute('autocomplete') || ''))
+                    || (!notTyped.includes(i.type) && [i.name, i.id].some(n => /password|passwd|pwd|^pass$/i.test(n || '')))
+                    || (i.getAttribute('data-gergur-login') || '').startsWith('pass-');
+                let state = 0;
+                const look = root => {
+                    for (const i of root.querySelectorAll('input'))
+                        if (i.value && secret(i)) state = Math.max(state, i.type === 'password' || i.type === 'hidden' ? 1 : 2);
+                    for (const el of root.querySelectorAll('*')) if (el.shadowRoot) look(el.shadowRoot);
+                    for (const f of root.querySelectorAll('iframe, frame')) {
+                        let d = null;
+                        try { d = f.contentDocument; } catch (e) { }
+                        if (d) look(d);
+                    }
+                };
+                look(document);
+                return state;
+            } catch (e) {
+                return 2;
+            }
+        })()
+        """;
+
+    /// <summary>
+    /// <see cref="PasswordStateJs"/> as the engine hands it back, raw JSON: a number. Anything
+    /// else (a page that could not be read is "null"; a string would come back quoted) is not
+    /// taken for none.
+    /// </summary>
+    internal static bool HoldsNoPassword(string raw) => raw == "0";
+
+    /// <summary>Whether <see cref="PasswordStateJs"/> answered that a password shows as plain text.</summary>
+    internal static bool ShowsPasswordAsText(string raw) => raw == "2";
+
+    /// <summary>
+    /// What <see cref="LoginStateJs"/> found: password fields shown in the document, whether the
+    /// first holds something, the username beside it, a button that sends its form, and whether
+    /// there are password fields it cannot reach (in a frame or a shadow root).
+    /// </summary>
+    internal sealed record LoginState(int Fields, bool Filled, string? User, bool Button, bool Elsewhere = false);
+
+    /// <summary>
+    /// Looks at the sign-in form without reading the password: how many password fields are
+    /// shown, whether the first one holds something, the username typed or filled before it,
+    /// and the form's submit button. The field and the button are marked with the nonce so
+    /// the next steps reach the same two elements.
+    /// </summary>
+    internal static string LoginStateJs(string nonce) => $$"""
+        (() => {
+            const shown = el => { const r = el.getBoundingClientRect(); const s = getComputedStyle(el);
+                return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none'; };
+            const fields = [...document.querySelectorAll('input')].filter(i => i.type === 'password' && shown(i));
+            if (fields.length === 0) {
+                const inside = root => {
+                    for (const el of root.querySelectorAll('*'))
+                        if (el.shadowRoot && (el.shadowRoot.querySelector('input[type=password]') || inside(el.shadowRoot))) return true;
+                    for (const f of root.querySelectorAll('iframe, frame')) {
+                        let d = null;
+                        try { d = f.contentDocument; } catch (e) { }
+                        if (d && (d.querySelector('input[type=password]') || inside(d))) return true;
+                    }
+                    return false;
+                };
+                return { fields: 0, elsewhere: inside(document) };
+            }
+            const p = fields[0];
+            p.setAttribute('data-gergur-login', 'pass-{{nonce}}');
+            const scope = p.form ? [...p.form.elements] : [...document.querySelectorAll('input')];
+            const users = scope.filter(i => i instanceof HTMLInputElement && ['text', 'email', 'tel'].includes(i.type)
+                && shown(i) && (p.compareDocumentPosition(i) & Node.DOCUMENT_POSITION_PRECEDING));
+            const u = users.length ? users[users.length - 1] : null;
+            let button = null;
+            if (p.form)
+                button = [...p.form.elements].find(b => shown(b) && !b.disabled
+                    && ((b instanceof HTMLButtonElement && b.type === 'submit')
+                        || (b instanceof HTMLInputElement && (b.type === 'submit' || b.type === 'image'))));
+            if (button) button.setAttribute('data-gergur-login', 'go-{{nonce}}');
+            return { fields: fields.length, filled: p.value.length > 0, user: u && u.value ? u.value.slice(0, 100) : null, button: !!button };
+        })()
+        """;
+
+    /// <summary>Whether the password field /login used is still on the page and shown: the sign-in did not go through, or asks again.</summary>
+    internal static string StillAskingJs(string nonce) => $$"""
+        (() => {
+            const p = document.querySelector('[data-gergur-login="pass-{{nonce}}"]');
+            if (!p) return false;
+            const r = p.getBoundingClientRect();
+            return r.width > 0 && r.height > 0;
+        })()
+        """;
+
+    /// <summary>
+    /// Where /login stops before sending anything, with its answer, or null to go on and sign in.
+    /// The submit false answer is the one that works on a page an agent scripted: it sends
+    /// nothing, and the username it reports is on the page for anyone to read.
+    /// </summary>
+    internal static (int Status, object Answer)? LoginStop(LoginState? state, bool submit, bool scripted)
+    {
+        if (state is null || state.Fields == 0)
+            return (200, new { ok = false, filled = false, error = state?.Elsewhere == true ? PasswordElsewhere : NoPasswordField });
+        if (!state.Filled)
+            return (200, new { ok = false, filled = false, error = NoSavedLogin });
+        if (!submit)
+            return (200, new { ok = true, filled = true, user = state.User, submitted = false });
+        if (state.Fields > 1)
+            return (409, new { error = SeveralPasswordFields });
+        if (scripted)
+            return (409, new { error = ScriptedLoginPage });
+        return null;
+    }
+
+    /// <summary>What <see cref="LoginStateJs"/> answered, or null when the answer is not one.</summary>
+    internal static LoginState? ParseLoginState(string raw)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(raw);
+            var e = doc.RootElement;
+            if (e.ValueKind != JsonValueKind.Object || !e.TryGetProperty("fields", out var f) || f.ValueKind != JsonValueKind.Number)
+                return null;
+            bool B(string name) => e.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.True;
+            string? user = e.TryGetProperty("user", out var u) && u.ValueKind == JsonValueKind.String ? u.GetString() : null;
+            return new LoginState(f.GetInt32(), B("filled"), user, B("button"), B("elsewhere"));
+        }
+        catch (Exception ex) when (ex is JsonException or FormatException or InvalidOperationException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>How long the cursor takes to glide to an element, so the act lands when it arrives.</summary>
+    private static readonly TimeSpan CursorGlide = TimeSpan.FromMilliseconds(600);
+
+    /// <summary>The least a single read in a wait is given, so the last one is not handed nothing.</summary>
+    private static readonly TimeSpan MinRead = TimeSpan.FromMilliseconds(500);
+
+    private static readonly JsonSerializerOptions QuietJson = new()
+    {
+        DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull,
+    };
+
+    /// <summary>An answer with its empty parts left out, so an agent reads what happened and not a list of what did not.</summary>
+    private static byte[] Quiet(object o) => JsonSerializer.SerializeToUtf8Bytes(o, QuietJson);
+
+    /// <summary>Where an element is in the view, as the page measured it, in the page's own pixels.</summary>
+    /// <param name="Covered">Something else is on top at its centre, so a click there would reach that instead.</param>
+    /// <param name="CoveredBy">What is on top, as tag#id.class, for the agent to close.</param>
+    internal sealed record Located(double X, double Y, double W, double H, string Tag, string? Type,
+        bool FileInput, bool InView, bool Covered, string? CoveredBy)
+    {
+        /// <summary>A click at its centre would reach it and nothing else.</summary>
+        public bool CanClickAt => InView && !Covered;
+    }
+
+    /// <summary>What <see cref="LocateJs"/> answered, or null when nothing matched or the answer is not one.</summary>
+    internal static Located? ParseLocated(string raw)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(raw);
+            var e = doc.RootElement;
+            if (e.ValueKind != JsonValueKind.Object || !e.TryGetProperty("found", out var found) || found.ValueKind != JsonValueKind.True)
+                return null;
+            double N(string name) => e.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.Number ? v.GetDouble() : 0;
+            string? S(string name) => e.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() : null;
+            bool B(string name) => e.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.True;
+            return new Located(N("x"), N("y"), N("w"), N("h"), S("tag") ?? "", S("type"), B("fileInput"), B("inView"), B("covered"), S("coveredBy"));
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Finds an element, scrolls it to the middle of the view and measures it: its centre,
+    /// whether that is on screen, and whether something else is on top there. A label for
+    /// the element counts as the element, since clicking it is clicking the field.
+    /// With animate, the visible cursor sets off towards it.
+    /// </summary>
+    internal static string LocateJs(string selector, bool animate) => $$"""
+        (() => {
+            let el;
+            try { el = document.querySelector({{JsonSerializer.Serialize(selector)}}); } catch (e) { return { found: false }; }
+            if (!el) return { found: false };
+            el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+            const r = el.getBoundingClientRect();
+            const x = r.left + r.width / 2, y = r.top + r.height / 2;
+            const inView = r.width > 0 && r.height > 0 && x >= 0 && y >= 0 && x < innerWidth && y < innerHeight;
+            let covered = false, coveredBy = null;
+            if (inView) {
+                const top = document.elementFromPoint(x, y);
+                const label = top && top.closest ? top.closest('label') : null;
+                if (top && top !== el && !el.contains(top) && !(label && label.control === el)) {
+                    covered = true;
+                    const cls = typeof top.className === 'string' ? top.className.split(' ').filter(Boolean).slice(0, 2) : [];
+                    coveredBy = (top.tagName.toLowerCase() + (top.id ? '#' + top.id : '') + cls.map(c => '.' + c).join('')).slice(0, 80);
+                }
+            }
+            {{(animate ? CursorJs + AnimateJs : "")}}
+            return { found: true, x, y, w: r.width, h: r.height, tag: el.tagName.toLowerCase(),
+                type: typeof el.type === 'string' ? el.type : null,
+                fileInput: el instanceof HTMLInputElement && el.type === 'file', inView, covered, coveredBy };
+        })()
+        """;
+
+    private const string AnimateJs = """
+        if (inView) __gergurCursorTo(x, y, () => {
+            const prev = el.style.outline;
+            el.style.outline = '2px solid #3D7BFA';
+            setTimeout(() => { el.style.outline = prev; }, 600);
+        });
+        """;
+
+    private async Task<(Located? Spot, bool Ready)> LocateAsync(Tab tab, string selector, bool animate)
+    {
+        var (raw, ready) = await OnUiAsync(() => tab.ReadScriptAsync(LocateJs(selector, animate), Tab.WakeTimeout));
+        return (ready ? ParseLocated(raw) : null, ready);
+    }
+
+    /// <summary>The element's own click(), for when a real one cannot reach it.</summary>
+    internal static string SyntheticClickJs(string selector) => $$"""
+        (() => {
+            let el;
+            try { el = document.querySelector({{JsonSerializer.Serialize(selector)}}); } catch (e) { return false; }
+            if (!el) return false;
+            el.click();
+            return true;
+        })()
+        """;
+
+    /// <summary>
+    /// Gives an element the keyboard focus, and either selects what is in it, for typing
+    /// over, or puts the caret at the end, for adding to it. True when it took the focus.
+    /// </summary>
+    internal static string FocusJs(string selector, bool selectAll) => $$"""
+        (() => {
+            let el;
+            try { el = document.querySelector({{JsonSerializer.Serialize(selector)}}); } catch (e) { return false; }
+            if (!el) return false;
+            el.focus({ preventScroll: true });
+            if ({{(selectAll ? "true" : "false")}}) {
+                if (typeof el.select === 'function') el.select();
+                else if (el.isContentEditable) {
+                    const range = document.createRange();
+                    range.selectNodeContents(el);
+                    const chosen = getSelection();
+                    chosen.removeAllRanges();
+                    chosen.addRange(range);
+                }
+            } else if (typeof el.setSelectionRange === 'function' && typeof el.value === 'string') {
+                try { el.setSelectionRange(el.value.length, el.value.length); } catch (e) { }
+            }
+            const active = document.activeElement;
+            return active === el || el.contains(active);
+        })()
+        """;
+
+    /// <summary>
+    /// Sets a field's value the way React and its kind notice, for when real typing cannot
+    /// be sent: the prototype's setter, then input and change.
+    /// </summary>
+    internal static string SetValueJs(string selector, string text, bool replace) => $$"""
+        (() => {
+            let el;
+            try { el = document.querySelector({{JsonSerializer.Serialize(selector)}}); } catch (e) { return false; }
+            if (!el) return false;
+            el.focus();
+            const text = {{JsonSerializer.Serialize(text)}};
+            if (el.isContentEditable && !(el instanceof HTMLInputElement) && !(el instanceof HTMLTextAreaElement)) {
+                el.textContent = {{(replace ? "text" : "el.textContent + text")}};
+            } else {
+                const next = {{(replace ? "text" : "(el.value || '') + text")}};
+                const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+                const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+                if (desc && desc.set) desc.set.call(el, next); else el.value = next;
+            }
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+            return true;
+        })()
+        """;
+
+    /// <summary>What a field holds now, as a string, or null when it is gone.</summary>
+    internal static string ValueJs(string selector) => $$"""
+        (() => {
+            let el;
+            try { el = document.querySelector({{JsonSerializer.Serialize(selector)}}); } catch (e) { return null; }
+            if (!el) return null;
+            return typeof el.value === 'string' ? el.value : (el.innerText || '');
+        })()
+        """;
+
+    /// <summary>
+    /// Whether a field says what was typed: all of it when it was typed over, its end when
+    /// added to. Null when the field could not be read, which after Enter is often because
+    /// the page went on to the next one.
+    /// </summary>
+    internal static bool? Matches(string? now, string text, bool replaced)
+    {
+        if (now is null)
+            return null;
+        string trimmed = now.TrimEnd();
+        return replaced
+            ? now == text || trimmed == text
+            : now.EndsWith(text, StringComparison.Ordinal) || trimmed.EndsWith(text, StringComparison.Ordinal);
+    }
+
+    internal static string UnknownKey(string key)
+        => $"not a key Gergur knows: \"{Truncate(key, 40)}\". Use a name such as Enter, Tab, Escape, Backspace, ArrowDown, PageDown or F5, "
+            + "a single character, or a chord such as Ctrl+A or Shift+Tab.";
+
+    private const string ScrollStateJs = """
+        ({ ok: true, x: Math.round(scrollX), y: Math.round(scrollY),
+           height: document.documentElement.scrollHeight, viewport: innerHeight,
+           atTop: scrollY <= 0,
+           atBottom: Math.ceil(scrollY + innerHeight) >= document.documentElement.scrollHeight })
+        """;
+
+    /// <summary>Two numbers from a page's [x, y], or null.</summary>
+    internal static (double X, double Y)? ParsePoint(string raw)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(raw);
+            var e = doc.RootElement;
+            return e.ValueKind == JsonValueKind.Array && e.GetArrayLength() == 2
+                && e[0].ValueKind == JsonValueKind.Number && e[1].ValueKind == JsonValueKind.Number
+                ? (e[0].GetDouble(), e[1].GetDouble())
+                : null;
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Chooses an option in a select, by its value or else by the words on it (spacing and
+    /// then case ignored), with input and change fired as a person's choice fires them.
+    /// When none fits, the options there are come back so the agent can pick one.
+    /// </summary>
+    internal static string SelectJs(string selector, string? value, string? label) => $$"""
+        (() => {
+            let el;
+            try { el = document.querySelector({{JsonSerializer.Serialize(selector)}}); } catch (e) { return null; }
+            if (!(el instanceof HTMLSelectElement)) return null;
+            const want = {{JsonSerializer.Serialize(value)}}, words = {{JsonSerializer.Serialize(label)}};
+            const norm = s => (s || '').trim().split(' ').filter(Boolean).join(' ');
+            const opts = Array.from(el.options);
+            let found = want !== null ? opts.find(o => o.value === want) : undefined;
+            if (!found && words !== null) {
+                found = opts.find(o => norm(o.text) === norm(words))
+                    || opts.find(o => norm(o.text).toLowerCase() === norm(words).toLowerCase());
+            }
+            if (!found) return { ok: false, error: 'no option like that', options: opts.slice(0, 50).map(o => ({ value: o.value, label: norm(o.text) })) };
+            if (found.disabled) return { ok: false, error: 'that option is disabled' };
+            el.focus();
+            found.selected = true;
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+            return { ok: true, value: found.value, label: norm(found.text) };
+        })()
+        """;
+
+    /// <summary>
+    /// Whether what a wait is for is there: an element that is laid out and not hidden,
+    /// and words in the page's visible text. Both when both are named.
+    /// </summary>
+    internal static string WaitJs(string? selector, string? text) => $$"""
+        (() => {
+            try {
+                const sel = {{JsonSerializer.Serialize(selector)}}, words = {{JsonSerializer.Serialize(text)}};
+                let here = true;
+                if (sel !== null) {
+                    let el;
+                    try { el = document.querySelector(sel); } catch (e) { return 'invalid selector'; }
+                    here = !!el && el.getClientRects().length > 0 && getComputedStyle(el).visibility !== 'hidden';
+                }
+                if (here && words !== null) here = !!document.body && document.body.innerText.includes(words);
+                return here;
+            } catch (e) { return false; }
+        })()
+        """;
+
+    /// <summary>How many files a file input holds, or null.</summary>
+    internal static string FileCountJs(string selector) => $$"""
+        (() => {
+            let el;
+            try { el = document.querySelector({{JsonSerializer.Serialize(selector)}}); } catch (e) { return null; }
+            return el && el.files ? el.files.length : null;
+        })()
+        """;
+
+    /// <summary>The paths an upload names: an array of strings, or one string.</summary>
+    internal static IReadOnlyList<string> FilesIn(JsonDocument? body)
+    {
+        if (body is not { RootElement.ValueKind: JsonValueKind.Object } || !body.RootElement.TryGetProperty("files", out var files))
+            return [];
+        return files.ValueKind switch
+        {
+            JsonValueKind.String => [files.GetString() ?? ""],
+            JsonValueKind.Array => files.EnumerateArray().Select(f => f.ValueKind == JsonValueKind.String ? f.GetString() ?? "" : "").ToList(),
+            _ => [],
+        };
+    }
+
+    /// <summary>The page dialogs a tab answered, as an agent reads them; null when there were none.</summary>
+    internal static object[]? DialogsOut(IReadOnlyList<Tab.DialogSeen> dialogs)
+        => dialogs.Count == 0
+            ? null
+            : dialogs.Select(d => (object)new { kind = d.Kind, message = d.Message, accepted = d.Accepted, answer = d.Answer }).ToArray();
+
+    /// <summary>The tabs a tab has opened that are still open, by id. UI thread work, so it is sent there.</summary>
+    private Task<HashSet<string>> OpenedFromAsync(Tab tab)
+        => OnUiAsync(() => Task.FromResult(AllTabs().Where(e => e.Tab.Opener == tab).Select(e => e.Tab.Id).ToHashSet()));
+
+    /// <summary>Tabs the tab opened since <paramref name="before"/>: a popup or target=_blank link. Null when none.</summary>
+    private async Task<object[]?> NewlyOpenedAsync(Tab tab, HashSet<string> before)
+    {
+        await Task.Delay(150); // the engine's NewWindowRequested comes a moment after the click
+        var opened = await OnUiAsync(() => Task.FromResult(AllTabs()
+            .Where(e => e.Tab.Opener == tab && !before.Contains(e.Tab.Id))
+            .Select(e => (object)new { id = e.Tab.Id, url = InternalPages.NameOf(e.Tab.Url) })
+            .ToArray()));
+        return opened.Length == 0 ? null : opened;
+    }
+
+    /// <summary>
+    /// An agent's downloads: from a window of its own, or from a tab it was acting in when the
+    /// download started (<see cref="DownloadOwner"/>). The person's own downloads are theirs
+    /// and never listed, in a tab an agent once touched included. UI thread.
+    /// </summary>
+    private (int Running, object[] Listed) DownloadsOf(string agentKey)
+    {
+        var mine = _session.Downloads.Items.Where(d => d.AgentKey == agentKey).ToList();
+        return (mine.Count(d => d.IsRunning), mine.Select(d => (object)new
+        {
+            id = d.Id,
+            file = d.FileName,
+            path = d.FilePath,
+            state = d.State.ToString(),
+            received = d.BytesReceived,
+            total = d.TotalBytes,
+            from = Truncate(d.Uri, 300),
+        }).ToArray());
+    }
+
     /// <summary>
     /// What an endpoint says when the tab's page could not be started at all, as opposed
     /// to a url the engine refused. Told apart because the fix is different: a caller told
@@ -1671,7 +2938,7 @@ public sealed class AgentServer
     {
         // A click or typing from here is the person's, as far as a fullscreen request can
         // tell. The window is told it was an agent, so it does not take the screen for it.
-        tab.NoteAgentAction();
+        Acting(tab);
         var (raw, ready) = await OnUiAsync(() => tab.ReadScriptAsync(js, Tab.WakeTimeout));
         return (raw == "true", ready);
     }

@@ -184,22 +184,26 @@ public sealed class AgentsPanelTests
             };
             var tabs = new Dictionary<string, AgentTabInfo>
             {
-                ["t7"] = new("t7", "A song", "https://www.youtube.com/watch?v=x", InAgentWindow: true),
-                ["t2"] = new("t2", "", "https://example.com/", InAgentWindow: false),
-                ["t3"] = new("t3", "Three", "https://three.example/", InAgentWindow: false),
-                ["t4"] = new("t4", "Four", "https://four.example/", InAgentWindow: false),
+                ["t7"] = new("t7", "A song", "https://www.youtube.com/watch?v=x", Hidden: true),
+                ["t2"] = new("t2", "", "https://example.com/", Hidden: false),
+                ["t3"] = new("t3", "Three", "https://three.example/", Hidden: false),
+                ["t4"] = new("t4", "Four", "https://four.example/", Hidden: false),
                 // t8 has closed: not listed.
             };
             var shown = new List<string>();
-            using var panel = new AgentsFlyout(() => agents, id => tabs.GetValueOrDefault(id), shown.Add, () => "Agent API on");
+            int pageOpened = 0;
+            using var panel = new AgentsFlyout(() => agents, id => tabs.GetValueOrDefault(id), shown.Add, () => "Agent API on", () => pageOpened++);
             panel.Relayout(keepPlace: false);
 
             // Three tabs at most for the first agent, the closed one skipped, and t7 not
-            // listed again under the second.
-            Assert.Equal(new[] { "Show A song", "Show https://example.com/", "Show Three" }, panel.Spots.Select(s => s.Spoken));
-            Assert.Equal("Bring its window forward", panel.Spots[0].Tip);
+            // listed again under the second; then the way through to the full page.
+            Assert.Equal(new[] { "Show A song", "Show https://example.com/", "Show Three", "Open the agents page" }, panel.Spots.Select(s => s.Spoken));
+            Assert.Equal("Show its hidden window", panel.Spots[0].Tip);
+            Assert.Equal("Go to this tab", panel.Spots[1].Tip);
             panel.RunSpot(panel.Spots[0]);
             Assert.Equal(["t7"], shown);
+            panel.RunSpot(panel.Spots[^1]);
+            Assert.Equal(1, pageOpened);
         });
     }
 
@@ -343,9 +347,9 @@ public sealed class AgentsPanelTests
     {
         OnSta(() =>
         {
-            using var panel = new AgentsFlyout(() => [], _ => null, _ => { }, () => "Agent API on");
+            using var panel = new AgentsFlyout(() => [], _ => null, _ => { }, () => "Agent API on", () => { });
             panel.Relayout(keepPlace: false);
-            Assert.Empty(panel.Spots);
+            Assert.Equal(["Open the agents page"], panel.Spots.Select(s => s.Spoken));
             Assert.True(panel.Height > 0);
         });
     }
@@ -355,7 +359,8 @@ public sealed class AgentsPanelTests
     {
         string form = Code("Gergur", "UI", "MainForm.cs");
         Assert.Contains("_agentsButton.Visible = _settings.AgentServerEnabled;", form);
-        // A tab brought forward comes with its window, restored if minimised.
-        Assert.Matches(@"window\.WindowState = FormWindowState\.Normal;\s*await window\.Tabs\.ActivateAsync\(tab\);\s*window\.Activate\(\);", form);
+        // A tab brought forward comes with its window, out of hiding and restored if minimised.
+        Assert.Matches(@"await window\.Tabs\.ActivateAsync\(tab\);\s*window\.ShowToPerson\(\);", form);
+        Assert.Matches(@"if \(WindowState == FormWindowState\.Minimized\)\s*WindowState = FormWindowState\.Normal;\s*Activate\(\);", form);
     }
 }

@@ -20,6 +20,12 @@ public sealed class DownloadItem
     /// </summary>
     public int Id { get; internal set; }
 
+    /// <summary>The tab the download came from, so an agent is shown its own downloads and not the person's.</summary>
+    public string? TabId { get; internal set; }
+
+    /// <summary>The agent whose window the download started in, or null for the person's windows.</summary>
+    public string? AgentKey { get; internal set; }
+
     public string Uri { get; }
     public string FilePath { get; private set; }
     public DateTime StartedUtc { get; } = DateTime.UtcNow;

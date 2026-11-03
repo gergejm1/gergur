@@ -47,12 +47,23 @@ sent. Prefer the id: see "Naming a tab" below.
 | GET /html | | outer HTML |
 | GET /screenshot | ?activate=1, ?chrome=1 | PNG bytes |
 | GET /console | | {url, errors} - the same list the status bar counts |
-| POST /eval | {"js": "...", "await": false?, "timeout": s?} | run JS, returns {"ok": true, "result": ...} |
-| POST /click | {"selector": "..."} | querySelector + click; 503 if the page is not loaded |
-| POST /type | {"selector": "...", "text": "..."} | fill input (React-safe); 503 if the page is not loaded |
+| POST /eval | {"js": "...", "await": false?, "timeout": s?} | run JS, returns {"ok": true, "result": ...}; 409 where a password is filled in (see "Saved passwords") |
+| POST /click | {"selector": "..."} | a real (trusted) mouse click; reports covered, fileChooser, opened tabs, dialogs. See "Acting like a person" |
+| POST /type | {"selector": "...", "text": "...", "clear": false?, "submit": true?} | real typing (Input.insertText); answers matches without echoing the text |
+| POST /key | {"key": "Enter" or "Ctrl+A", "selector": "..."?, "times": n?} | press a key or chord |
+| POST /hover | {"selector": "..."} | move the mouse over it and leave it there |
+| POST /scroll | {"selector"?, "dx"?, "dy"?, "to": "top"/"bottom"?} | wheel, scroll into view, or to an end; answers {x, y, height, viewport, atTop, atBottom} |
+| POST /select | {"selector": "...", "value" or "label": "..."} | choose a <select> option; lists the options when none fits |
+| POST /wait | {"selector" and/or "text", "gone": true?, "timeout": s?} | {met, waitedSeconds}; met:false at the timeout, not an error |
+| POST /upload | {"selector": "...", "files": ["C:/abs/path", ...]} | file input (hidden ones too) or a button that opens the chooser |
+| GET or POST /dialogs | {"accept": false?, "text": "..."?} | recent page dialogs, and how the next confirm/prompt are answered |
+| GET /downloads | ?wait=1&timeout=s | the caller's own downloads: file, path, state, bytes |
+| POST /ask | {"question": "..."} or {"id": "ask-1"}, "timeout": s? | ask the person; a bar in their window. See "Asking the person" |
+| POST /login | {"submit": false?} | sign in with a saved password: {filled, user, submitted, via, stillAsking, url}. See "Saved passwords" |
 | GET /settings | | {settings, restartRequired, vpnInForce, tunnelRunning}; credentials read as "(hidden)" |
 | POST /settings | {"BlocklistEnabled": false, ...} | change settings, returns {applied, restartNeededFor, unknown, persisted} |
 | POST /window | {"url": "..."?, "focus": true?, "muted": true?} | open another window, returns {window, id} |
+| POST /task | {"task": "Researching flights to Tokyo"} | say what you are doing; shown to the person (see "Saying what you are doing") |
 
 `muted` opens the tab silent from its first frame: the mute is set on the tab before its
 view exists, and every view the tab builds afterwards starts muted. Use it for anything that
@@ -73,12 +84,31 @@ every window in window order.
 
 Nothing here takes the screen unless it is asked to:
 
-- `POST /window` opens a second window, placed directly behind whatever has focus
-  unless `focus` is set, and always with a tab in it. Not taking the keyboard is not the
-  same as not covering the screen: a new window starts at the top of the stack, so it is
-  put behind explicitly. Measured on 2026-09-22 with a terminal in front: focus kept, new
-  window behind. That is the one to reach for: a window of your own is where to work
-  without interrupting anyone. It answers with a `window` index.
+- `POST /window` opens a second window, always with a tab in it, and unless `focus` is
+  set the person never sees it at all: it is cloaked by the window manager before its
+  first frame (`DWMWA_CLOAK`, what Windows does to a window on another virtual desktop)
+  and its taskbar button is taken away (`ITaskbarList`), so it is not on screen, not on
+  the taskbar and not in Alt+Tab (`MainForm.HiddenForAgent`, `WindowStacking`). Its page
+  still draws, captures and takes trusted clicks: measured on WebView2, a cloaked page
+  stays "visible" to itself. It is also placed behind whatever has focus, as before, for
+  the case below where cloaking fails. That is the one to reach for: a window of your own
+  is where to work without interrupting anyone. It answers with a `window` index.
+  - Only the person shows it: Show on the agents panel or page. `/activate` never shows a
+    hidden window (it switches the tab and leaves the window hidden). Hide, X, Alt+F4 and
+    the taskbar's Close hide it again (`SendBackToAgent`); the person taking the window
+    over (`ClaimForPerson`) shows it for good.
+  - If the system will not cloak it (the attribute is undocumented), it opens as it used
+    to, behind and on the taskbar, and does not count as hidden: a window left on screen
+    with no taskbar button would be one nobody can find.
+  - When the person closes the last window they can see and only hidden agent windows are
+    left, those close too and the app exits (`MainForm.QuitsWithThisWindow`); otherwise
+    a browser would run on where nobody can find it. Work in progress in them ends. The
+    session file keeps the person's tabs (`AppSession.SessionOf` writes nothing when only
+    agent windows are left).
+  - An agent's window has a blue band across it (`AgentBanner`: AGENT, the agent's name,
+    what it says it is doing, Hide), and every tab in it, like every tab an agent opened
+    in one of the person's windows (`Tab.AgentName`), wears an AGENT pill on the strip.
+    The pill on a tab in the person's window goes once they navigate it from the address bar.
 - `POST /open` takes that `window` index, so tabs land in your window rather than the
   one the user is reading. With `background: true` it does not switch to the new tab.
 - `GET /screenshot` reads whatever the tab last rendered. `activate=1` switches the tab's
@@ -341,7 +371,7 @@ wakes it. The user's browsing is personal: read what the task requires, nothing 
   its tab strip, any keyboard shortcut in it, a link from another app landing in it, or a
   tab dragged in from their own window. Otherwise dragging all their tabs into an agent
   window emptied their own, which saved as nothing while the tabs lived on unsaved.
-- History, Downloads, Bookmarks and Settings are pages in a tab (`Assets/history.html`,
+- History, Downloads, Bookmarks, Settings and Agents are pages in a tab (`Assets/history.html`,
   `downloads.html`, `bookmarks.html`, `settings.html`, and the new tab page `home.html`), shown in the
   address bar as `gergur://history` and so on, which can also be typed, and saved in the
   session by those names rather than a path into the install. They were separate
@@ -607,8 +637,23 @@ wakes it. The user's browsing is personal: read what the task requires, nothing 
     downloads panel rather than the page.
   - Agents (`AgentsFlyout`, the robot button beside the menu, shown while the agent API is
     on): every agent since start, active (green dot, 30 s after its last request) or not,
-    what it did last in a few words, and up to three of its live tabs, any of which is
-    brought forward with its window on click. MCP clients are named by `clientInfo.name`
+    what it says it is doing, what it did last in a few words, and up to three of its live
+    tabs, any of which is brought forward with its window on click (out of hiding), and a
+    last row, "Open the agents page".
+  - The agents page (`gergur://agents`, `Assets/agents.html`, `AgentsPage` and
+    `IAgentsHost` behind it): the panel at full size. Each agent with its task, its
+    timeline (the last twelve actions with times), and its open tabs, each with a live
+    picture and Show, Hide (only in an agent's own window) and DevTools. Every tab says
+    where it is: hidden, agent window, or "Your window". Its ops (`agents.*`) act only on
+    tabs some agent has worked in and that are still open (`InternalPages.AgentTabOf`). The
+    pictures are small JPEGs (`Tab.CaptureThumbnailAsync`, 560 px wide) pushed as `data:`
+    urls in a "snapshot" push, which is why this page's CSP alone allows `img-src data:`.
+    A picture never wakes a tab or counts as using it, and they are rationed: two at most
+    under way, each tab at most every eight seconds, only cards on screen, one capture per
+    tab at a time on the browser side. The list itself is read every four seconds and on a
+    push after each agent action. The agent API cannot read or script it, like every other
+    own page. Verified: unit tests against a fake host, and the page in headless Edge with
+    `?demo=1`. MCP clients are named by `clientInfo.name`
     from initialize, carried as the `Mcp-Session-Id` header the server now issues; REST
     callers may send `X-Gergur-Agent: name`, otherwise they are "Script". `AgentActivity`
     records the route, the tab and the url's site, never typed text, scripts or page
@@ -707,6 +752,150 @@ wakes it. The user's browsing is personal: read what the task requires, nothing 
   only source checks, and the window behaviour was measured on the throwaway form, not on
   MainForm itself.
 
-Agent actions are visualized: /click and /type animate a blue cursor to the
-target, ripple, and flash the element, so the user can watch the agent work.
-Both endpoints return after the animation and action complete (~1s).
+Agent actions are visualized: /click, /type, /key (with a selector), /hover, /select and
+/upload animate a blue cursor to the target, ripple, and flash the element, so the user can
+watch the agent work. Each returns after the animation and the action (~1s).
+
+### Acting like a person
+
+/click, /type, /key, /hover and /scroll send real input through the DevTools protocol
+(`Input.dispatchMouseEvent`, `Input.insertText`, `Input.dispatchKeyEvent`; `Tabs/TabInput.cs`,
+`Tabs/TrustedInput.cs`), so the page sees `isTrusted: true` events. Sites that ignore
+script clicks (a "Submit" that checks isTrusted, a file chooser, a popup) now work.
+
+- The element is found, scrolled to the middle of the view and measured in the page
+  (`AgentServer.LocateJs`), then measured again after the cursor's glide in case it moved.
+- Covered: when something else is on top at its centre (`elementFromPoint`), the click is
+  NOT sent at that point, which would click the cover (a cookie banner's "Accept", say).
+  The element's own `click()` is called instead and the answer names the cover
+  (`covered: "div#consent"`, `trusted: false`). A label for the element counts as the element.
+- A click that fails before the button went down falls back to `click()`. One that fails
+  after (`MayHaveLanded`) is never retried: a second click on "Pay" is worse than none.
+  Each protocol call has a 5 second budget (`TabInput.CallBudget`), and a whole action
+  (click with its chooser watch, upload, a run of keys) 8 seconds between them
+  (`TabInput.ActionBudget`). A press that failed after the button went down sends the
+  release, so the button is not left held. Typing that timed out is treated the same way
+  as a click that may have landed: not set again.
+- Clicks and uploads in one tab take turns (`TabInput.TakeTurnAsync`): interception is
+  switched on and off per action, and overlapping ones would switch it off under each other.
+- The own-page check is made before the engine is touched and again directly before the
+  message that acts, with nothing awaited between: the chooser watch awaits, and the tab
+  may have reached gergur://settings meanwhile.
+- A file chooser a click opens is intercepted and closed unseen, and the answer says to
+  use /upload. A native dialog from a hidden window would land on the person's screen.
+- /upload with a file input sets its files (`DOM.setFileInputFiles`), hidden inputs
+  included. With anything else it clicks it and answers the chooser that opens. Paths must
+  be absolute, local and existing, at most 100 (`TrustedInput.CheckFiles`); nothing else is
+  restricted, as the person asked.
+- Page dialogs (alert, confirm, prompt, "leave this page?") in an agent's window are
+  answered by the tab itself (`AreDefaultScriptDialogsEnabled = false`, set before the first
+  navigation) and kept for /dialogs, the last 10. Confirm and prompt follow the tab's policy
+  (OK by default; prompt gets `text` or its default); alert and leave-page are always OK.
+  In the person's windows dialogs show as ever. A tab moved into the person's window, or an
+  agent window that becomes theirs, gets the engine's dialogs back at its next navigation
+  (`Tab.RefreshDialogMode`); until then a dialog is asked of the person in a plain box.
+- /click and /key report tabs the page opened (`opened`, by Opener) and dialogs answered
+  (`dialogs`, by `Tab.DialogsSince`).
+- /downloads lists only downloads put down to the caller (`DownloadItem.AgentKey`, set by
+  `AgentServer.DownloadOwner`): started in its own window, or in a tab it acted in (click, type, key,
+  hover, scroll, select, upload, eval, navigate; by id, index or none) within the last 30
+  seconds (`AgentServer.Acting`, `Tab.NoteDrivenBy`). Reads never count. The person's
+  are never listed, a download in a tab an agent once touched included.
+- The person's log (agents panel and page) says "Typed in t3", "Pressed a key", "Uploaded
+  files": never the text, keys or file names.
+
+Verified live on 2026-11-03 (`scratchpad/livetest/sprint2.ps1`, 55 checks, a hidden agent
+window on a local test page): trusted click/input/keydown/mouseover seen by the page,
+uploads through a visible input, a hidden one and a chooser button, no dialog window ever
+created, confirm cancelled and accepted, prompt answered, popup reported, covered element
+not clicked through, wheel/top/bottom/into-view scrolling, waits met and timed out, the
+agent's own download listed, focus never moved and the window stayed cloaked. Not verified
+live: the person-side dialog fallback (`AskPersonInstead`, `PromptBox`), input in a
+background tab of an agent window, and a tab zoomed away from 100%: coordinates come from
+`getBoundingClientRect` and go to `Input.dispatchMouseEvent` unscaled, which is right if the
+protocol takes CSS pixels at that zoom and wrong if not. Agent windows open at 100%.
+
+### Asking the person
+
+`gergur_ask_person` (POST /ask) is for what only the person can do: a code from their
+phone, a captcha, a login, a choice. The question (one printable line, at most 300
+characters, `AgentAsks.Clean`) appears in a bar across every one of the person's windows,
+never an agent's, in the agents' blue: who asks, the question, a reply box, Done, Can't,
+"Show its window" when the agent has a tab open, and how many more are waiting. A new
+question flashes the window's taskbar button until it comes to the front; nothing is
+brought forward. The call waits up to its timeout (18 s over MCP) and answers
+`{id, answered: false}`; calling again with the id keeps waiting. The answer is
+`{answered: true, done, reply}`, handed over once. At most 10 wait at a time; the same
+question asked again while it waits is the same question; everything is forgotten after an
+hour. An id is only answered to the agent that asked. Verified live: asked, answered in the
+bar through UI automation, the reply reached the agent, the bar went away, focus did not move.
+
+### Saved passwords
+
+The person asked for a vault: offered on every login, kept only if they say yes, and usable by
+every agent without the agent ever seeing a password. The engine already is one, so Gergur
+does not keep passwords of its own:
+
+- Saving is the engine's (`SavePasswords`, on by default): after a sign-in in the person's
+  window it shows "Save your password?" with Save and Not now, and keeps what they save
+  encrypted in the profile. Agent windows never offer to save
+  (`BrowserEnvironment.SavesPasswords`, `IsPasswordAutosaveEnabled` off there, set when the
+  view is built, when settings change and in `Tab.RefreshDialogMode` when a tab moves or the
+  window is claimed): what an agent types is not the person choosing to keep it.
+- Filling is the engine's too, and reaches agent windows, which share the profile: a saved
+  login fills in as its sign-in page loads, the most recently used account when there are
+  several.
+- `gergur_login` (POST /login) looks at the first password field shown in the document and
+  sends its form: a real click on its submit button, or Enter in the field. It answers the
+  username before it, how it sent it (`via`), whether the same field is still asking
+  afterwards (`stillAsking`: a wrong password, a captcha, or a page that signs in without
+  leaving) and where the page went, never the password (`LoginStateJs` reads only its
+  length). Where it stops is `AgentServer.LoginStop`: no field (or one only in a frame or
+  shadow root it cannot click into, said as such), an empty field (no saved login), more
+  than one password field shown (sign-up, change password), or a page an agent scripted.
+  `submit: false` only looks, and is the one answer given on a scripted page.
+- A scripted page (`Tab.AgentScriptedThisDocument`): /eval marks the tab as it starts and
+  as it ends, and counts itself running in between; a new document (`ContentLoading`) is
+  marked as it begins; a Back or Forward in a tab an agent has scripted counts as scripted
+  until a page loads afresh, since the back-forward cache brings back the old document.
+  Marks come from one counter, not the clock. /login looks again directly before the click
+  and before Enter, since such a script could have pointed the form at another site.
+- /eval is refused (409) on a page holding a password (`PasswordStateJs`), and looked at
+  again after the script: if one is there by then (the page moved on, or drew a form the
+  engine filled), the script's answer is kept back (409, the script did run). A field
+  counts as a password when it is one, or was one and a "show password" switch made it
+  text (a typed field, not a checkbox or button, whose autocomplete says current-password or
+  new-password or whose name or id contains password,
+  passwd or pwd or being just pass, or /login's mark), in the document, open shadow roots and frames the page
+  can reach. A page that throws counts as one.
+- /screenshot refuses (409) a page with a password shown as plain text; dots are fine.
+
+Measured on WebView2 156 with a scratch profile and a local login page (a throwaway exe in
+the session scratchpad, not in the repo): the save prompt after a sign-in, Save storing it,
+the fields filled on the next load before any input, a view with saving off still filled
+and never prompting, two accounts filling the most recent. The page scripts run in the
+test suite against a stand-in page under node (`LoginScripts.harness.js`, from
+`SavedLoginsTests`). Not possible: choosing another saved account (the engine showed no
+suggestion list to a protocol click and keys picked nothing), and filling the password
+page of a two-step sign-in after typing a saved username. Not airtight: a script can keep
+what it reads somewhere (a global, storage) and hand it over in a later call once the field
+is gone, or wait for the engine to fill a form, read it and empty the field before it
+returns, so the look afterwards finds nothing; a page scripted through another tab the agent scripted (a window.open handle) is
+not caught; a "show password" field not named or marked as one is not recognised, and it
+would then show in a screenshot. Saved passwords cannot be listed or removed one by one
+from Gergur; WebView2 has no API for it, only clearing them all.
+
+### Saying what you are doing
+
+The person sees what each agent says it is doing, beside its name: on the agents panel,
+the agents page, and the band across its window. Over MCP every tool but
+`gergur_set_task`, `gergur_list_tabs` and `gergur_read_settings` is refused until the
+session has called `gergur_set_task` with a few words ("Uploading the 2.4 build to App
+Store Connect"); `initialize` says so in its `instructions`. Call it again when the task
+changes. Over plain HTTP send `POST /task` or an `X-Gergur-Task` header on any request;
+nothing is refused without it. It is kept as one printable line of at most 100 characters
+(`AgentActivity.CleanTask`), in memory only.
+
+This is a nudge, not a boundary: an agent can skip it by using the HTTP API, and agents
+that share a key share a task (every MCP client that sent no session id is "mcp:unnamed",
+and API callers with the same `X-Gergur-Agent` name are one agent).

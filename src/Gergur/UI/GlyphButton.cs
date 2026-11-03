@@ -13,6 +13,15 @@ public sealed class GlyphButton : Control
     private string _glyph = "";
     private Color _glyphColor = Theme.Text;
     private Color? _dot;
+    private bool _strike;
+
+    /// <summary>A stroke drawn across the glyph, for an icon the font lacks: see <see cref="AgentGlyphs.SendBack"/>.</summary>
+    [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+    public bool Strike
+    {
+        get => _strike;
+        set { _strike = value; Invalidate(); }
+    }
 
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
     public string Glyph
@@ -84,6 +93,8 @@ public sealed class GlyphButton : Control
         TextRenderer.DrawText(g, _glyph, Font, ClientRectangle,
             Enabled ? _glyphColor : Theme.TextDim,
             TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+        if (_strike)
+            AgentGlyphs.DrawStrike(g, ClientRectangle, Enabled ? _glyphColor : Theme.TextDim, Math.Max(1.4f, DeviceDpi / 64f));
         if (_dot is { } dot)
         {
             int size = Math.Max(6, Width / 5);

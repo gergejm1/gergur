@@ -60,6 +60,7 @@ public sealed class OwnPagesHardeningTests : IDisposable
             ["downloads.html"] = Page.Downloads,
             ["bookmarks.html"] = Page.Bookmarks,
             ["settings.html"] = Page.Settings,
+            ["agents.html"] = Page.Agents,
         };
         // Every op-shaped string literal, not only the ones written straight into a call: the
         // downloads page passes open, showInFolder and cancel through a variable. And "open",
@@ -68,7 +69,7 @@ public sealed class OwnPagesHardeningTests : IDisposable
         foreach (var (file, page) in pages)
         {
             string source = File.ReadAllText(FindSource("src", "Gergur", "Assets", file));
-            foreach (Match literal in Regex.Matches(source, @"[""'`]((?:history|bookmarks|downloads|settings)\.(?!html\b|css\b|js\b)[A-Za-z]+)[""'`]"))
+            foreach (Match literal in Regex.Matches(source, @"[""'`]((?:history|bookmarks|downloads|settings|agents)\.(?!html\b|css\b|js\b)[A-Za-z]+)[""'`]"))
                 ops.Add((page, literal.Groups[1].Value));
             ops.Add((page, "open"));
         }
@@ -450,7 +451,7 @@ public sealed class OwnPagesWiringTests
         // Clicking between an agent's tabs is looking at its work, not taking the window over.
         Assert.Matches(@"TabClicked \+= async \(_, tab\) => \{ await ActivateTabAsync\(tab\); \};", form);
         Assert.Matches(@"NewTabClicked \+= \(_, _\) => \{ ClaimForPerson\(\);", form);
-        Assert.Matches(@"NavigationRequested \+= async \(_, url\) => \{ ClaimForPerson\(\);", form);
+        Assert.Matches(@"NavigationRequested \+= async \(_, url\) =>\s*\{\s*ClaimForPerson\(\);", form);
         // The routes only a person takes, now that a tab click no longer claims.
         Assert.Contains("ClaimForPerson()", Body(form, "private async Task OpenBookmarkAsync("));
         Assert.Contains("url => { ClaimForPerson(); _ = NavigateActiveAsync(url); },", form);   // history panel

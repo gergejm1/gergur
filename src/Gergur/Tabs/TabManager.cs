@@ -15,6 +15,14 @@ public sealed class TabManager
     public RequestBlocker Blocker { get; }
 
     public IReadOnlyList<Tab> Tabs => _tabs;
+
+    /// <summary>
+    /// Whether the window these tabs are in is an agent's. Asked as each tab's view is
+    /// built: an agent's tabs answer page dialogs themselves rather than showing them
+    /// (<see cref="Tab.RecentDialogs"/>), since a dialog from a hidden window would come up
+    /// on the person's screen. Set by the window.
+    /// </summary>
+    public Func<bool> IsAgentWindow { get; set; } = () => false;
     public Tab? ActiveTab { get; private set; }
 
     /// <summary>Anything the chrome shows changed: list, order, active tab, or a tab's title/state.</summary>

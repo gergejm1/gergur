@@ -279,15 +279,17 @@ public sealed class PageFullScreenTests
         int eval = agent.IndexOf("case (\"POST\", \"/eval\")", StringComparison.Ordinal);
         Assert.True(eval >= 0);
         string evalBody = agent[eval..Math.Min(agent.Length, eval + 1800)];
-        Assert.Contains("tab.NoteAgentAction();", evalBody);
-        Assert.True(evalBody.IndexOf("NoteAgentAction", StringComparison.Ordinal)
+        // Acting(tab) records it (and who): pinned to call NoteAgentAction first in AgentToolsTests.
+        Assert.Contains("Acting(tab);", evalBody);
+        Assert.True(evalBody.IndexOf("Acting(tab);", StringComparison.Ordinal)
             < evalBody.IndexOf("ReadScriptAsync", StringComparison.Ordinal),
             "the action must be recorded before the script is run");
 
         int act = agent.IndexOf("private async Task<(bool Worked, bool Ready)> ActOnPageAsync", StringComparison.Ordinal);
         Assert.True(act >= 0);
         string actBody = agent[act..Math.Min(agent.Length, act + 700)];
-        Assert.True(actBody.IndexOf("tab.NoteAgentAction();", StringComparison.Ordinal)
+        Assert.Contains("Acting(tab);", actBody);
+        Assert.True(actBody.IndexOf("Acting(tab);", StringComparison.Ordinal)
             < actBody.IndexOf("ReadScriptAsync", StringComparison.Ordinal),
             "/click and /type must record the action before the script is run");
     }

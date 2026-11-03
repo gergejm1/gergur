@@ -28,6 +28,7 @@ public sealed class MainForm : Form
     private readonly System.Windows.Forms.Timer _pagePushTimer = new() { Interval = 250 };
     private bool _downloadsPushPending;
     private bool _bookmarksPushPending;
+    private bool _agentsPushPending;
     private DropForm? _dropWindow;
     private NotifyIcon? _tray;
     private bool _closing;
@@ -55,11 +56,33 @@ public sealed class MainForm : Form
             _openedByAgent = value;
             // Only an agent's window can be hidden again; once it is the person's, X closes it.
             _hideButton.Visible = value;
+            _agentBanner.Visible = value;
+            _tabStrip.AgentWindow = value;
+            if (_askBar is not null && _session is not null)
+                UpdateAskBar();
+            // Whose window it is decides who answers page dialogs: see Tab.RefreshDialogMode.
+            if (Tabs is not null)
+                foreach (var tab in Tabs.Tabs)
+                    tab.RefreshDialogMode();
+            UpdateAgentBanner();
             LayoutToolbar();
         }
     }
 
     private bool _openedByAgent;
+
+    /// <summary>The agent whose window this is, as the agents panel knows it; null for the person's windows.</summary>
+    internal string? AgentOwnerKey { get; private set; }
+
+    /// <summary>What the banner across an agent's window calls its agent.</summary>
+    internal string? AgentOwnerName { get; private set; }
+
+    /// <summary>
+    /// An agent's window the person cannot see at all: cloaked where it stands and off the
+    /// taskbar, until they show it from the agents panel. It keeps working: its page still
+    /// draws, clicks and captures. Every agent window starts this way unless asked to focus.
+    /// </summary>
+    internal bool HiddenForAgent { get; private set; }
 
     /// <summary>
     /// The person has used this window, so it is theirs from now on and its tabs are their
@@ -75,7 +98,13 @@ public sealed class MainForm : Form
     /// behind their back, and X then closed it for good, agent's work and all, instead of
     /// hiding it again.
     /// </summary>
-    internal void ClaimForPerson() => OpenedByAgent = false;
+    internal void ClaimForPerson()
+    {
+        // Theirs from now on, so never left where they cannot see it.
+        if (HiddenForAgent)
+            ShowToPerson();
+        OpenedByAgent = false;
+    }
 
     private TabStripControl _tabStrip = null!;
     private Panel _toolbar = null!;
@@ -106,6 +135,9 @@ public sealed class MainForm : Form
     private GlyphButton _phoneButton = null!;
     private GlyphButton _agentsButton = null!;
     private GlyphButton _hideButton = null!;
+    private AgentBanner _agentBanner = null!;
+    private AskBar _askBar = null!;
+    private string? _askShown;
     private ToolTip _hideTip = null!;
     private AppSession? _agentsHookedTo;
     private System.Windows.Forms.Timer _statusTimer = null!;
@@ -135,15 +167,30 @@ public sealed class MainForm : Form
     /// takes the view away mid-sentence. A window it can have to itself is the answer,
     /// and one that does not come to the front is what makes it bearable.
     /// </summary>
-    internal static async Task<MainForm> OpenWindowAsync(AppSession session, bool focus)
+    internal static async Task<MainForm> OpenWindowAsync(AppSession session, bool focus, AgentCaller? owner = null)
     {
-        var window = new MainForm(session, null, isSecondaryWindow: true, restore: null) { OpenedByAgent = true };
+        var window = new MainForm(session, null, isSecondaryWindow: true, restore: null)
+        {
+            AgentOwnerKey = owner?.Key,
+            AgentOwnerName = owner?.Name,
+            OpenedByAgent = true,
+        };
         if (focus)
         {
             window.Show();
         }
         else
         {
+            // Hidden from the person from its first frame: cloaked before it is shown, so it
+            // never flashes up, and off the taskbar as soon as it has a button to take away.
+            // It still draws, clicks and captures: see WindowStacking.SetHidden. If the system
+            // will not cloak it, it opens as it used to, behind and on the taskbar: a window
+            // left on screen with no taskbar button would be one the person cannot find, and
+            // the quit policy would count it as hidden and close it under them.
+            bool cloaked = WindowStacking.Cloak(window.Handle, true);
+            if (!cloaked)
+                DebugLog.WriteAlways("an agent window could not be cloaked; it opens behind, on the taskbar");
+            window.HiddenForAgent = cloaked;
             // ShowWithoutActivation keeps the keyboard where it is. It does not decide the
             // stacking: a new top level window starts at the top, and whether Windows lets
             // it stay there depends on who has focus. Measured with a terminal in front it
@@ -162,6 +209,8 @@ public sealed class MainForm : Form
             IntPtr after = BehindWhat(root, rootIsTopmost, window.Handle);
             if (!SetWindowPos(window.Handle, after, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE))
                 DebugLog.WriteAlways("an agent window could not be placed behind the one in use");
+            if (cloaked && !WindowStacking.SetTaskbarButton(window.Handle, shown: false))
+                DebugLog.WriteAlways("an agent window's taskbar button could not be taken away");
         }
         await window.Ready;
         return window;
@@ -193,6 +242,22 @@ public sealed class MainForm : Form
 
     [System.Runtime.InteropServices.DllImport("user32.dll")]
     private static extern IntPtr GetForegroundWindow();
+
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    private struct FLASHWINFO
+    {
+        public uint cbSize;
+        public IntPtr hwnd;
+        public uint dwFlags;
+        public uint uCount;
+        public uint dwTimeout;
+    }
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern bool FlashWindowEx(ref FLASHWINFO info);
+
+    private const uint FLASHW_ALL = 0x3;        // caption and taskbar button
+    private const uint FLASHW_TIMERNOFG = 0xC;  // until the window comes to the front
 
     [System.Runtime.InteropServices.DllImport("user32.dll")]
     private static extern bool SetWindowPos(IntPtr window, IntPtr insertAfter, int x, int y, int width, int height, uint flags);
@@ -277,7 +342,16 @@ public sealed class MainForm : Form
         _addressBar.Width = _toolbar.Width; // corrected after toolbar is sized
         _addressPill = new AddressPill(_addressBar);
         _addressBar.SuggestionProvider = () => _session?.History.GetSuggestions() ?? Array.Empty<string>();
-        _addressBar.NavigationRequested += async (_, url) => { ClaimForPerson(); await NavigateActiveAsync(url); };
+        _addressBar.NavigationRequested += async (_, url) =>
+        {
+            ClaimForPerson();
+            if (Tabs?.ActiveTab is { AgentName: not null } taken)
+            {
+                taken.AgentName = null;   // the person went somewhere in it: theirs now
+                _tabStrip.Invalidate();
+            }
+            await NavigateActiveAsync(url);
+        };
         _addressBar.Escaped += (_, _) =>
         {
             ShowAddress(Tabs?.ActiveTab);
@@ -296,10 +370,22 @@ public sealed class MainForm : Form
         // In an agent's window only, nearest the address bar: back behind the person's
         // windows, the agent still working in it. Shown from OpenedByAgent.
         _hideButton = MakeToolButton(AgentGlyphs.SendBack, 0);
+        _hideButton.Strike = AgentGlyphs.SendBackNeedsStrike;
         _hideButton.Anchor = AnchorStyles.Top | AnchorStyles.Right;
         _hideButton.AccessibleName = "Hide this agent window";
         _hideButton.Visible = false;
         _hideButton.Click += (_, _) => SendBackToAgent();
+        // Across an agent's window, so it is never taken for one of the person's.
+        _agentBanner = new AgentBanner { Dock = DockStyle.Top, Visible = false };
+        _agentBanner.HideClicked += (_, _) => SendBackToAgent();
+        // Across the person's windows while an agent waits on them. Never in an agent's.
+        _askBar = new AskBar { Dock = DockStyle.Top, Visible = false };
+        _askBar.Answered += (id, done, text) =>
+        {
+            _session?.Asks.Answer(id, done, text, DateTime.UtcNow);
+            UpdateAskBar();
+        };
+        _askBar.ShowAgentRequested += key => _ = ShowAgentTabAsync(LatestTabOf(key) ?? "");
         _hideTip = new ToolTip();
         _hideTip.SetToolTip(_hideButton, "Hide this agent window. The agent keeps working in it.");
         // The phone drop, a click away: and a file dragged onto it goes to the phone.
@@ -386,6 +472,8 @@ public sealed class MainForm : Form
         Controls.Add(_hostPanel);
         Controls.Add(_statusStrip);
         Controls.Add(_findBar);
+        Controls.Add(_agentBanner);   // docked under the bookmarks bar, just above the page
+        Controls.Add(_askBar);        // the same place, in the person's windows
         Controls.Add(_bookmarksBar);
         Controls.Add(_toolbar);
         Controls.Add(_tabStrip);
@@ -436,8 +524,8 @@ public sealed class MainForm : Form
         _pagePushTimer.Stop();
         if (_session is null || Tabs is null)
             return;
-        bool downloadsDue = _downloadsPushPending, bookmarksDue = _bookmarksPushPending;
-        _downloadsPushPending = _bookmarksPushPending = false;
+        bool downloadsDue = _downloadsPushPending, bookmarksDue = _bookmarksPushPending, agentsDue = _agentsPushPending;
+        _downloadsPushPending = _bookmarksPushPending = _agentsPushPending = false;
         string? downloads = null;
         foreach (var tab in Tabs.Tabs)
         {
@@ -454,6 +542,9 @@ public sealed class MainForm : Form
                     break;
                 case InternalPages.Page.Bookmarks or InternalPages.Page.Home when bookmarksDue:
                     tab.PostToPage("""{"event":"bookmarks"}""", tab.ShownPage!.Value);
+                    break;
+                case InternalPages.Page.Agents when agentsDue:
+                    tab.PostToPage("""{"event":"agents"}""", InternalPages.Page.Agents);
                     break;
             }
         }
@@ -500,7 +591,102 @@ public sealed class MainForm : Form
             // A plain click replaces the page in its own tab; Ctrl or middle click opens a
             // tab behind it, as a link does anywhere else.
             (url, newTab) => _ = newTab ? (Task)manager.CreateTabAsync(url, activate: false) : tab.NavigateAsync(url),
-            new SettingsHost(this, _session));
+            new SettingsHost(this, _session),
+            new AgentsHost(this, _session, tab));
+    }
+
+    /// <summary>
+    /// What the agents page acts through. Like the settings page's host, everything that
+    /// shows or hides a window is done after the request has been answered.
+    /// </summary>
+    /// <param name="page">The tab the agents page is in, which pictures are posted back to.</param>
+    private sealed class AgentsHost(MainForm window, AppSession session, Tab page) : IAgentsHost
+    {
+        public IReadOnlyList<AgentSnapshot> Agents => session.Agents.Snapshot();
+        public AgentTabInfo? Tab(string id) => window.AgentTab(id);
+        public string ApiLine => window.AgentApiLine();
+
+        public void Show(string tabId) => Later(async () =>
+        {
+            await window.ShowAgentTabAsync(tabId);
+            NoteAgentWindowsChanged(session);
+        });
+
+        public void Hide(string tabId) => Later(() =>
+        {
+            if (FindTab(session, tabId) is { Window: { OpenedByAgent: true, HiddenForAgent: false } owner })
+                owner.SendBackToAgent();
+            NoteAgentWindowsChanged(session);
+            return Task.CompletedTask;
+        });
+
+        public void DevTools(string tabId) => Later(() =>
+        {
+            FindTab(session, tabId)?.Tab.OpenDevTools();
+            return Task.CompletedTask;
+        });
+
+        public void Snapshot(string tabId) => Later(async () =>
+        {
+            // One picture of a tab at a time, however many pages ask: a capture that ran out
+            // of time is abandoned rather than cancelled, and asking again on top of it would
+            // pile them up on the UI thread. The page that asked hears nothing and asks later.
+            if (!CapturesUnderWay.Add(tabId))
+                return;
+            byte[]? jpeg;
+            try
+            {
+                jpeg = FindTab(session, tabId) is { } found
+                    ? await found.Tab.CaptureThumbnailAsync(AgentsPage.SnapshotWidth, TimeSpan.FromSeconds(5))
+                    : null;
+            }
+            finally
+            {
+                CapturesUnderWay.Remove(tabId);
+            }
+            page.PostToPage(AgentsPage.SnapshotPush(tabId, jpeg), InternalPages.Page.Agents);
+        });
+
+        /// <summary>Tabs being photographed for an agents page now. UI thread only.</summary>
+        private static readonly HashSet<string> CapturesUnderWay = new(StringComparer.Ordinal);
+
+        private void Later(Func<Task> action)
+        {
+            if (window.IsDisposed || !window.IsHandleCreated)
+                return;
+            window.BeginInvoke(async () =>
+            {
+                try { await action(); }
+                catch (Exception ex)
+                {
+                    // Behind an async void: anything let out here would take the browser down.
+                    DebugLog.WriteAlways($"an agents page request failed: {ex.Message}");
+                }
+            });
+        }
+    }
+
+    /// <summary>A tab by id in any window, with the window it is in.</summary>
+    private static (MainForm Window, Tab Tab)? FindTab(AppSession session, string id)
+    {
+        foreach (var window in session.Windows)
+        {
+            if (window.Tabs?.Tabs.FirstOrDefault(t => t.Id == id) is { } tab)
+                return (window, tab);
+        }
+        return null;
+    }
+
+    /// <summary>A window was shown or hidden: every open agents page, in every window, reads the list again.</summary>
+    private static void NoteAgentWindowsChanged(AppSession session)
+    {
+        foreach (var window in session.Windows)
+        {
+            if (window.IsDisposed || window._closing)
+                continue;
+            window._agentsPushPending = true;
+            window._pagePushTimer.Start();
+        }
     }
 
     /// <summary>
@@ -723,6 +909,11 @@ public sealed class MainForm : Form
     /// <summary>Test hook: what X in the window's corner does now.</summary>
     internal bool CloseHides => _openedByAgent;
 
+    /// <summary>Test hooks: the tab strip and the band across an agent's window.</summary>
+    internal TabStripControl TabStripForTest => _tabStrip;
+    internal AgentBanner AgentBannerForTest => _agentBanner;
+    internal AskBar AskBarForTest => _askBar;
+
     /// <summary>X in the window's corner: closes a window of the person's, hides an agent's.</summary>
     private void CloseOrSendBack()
     {
@@ -755,12 +946,72 @@ public sealed class MainForm : Form
         _historyPanel?.Dismiss();
         _agentsPanel?.Dismiss();
         _phonePanel?.Dismiss();
+        // One of theirs comes forward. A minimised one only when every one of theirs is
+        // minimised, and then restored: a hidden window left as the active one would take
+        // their typing where nobody can see it, which is worse than a window coming back.
         MainForm? theirs = _session is { } session
-            ? AppSession.WindowToReturnTo(session.Windows, session.LastPersonsWindow, this,
-                w => w is { OpenedByAgent: false, IsDisposed: false, Visible: true } && w.WindowState != FormWindowState.Minimized)
+            ? WindowToBringForward(session.Windows, session.LastPersonsWindow, this,
+                w => w is { OpenedByAgent: false, IsDisposed: false, Visible: true },
+                w => w.WindowState == FormWindowState.Minimized)
             : null;
+        if (theirs is { WindowState: FormWindowState.Minimized })
+            theirs.WindowState = FormWindowState.Normal;
         if (!WindowStacking.SendBack(Handle, theirs))
             DebugLog.WriteAlways("an agent window could not be sent back");
+        // Hidden only if it was cloaked: see OpenWindowAsync for why a window the system
+        // would not cloak keeps its taskbar button and does not count as hidden.
+        bool cloaked = WindowStacking.Cloak(Handle, true);
+        if (!cloaked)
+            DebugLog.WriteAlways("an agent window could not be hidden; it is left behind, on the taskbar");
+        else if (!WindowStacking.SetTaskbarButton(Handle, shown: false))
+            DebugLog.WriteAlways("an agent window's taskbar button could not be taken away");
+        HiddenForAgent = cloaked;
+    }
+
+    /// <summary>
+    /// Which of the person's windows comes forward when an agent's is hidden: the one they
+    /// used last, or failing that any of theirs, preferring one that is not minimised; a
+    /// minimised one only when that is all there is. Null when they have none.
+    /// </summary>
+    internal static T? WindowToBringForward<T>(IReadOnlyList<T> windows, T? lastPersons, T leaving,
+        Func<T, bool> isTheirs, Func<T, bool> isMinimised) where T : class
+        => AppSession.WindowToReturnTo(windows, lastPersons, leaving, w => isTheirs(w) && !isMinimised(w))
+            ?? AppSession.WindowToReturnTo(windows, lastPersons, leaving, isTheirs);
+
+    /// <summary>
+    /// Shows an agent's hidden window to the person, in front, restored if minimised: what
+    /// the agents panel and page do when asked to show one of its tabs. A window that is not
+    /// hidden is just brought forward.
+    /// </summary>
+    internal void ShowToPerson()
+    {
+        if (_closing || IsDisposed || !IsHandleCreated)
+            return;
+        if (HiddenForAgent)
+        {
+            if (!WindowStacking.SetHidden(Handle, false))
+                DebugLog.WriteAlways("an agent window could not be shown");
+            HiddenForAgent = false;
+        }
+        if (WindowState == FormWindowState.Minimized)
+            WindowState = FormWindowState.Normal;
+        Activate();
+    }
+
+    /// <summary>Badges a tab as an agent's on the tab strip: one it opened, in any window.</summary>
+    internal void MarkOpenedByAgent(Tab tab, string agentName)
+    {
+        tab.AgentName = agentName;
+        _tabStrip.Invalidate();
+    }
+
+    /// <summary>The banner across an agent's window: whose it is and what it says it is doing.</summary>
+    private void UpdateAgentBanner()
+    {
+        if (!_openedByAgent)
+            return;
+        string? task = AgentOwnerKey is { } key ? _session?.Agents.TaskOf(key) : null;
+        _agentBanner.SetAgent(AgentOwnerName ?? "An agent", task);
     }
 
     private void LayoutToolbar()
@@ -892,7 +1143,7 @@ public sealed class MainForm : Form
         _phonePanel?.Dismiss();
         if (_agentsPanel is null)
         {
-            _agentsPanel = new AgentsFlyout(session.Agents.Snapshot, AgentTab, id => _ = ShowAgentTabAsync(id), AgentApiLine);
+            _agentsPanel = new AgentsFlyout(session.Agents.Snapshot, AgentTab, id => _ = ShowAgentTabAsync(id), AgentApiLine, OpenAgentsPage);
             session.Agents.Changed += _agentsPanel.AgentsChanged;
         }
         if (_agentsPanel.Visible)
@@ -1023,7 +1274,60 @@ public sealed class MainForm : Form
         if (_session is not { } session || ReferenceEquals(_agentsHookedTo, session))
             return;
         session.Agents.Changed += OnAgentsChanged;
+        session.Asks.Changed += OnAsksChanged;
         _agentsHookedTo = session;
+        if (IsHandleCreated)
+            BeginInvoke(UpdateAskBar);
+    }
+
+    /// <summary>An agent asked the person something, or it was answered, on whichever thread.</summary>
+    private void OnAsksChanged()
+    {
+        if (_closing || IsDisposed || !IsHandleCreated)
+            return;
+        try
+        {
+            BeginInvoke(() =>
+            {
+                if (!_closing && !IsDisposed)
+                    UpdateAskBar();
+            });
+        }
+        catch (InvalidOperationException) { }   // the handle went between the check and the call
+    }
+
+    /// <summary>
+    /// Shows the oldest question agents are waiting on, in the person's windows only, and
+    /// flashes the window's taskbar button when a new one comes in while they are elsewhere.
+    /// </summary>
+    private void UpdateAskBar()
+    {
+        if (_session is not { } session || _closing || IsDisposed)
+            return;
+        IReadOnlyList<AgentQuestion> waiting = _openedByAgent ? [] : session.Asks.Pending(DateTime.UtcNow);
+        var first = waiting.Count > 0 ? waiting[0] : null;
+        _askBar.SetQuestions(waiting, first is not null && LatestTabOf(first.AgentKey) is not null);
+        _askBar.Visible = first is not null;
+        if (first is not null && first.Id != _askShown && IsHandleCreated && !HiddenForAgent)
+        {
+            var flash = new FLASHWINFO
+            {
+                cbSize = (uint)System.Runtime.InteropServices.Marshal.SizeOf<FLASHWINFO>(),
+                hwnd = Handle,
+                dwFlags = FLASHW_ALL | FLASHW_TIMERNOFG,
+            };
+            FlashWindowEx(ref flash);
+        }
+        _askShown = first?.Id;
+    }
+
+    /// <summary>The newest tab an agent has worked in that is still open, by id, or null.</summary>
+    private string? LatestTabOf(string agentKey)
+    {
+        if (_session is not { } session)
+            return null;
+        var tabs = session.Agents.Snapshot().FirstOrDefault(a => a.Key == agentKey)?.TabIds ?? [];
+        return tabs.Reverse().FirstOrDefault(id => FindTab(session, id) is not null);
     }
 
     /// <summary>An agent acted, on the agent server's thread.</summary>
@@ -1031,7 +1335,19 @@ public sealed class MainForm : Form
     {
         if (_closing || IsDisposed || !IsHandleCreated)
             return;
-        try { BeginInvoke(UpdateAgentsButton); }
+        try
+        {
+            BeginInvoke(() =>
+            {
+                // Queued before the window closed and run after: its timer is disposed by then.
+                if (_closing || IsDisposed)
+                    return;
+                UpdateAgentsButton();
+                // An agents page open in this window shows it, a quarter second later at most.
+                _agentsPushPending = true;
+                _pagePushTimer.Start();
+            });
+        }
         catch (InvalidOperationException) { }   // the handle went between the check and the call
     }
 
@@ -1044,6 +1360,7 @@ public sealed class MainForm : Form
         bool active = session.Agents.AnyActive(DateTime.UtcNow);
         _agentsButton.Dot = active ? Theme.Live : null;
         _agentsButton.AccessibleName = active ? "Agents (an agent is working)" : "Agents";
+        UpdateAgentBanner();   // its task may have changed
     }
 
     /// <summary>A tab by id, in any window, as the agents panel shows it.</summary>
@@ -1052,7 +1369,8 @@ public sealed class MainForm : Form
         foreach (var window in _session?.Windows ?? [])
         {
             if (window.Tabs?.Tabs.FirstOrDefault(t => t.Id == id) is { } tab)
-                return new AgentTabInfo(tab.Id, tab.Title, InternalPages.NameOf(tab.Url), window.OpenedByAgent);
+                return new AgentTabInfo(tab.Id, tab.Title, InternalPages.NameOf(tab.Url), window.HiddenForAgent,
+                    InAgentWindow: window.OpenedByAgent, Asleep: tab.State is TabState.Suspended or TabState.Discarded);
         }
         return null;
     }
@@ -1070,10 +1388,8 @@ public sealed class MainForm : Form
                 continue;
             try
             {
-                if (window.WindowState == FormWindowState.Minimized)
-                    window.WindowState = FormWindowState.Normal;
                 await window.Tabs.ActivateAsync(tab);
-                window.Activate();
+                window.ShowToPerson();   // out of hiding, if it was hidden
             }
             catch (Exception ex)
             {
@@ -1337,6 +1653,8 @@ public sealed class MainForm : Form
             _pagePushTimer.Tick += (_, _) => PushToOwnPages();
 
             Tabs = new TabManager(session.Env, _hostPanel, session.Blocker);
+            // Read as each view is built, by then the window knows whose it is.
+            Tabs.IsAgentWindow = () => _openedByAgent;
             Tabs.Changed += (_, _) => UpdateChrome();
             Tabs.TabCreated += (_, tab) => WireTab(tab);
             Tabs.LastTabClosed += (_, _) => Close();
@@ -1662,7 +1980,10 @@ public sealed class MainForm : Form
         _phonePanel?.Dispose();
         _hideTip.Dispose();
         if (_agentsHookedTo is not null)
+        {
             _agentsHookedTo.Agents.Changed -= OnAgentsChanged;
+            _agentsHookedTo.Asks.Changed -= OnAsksChanged;
+        }
         _memoryLabel.Dispose();   // in no strip now, so nothing else disposes it
         base.OnFormClosed(e);
     }
@@ -1696,8 +2017,29 @@ public sealed class MainForm : Form
         _session?.RemoveWindow(this); // stops the agent and tunnel when this was the last
         if (_session is null || _session.Windows.Count == 0)
             LastWindowClosed?.Invoke(this, EventArgs.Empty);
+        else if (QuitsWithThisWindow(HiddenForAgent, _session.Windows.Select(w => w.HiddenForAgent).ToList()))
+        {
+            // The person closed the last window they can see. Nothing left is on screen, the
+            // taskbar or Alt+Tab, so carrying on would be a browser running where nobody can
+            // find it: the agents' hidden windows go too, and with them the app. Each closes
+            // through its own queue, after this one has gone; the session file is not
+            // touched by them (AppSession.SessionOf: only agent windows left).
+            foreach (var hidden in _session.Windows.ToList())
+            {
+                if (!hidden.IsDisposed && hidden.IsHandleCreated)
+                    hidden.BeginInvoke(hidden.Close);
+            }
+        }
         base.OnFormClosing(e);
     }
+
+    /// <summary>
+    /// Whether closing a window should take the rest with it: it was one the person could
+    /// see, and every window left is an agent's, hidden. An agent closing its own hidden
+    /// window never does, and neither does the person closing one of two of theirs.
+    /// </summary>
+    internal static bool QuitsWithThisWindow(bool closingWasHidden, IReadOnlyList<bool> othersHidden)
+        => !closingWasHidden && othersHidden.Count > 0 && othersHidden.All(hidden => hidden);
 
     /// <summary>Whether this run's engine routes through the tunnel. See <see cref="BrowserEnvironment.ProxyInForce"/>.</summary>
     private bool ProxyInForce => _session?.Env.ProxyInForce ?? false;
@@ -1998,6 +2340,8 @@ public sealed class MainForm : Form
             if (_session is null)
                 return;
             var item = _session.Downloads.Track(operation);
+            item.TabId = tab.Id;
+            item.AgentKey = AgentServer.DownloadOwner(_openedByAgent, AgentOwnerKey, tab.DrivenWithin(AgentServer.DownloadDriverWindow, DateTime.UtcNow));
             ShowMessage($"Downloading {item.FileName}…");
             // After the engine's event has returned: the panel is a window, and showing one
             // from inside a WebView2 handler is the kind of re-entry it throws on.
@@ -2466,6 +2810,27 @@ public sealed class MainForm : Form
     /// at once does, and the page says what is waiting for a restart and offers one.
     /// </summary>
     public void OpenSettings() => _ = OpenOwnPageAsync(InternalPages.Page.Settings);
+
+    /// <summary>
+    /// The agents page, in one of the person's windows: from an agent's own window it would
+    /// open among the agent's tabs, and in a hidden one where nobody could see it.
+    /// </summary>
+    public void OpenAgentsPage()
+    {
+        HookAgents();
+        var target = _openedByAgent && _session is { } session
+            ? AppSession.WindowToReturnTo(session.Windows, session.LastPersonsWindow, this,
+                w => w is { OpenedByAgent: false, IsDisposed: false }) ?? this
+            : this;
+        if (target != this)
+        {
+            target.HookAgents();
+            if (target.WindowState == FormWindowState.Minimized)
+                target.WindowState = FormWindowState.Normal;
+            target.Activate();
+        }
+        _ = target.OpenOwnPageAsync(InternalPages.Page.Agents);
+    }
 
     // ------------------------------------------------------------------ phone drop
 

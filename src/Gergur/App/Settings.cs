@@ -70,7 +70,7 @@ public sealed class Settings
     public string RelaxedSites { get; set; } = "";
 
     [Category(Privacy), DisplayName("Save passwords")]
-    [Description("Engine-level password autosave, DPAPI-encrypted inside the profile. Applies at once, open tabs included.")]
+    [Description("Offer to save a password when you sign in to a site, and fill saved ones in. Kept encrypted inside the profile. Agents sign in with saved ones (gergur_login) and never see them; their own windows never offer to save. Applies at once, open tabs included.")]
     public bool SavePasswords { get; set; } = true;
 
     [Category(Privacy), DisplayName("Form autofill")]

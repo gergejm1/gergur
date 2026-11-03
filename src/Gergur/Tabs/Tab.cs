@@ -30,6 +30,12 @@ public sealed class Tab : ITabHandle, IDisposable
     /// </summary>
     public string Id { get; } = "t" + Interlocked.Increment(ref _nextId);
 
+    /// <summary>
+    /// The agent that opened this tab, for the badge on the tab strip, or null for a tab of
+    /// the person's. Cleared when the person takes it over by going somewhere in it.
+    /// </summary>
+    internal string? AgentName { get; set; }
+
     public TabState State
     {
         get => _state;
@@ -331,7 +337,7 @@ public sealed class Tab : ITabHandle, IDisposable
     private async Task CreateWebViewAsync(bool navigateToStoredUrl)
     {
         DebugLog.Write($"CreateWebView url={Url} navigate={navigateToStoredUrl}");
-        var webView = await _owner.Env.CreateWebViewAsync(_owner.Host, visible: false);
+        var webView = await _owner.Env.CreateWebViewAsync(_owner.Host, visible: false, agentWindow: _owner.IsAgentWindow());
 
         // Closed while the engine was starting, which on a cold start is seconds. Without
         // this the view arrives after nobody is left to own it and stays parented and
@@ -359,6 +365,7 @@ public sealed class Tab : ITabHandle, IDisposable
 
         core.DocumentTitleChanged += OnDocumentTitleChanged;
         core.SourceChanged += OnSourceChanged;
+        core.ContentLoading += OnContentLoading;
         core.HistoryChanged += OnHistoryChanged;
         core.FaviconChanged += OnFaviconChanged;
         core.NavigationStarting += OnNavigationStarting;
@@ -369,6 +376,13 @@ public sealed class Tab : ITabHandle, IDisposable
         core.WindowCloseRequested += OnWindowCloseRequested;
         core.DownloadStarting += OnDownloadStarting;
         core.ContainsFullScreenElementChanged += OnContainsFullScreenElementChanged;
+        core.ScriptDialogOpening += OnScriptDialogOpening;
+        // An agent's window answers alert, confirm, prompt and "leave this page?" itself:
+        // shown, they would be modal boxes from a window the person cannot see, and the
+        // agent's next call into the page would wait on them for good. Off before the first
+        // navigation, which is when the engine reads it.
+        if (_owner.IsAgentWindow())
+            core.Settings.AreDefaultScriptDialogsEnabled = false;
         core.Find.MatchCountChanged += OnFindStatusChanged;
         core.Find.ActiveMatchIndexChanged += OnFindStatusChanged;
         webView.KeyDown += OnWebViewKeyDown;
@@ -486,7 +500,7 @@ public sealed class Tab : ITabHandle, IDisposable
             // and this task is discarded by its caller, so nothing else would see it.
             if (Core is not { } core)
                 return;
-            BrowserEnvironment.ApplyViewSettings(core, settings);
+            BrowserEnvironment.ApplyViewSettings(core, settings, _owner.IsAgentWindow());
             bool registered = _pageCleanupScript is { } current && current.Core == core;
             string? wanted = CleanupScriptFor(settings);
             // Turned off, or a different script wanted (the relaxed sites changed, or the
@@ -742,6 +756,246 @@ public sealed class Tab : ITabHandle, IDisposable
     /// </summary>
     internal void NoteAgentAction() => Interlocked.Exchange(ref _agentActedTicks, DateTime.UtcNow.Ticks);
 
+    // Marks taken from one counter shared by every tab, so their order is the order things
+    // happened in: a clock can step back, and two readings inside its resolution tie.
+    private static long s_marks;
+    private long _documentStarted;     // when the document on screen began (ContentLoading)
+    private long _agentScript;         // when an agent's script last started or ended here
+    private int _agentScriptsRunning;
+    // 1 after a Back or Forward in a tab an agent has scripted, until a page loads afresh: a
+    // page restored from the back-forward cache is the old document, script and all, and
+    // whether the engine says it began again was not established.
+    private int _historyAfterScript;
+    // The last main-frame navigation started, and whether it was Back or Forward. UI thread only.
+    private (ulong Id, bool History)? _lastNavigationStarted;
+
+    /// <summary>An agent's script (/eval) is about to run in this tab. Pair with <see cref="AgentScriptOver"/>.</summary>
+    internal void AgentScriptStarting()
+    {
+        Interlocked.Increment(ref _agentScriptsRunning);
+        Interlocked.Exchange(ref _agentScript, Interlocked.Increment(ref s_marks));
+    }
+
+    /// <summary>
+    /// The script is over, however it ended. Marked again: one asked for on one page runs on
+    /// the next if the tab moves on in between, and this mark is later than that page's start.
+    /// </summary>
+    internal void AgentScriptOver()
+    {
+        Interlocked.Exchange(ref _agentScript, Interlocked.Increment(ref s_marks));
+        Interlocked.Decrement(ref _agentScriptsRunning);
+    }
+
+    /// <summary>
+    /// Whether an agent's script may have run, or be running, in the document now on screen.
+    /// A saved password is not sent from such a page (/login): the script could have pointed
+    /// the form somewhere else, or be waiting to read what is typed.
+    /// </summary>
+    internal bool AgentScriptedThisDocument => ScriptedThisDocument(
+        Volatile.Read(ref _agentScriptsRunning), Interlocked.Read(ref _agentScript),
+        Interlocked.Read(ref _documentStarted), Volatile.Read(ref _historyAfterScript) != 0);
+
+    /// <summary>
+    /// A script running now, one marked at or after the document began, or a Back or Forward
+    /// since a script all count; a tab never scripted does not.
+    /// </summary>
+    internal static bool ScriptedThisDocument(int running, long scriptMark, long documentMark, bool historyAfterScript)
+        => running > 0 || historyAfterScript || (scriptMark != 0 && scriptMark >= documentMark);
+
+    private readonly object _driverGate = new();
+    private string? _driverKey;
+    private DateTime _drivenUtc;
+
+    /// <summary>
+    /// Records which agent is acting in this tab, as each of its requests starts, so a
+    /// download the tab starts can be put down to that agent and listed to it alone.
+    /// </summary>
+    internal void NoteDrivenBy(string agentKey)
+    {
+        lock (_driverGate)
+        {
+            _driverKey = agentKey;
+            _drivenUtc = DateTime.UtcNow;
+        }
+    }
+
+    /// <summary>The agent that acted in this tab within <paramref name="span"/> of <paramref name="nowUtc"/>, or null.</summary>
+    internal string? DrivenWithin(TimeSpan span, DateTime nowUtc)
+    {
+        lock (_driverGate)
+            return _driverKey is not null && nowUtc - _drivenUtc < span ? _driverKey : null;
+    }
+
+    /// <summary>A page dialog this tab answered by itself, for the agent to read back.</summary>
+    /// <param name="Kind">alert, confirm, prompt or beforeunload.</param>
+    /// <param name="Answer">What a prompt was answered with, or null.</param>
+    internal sealed record DialogSeen(DateTime AtUtc, string Kind, string Message, bool Accepted, string? Answer);
+
+    internal const int MaxDialogs = 10;
+
+    /// <summary>
+    /// A page dialog in the person's window while the engine still has its own turned off:
+    /// asked of them in a plain box, after the engine's event has returned, which is when a
+    /// modal window may come up without the engine throwing on the re-entry.
+    /// </summary>
+    private void AskPersonInstead(CoreWebView2ScriptDialogOpeningEventArgs e)
+    {
+        CoreWebView2Deferral deferral;
+        try
+        {
+            deferral = e.GetDeferral();
+        }
+        catch (Exception ex) when (ex is System.Runtime.InteropServices.COMException or InvalidOperationException)
+        {
+            DebugLog.Write($"a page dialog could not be deferred: {ex.Message}");
+            return;
+        }
+        var host = _owner.Host;
+        void Answer()
+        {
+            try
+            {
+                var window = host.FindForm();
+                string site = Uri.TryCreate(e.Uri, UriKind.Absolute, out var uri) && uri.Host.Length > 0 ? uri.Host : "This page";
+                string title = $"{site} says";
+                switch (e.Kind)
+                {
+                    case CoreWebView2ScriptDialogKind.Alert:
+                        MessageBox.Show(window, e.Message, title, MessageBoxButtons.OK);
+                        e.Accept();
+                        break;
+                    case CoreWebView2ScriptDialogKind.Confirm:
+                        if (MessageBox.Show(window, e.Message, title, MessageBoxButtons.OKCancel) == DialogResult.OK)
+                            e.Accept();
+                        break;
+                    case CoreWebView2ScriptDialogKind.Prompt:
+                        if (PromptBox.Ask(window, title, e.Message, e.DefaultText) is { } answer)
+                        {
+                            e.ResultText = answer;
+                            e.Accept();
+                        }
+                        break;
+                    default:
+                        if (MessageBox.Show(window, "Leave this page? Changes you made may not be saved.", title, MessageBoxButtons.OKCancel) == DialogResult.OK)
+                            e.Accept();
+                        break;
+                }
+            }
+            catch (Exception ex)
+            {
+                // Run from BeginInvoke, where anything escaping would reach the thread
+                // exception handler the app does not have. The page gets Cancel.
+                DebugLog.WriteAlways($"a page dialog could not be shown: {ex}");
+            }
+            finally
+            {
+                try { deferral.Complete(); }
+                catch (Exception ex) when (ex is System.Runtime.InteropServices.COMException or InvalidOperationException) { }
+            }
+        }
+        try
+        {
+            host.BeginInvoke(Answer);
+        }
+        catch (InvalidOperationException)
+        {
+            // The window is gone; so is the page that asked.
+            try { deferral.Complete(); }
+            catch (Exception ex) when (ex is System.Runtime.InteropServices.COMException or InvalidOperationException) { }
+        }
+    }
+    private readonly object _dialogGate = new();
+    private readonly List<DialogSeen> _dialogs = new();
+    private int _dialogCount;
+    private bool _acceptDialogs = true;
+    private string? _promptAnswer;
+
+    /// <summary>The last few dialogs this tab answered, the newest last. Any thread.</summary>
+    internal IReadOnlyList<DialogSeen> RecentDialogs
+    {
+        get { lock (_dialogGate) return _dialogs.ToArray(); }
+    }
+
+    /// <summary>How many dialogs this tab has answered, ever: a mark to tell which came after a click.</summary>
+    internal int DialogCount
+    {
+        get { lock (_dialogGate) return _dialogCount; }
+    }
+
+    /// <summary>The dialogs answered after <paramref name="mark"/>, a <see cref="DialogCount"/> taken earlier.</summary>
+    internal IReadOnlyList<DialogSeen> DialogsSince(int mark)
+    {
+        lock (_dialogGate)
+        {
+            int newer = Math.Min(_dialogCount - mark, _dialogs.Count);
+            return newer <= 0 ? [] : _dialogs.Skip(_dialogs.Count - newer).ToArray();
+        }
+    }
+
+    /// <summary>
+    /// How the next dialogs are answered: confirm and prompt accepted (OK) or dismissed
+    /// (Cancel), and the text a prompt gets (null: its default). Alerts are always OK, and
+    /// "leave this page?" always leaves, since an agent navigating meant to. Any thread.
+    /// </summary>
+    internal (bool Accept, string? PromptAnswer) DialogPolicy
+    {
+        get { lock (_dialogGate) return (_acceptDialogs, _promptAnswer); }
+        set { lock (_dialogGate) { _acceptDialogs = value.Accept; _promptAnswer = value.PromptAnswer; } }
+    }
+
+    /// <summary>Whether a dialog is accepted and what a prompt says, by its kind and the policy. Apart from the engine, for tests.</summary>
+    internal static (bool Accept, string? Text) AnswerFor(string kind, string defaultText, bool acceptPolicy, string? promptAnswer)
+        => kind switch
+        {
+            "alert" or "beforeunload" => (true, null),
+            "prompt" => acceptPolicy ? (true, promptAnswer ?? defaultText) : (false, null),
+            _ => (acceptPolicy, null),
+        };
+
+    /// <summary>Keeps a dialog this tab answered, the last <see cref="MaxDialogs"/> of them, each message cut to 500 characters.</summary>
+    internal void RecordDialog(string kind, string message, bool accepted, string? answer)
+    {
+        lock (_dialogGate)
+        {
+            _dialogs.Add(new DialogSeen(DateTime.UtcNow, kind, message.Length > 500 ? message[..500] : message, accepted, answer));
+            if (_dialogs.Count > MaxDialogs)
+                _dialogs.RemoveAt(0);
+            _dialogCount++;
+        }
+    }
+
+    private void OnScriptDialogOpening(object? sender, CoreWebView2ScriptDialogOpeningEventArgs e)
+    {
+        // Only raised with the engine's own dialogs off, which is an agent's window, or one
+        // that has just become the person's and not navigated since.
+        if (!_owner.IsAgentWindow())
+        {
+            AskPersonInstead(e);
+            return;
+        }
+        try
+        {
+            string kind = e.Kind switch
+            {
+                CoreWebView2ScriptDialogKind.Alert => "alert",
+                CoreWebView2ScriptDialogKind.Confirm => "confirm",
+                CoreWebView2ScriptDialogKind.Prompt => "prompt",
+                _ => "beforeunload",
+            };
+            var (accept, prompt) = DialogPolicy;
+            var (yes, text) = AnswerFor(kind, e.DefaultText ?? "", accept, prompt);
+            if (text is not null)
+                e.ResultText = text;
+            if (yes)
+                e.Accept();
+            RecordDialog(kind, e.Message ?? "", yes, text);
+        }
+        catch (Exception ex) when (ex is System.Runtime.InteropServices.COMException or InvalidOperationException)
+        {
+            DebugLog.Write($"a page dialog could not be answered: {ex.Message}");
+        }
+    }
+
     /// <summary>Whether <see cref="NoteAgentAction"/> was called within the last <paramref name="span"/>.</summary>
     internal bool AgentActedWithin(TimeSpan span)
     {
@@ -863,6 +1117,32 @@ public sealed class Tab : ITabHandle, IDisposable
         _owner = newOwner;
         if (_webView is not null)
             newOwner.Host.Controls.Add(_webView);
+        RefreshDialogMode();
+    }
+
+    /// <summary>
+    /// Puts page dialogs back in the hands of whoever owns the window now: answered by the
+    /// tab itself in an agent's window, shown in the person's. Called when a tab moves
+    /// between windows and when an agent's window becomes the person's. The engine reads
+    /// the setting at the next navigation, so until then a dialog in what is now the
+    /// person's window is asked of them by <see cref="AskPersonInstead"/>.
+    /// Whether the window offers to save passwords goes the same way, for the same reason
+    /// (<see cref="BrowserEnvironment.SavesPasswords"/>).
+    /// </summary>
+    internal void RefreshDialogMode()
+    {
+        if (Core is not { } core)
+            return;
+        try
+        {
+            bool agentWindow = _owner.IsAgentWindow();
+            core.Settings.AreDefaultScriptDialogsEnabled = !agentWindow;
+            core.Settings.IsPasswordAutosaveEnabled = BrowserEnvironment.SavesPasswords(_owner.Env.Settings, agentWindow);
+        }
+        catch (Exception ex) when (ex is System.Runtime.InteropServices.COMException or InvalidOperationException)
+        {
+            DebugLog.Write($"the dialog setting could not be changed: {ex.Message}");
+        }
     }
 
     /// <summary>
@@ -1987,6 +2267,73 @@ public sealed class Tab : ITabHandle, IDisposable
         return stream.ToArray();
     }
 
+    /// <summary>
+    /// A small JPEG of what the tab last drew, for the agents page to show the person, or
+    /// null when there is nothing to take without disturbing it: no view, a tab asleep, one
+    /// of the browser's own pages, or a capture that did not come back within the budget.
+    ///
+    /// Unlike <see cref="CaptureScreenshotAsync"/> it never wakes the tab or waits for its
+    /// page, and does not count as using it, so a page watching an agent's tabs every few
+    /// seconds does not keep a sleeping one awake or hold a frozen one up.
+    /// </summary>
+    internal async Task<byte[]?> CaptureThumbnailAsync(int maxWidth, TimeSpan budget)
+    {
+        if (State is TabState.Suspended or TabState.Discarded || Core is not { } core)
+            return null;
+        if (RefusalFor(Url, _navigationUnderWay?.Uri, CommittedUrl) is not null)
+            return null;
+        byte[] jpeg;
+        try
+        {
+            var (bytes, inTime) = await WithBudget(CaptureJpegAsync(core), budget, Array.Empty<byte>());
+            if (!inTime || bytes.Length == 0)
+                return null;
+            jpeg = bytes;
+        }
+        catch (Exception ex) when (ex is System.Runtime.InteropServices.COMException or InvalidOperationException or ObjectDisposedException)
+        {
+            return null;   // the view went, or the engine would not capture it now
+        }
+        return await Task.Run(() => Shrink(jpeg, maxWidth));
+    }
+
+    private static async Task<byte[]> CaptureJpegAsync(CoreWebView2 core)
+    {
+        using var stream = new MemoryStream();
+        await core.CapturePreviewAsync(CoreWebView2CapturePreviewImageFormat.Jpeg, stream);
+        return stream.ToArray();
+    }
+
+    /// <summary>An image made at most <paramref name="maxWidth"/> wide, as a JPEG; null if it cannot be read.</summary>
+    internal static byte[]? Shrink(byte[] image, int maxWidth)
+    {
+        try
+        {
+            using var input = new MemoryStream(image);
+            using var source = System.Drawing.Image.FromStream(input);
+            if (source.Width <= 0 || source.Height <= 0)
+                return null;
+            int width = Math.Min(maxWidth, source.Width);
+            int height = Math.Max(1, (int)Math.Round(source.Height * (width / (double)source.Width)));
+            using var small = new System.Drawing.Bitmap(width, height);
+            using (var g = System.Drawing.Graphics.FromImage(small))
+            {
+                g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+                g.DrawImage(source, 0, 0, width, height);
+            }
+            var codec = System.Drawing.Imaging.ImageCodecInfo.GetImageEncoders().First(c => c.FormatID == System.Drawing.Imaging.ImageFormat.Jpeg.Guid);
+            using var quality = new System.Drawing.Imaging.EncoderParameters(1);
+            quality.Param[0] = new System.Drawing.Imaging.EncoderParameter(System.Drawing.Imaging.Encoder.Quality, 78L);
+            using var output = new MemoryStream();
+            small.Save(output, codec, quality);
+            return output.ToArray();
+        }
+        catch (Exception ex) when (ex is ArgumentException or System.Runtime.InteropServices.ExternalException or OutOfMemoryException)
+        {
+            return null;   // GDI+ answers a bad image with any of these
+        }
+    }
+
     public void GoBack() { try { Core?.GoBack(); } catch { } }
     public void GoForward() { try { Core?.GoForward(); } catch { } }
     public void Reload() { try { Core?.Reload(); } catch { } }
@@ -2080,6 +2427,15 @@ public sealed class Tab : ITabHandle, IDisposable
         RaiseUpdated();
     }
 
+    // A new document, not a same-document move (pushState, a #fragment): anything an agent's
+    // script did to the last one is gone with it. See AgentScriptedThisDocument.
+    private void OnContentLoading(object? sender, CoreWebView2ContentLoadingEventArgs e)
+    {
+        Interlocked.Exchange(ref _documentStarted, Interlocked.Increment(ref s_marks));
+        if (_lastNavigationStarted is { History: false } started && started.Id == e.NavigationId)
+            Volatile.Write(ref _historyAfterScript, 0);
+    }
+
     private void OnHistoryChanged(object? sender, object e) => RaiseUpdated();
 
     private async void OnFaviconChanged(object? sender, object e)
@@ -2113,6 +2469,15 @@ public sealed class Tab : ITabHandle, IDisposable
             _recentErrors.Clear(); // fresh page, fresh slate for the error indicator
         // Redirects included: the same navigation, now heading somewhere else.
         NoteNavigationUnderWay(e.NavigationId, e.Uri);
+        bool history;
+        try { history = e.NavigationKind == CoreWebView2NavigationKind.BackOrForward; }
+        catch (Exception ex) when (ex is NotImplementedException or System.Runtime.InteropServices.COMException)
+        {
+            history = true;   // a runtime that cannot say: taken as the case that is refused
+        }
+        _lastNavigationStarted = (e.NavigationId, history);
+        if (history && Interlocked.Read(ref _agentScript) != 0)
+            Volatile.Write(ref _historyAfterScript, 1);
 
         // Hand this navigation to whoever asked for this url. Redirects are skipped: the
         // engine keeps the same NavigationId across one, so re-stamping would be a no-op

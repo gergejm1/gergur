@@ -123,7 +123,7 @@ public sealed class BrowserEnvironment
     /// on the shared environment. WebView2.Source must never be assigned before this
     /// completes - that triggers implicit init against a default, non-shared environment.
     /// </summary>
-    public async Task<WebView2> CreateWebViewAsync(Control host, bool visible)
+    public async Task<WebView2> CreateWebViewAsync(Control host, bool visible, bool agentWindow)
     {
         var webView = new WebView2
         {
@@ -138,7 +138,7 @@ public sealed class BrowserEnvironment
         {
             _ = webView.Handle; // force HWND creation; init needs it even while the control is hidden
             await webView.EnsureCoreWebView2Async(Core);
-            ApplyViewSettings(webView.CoreWebView2, Settings);
+            ApplyViewSettings(webView.CoreWebView2, Settings, agentWindow);
             // Before the first page is asked for, once per run, and bounded: see SiteWorkarounds.
             await SiteWorkarounds.ResetServiceWorkersOnceAsync(webView.CoreWebView2);
             return webView;
@@ -164,7 +164,7 @@ public sealed class BrowserEnvironment
     /// password saving until the tab was rebuilt, while the settings window and the agent
     /// API both said the change was applied.
     /// </summary>
-    internal static void ApplyViewSettings(CoreWebView2 core, Settings settings)
+    internal static void ApplyViewSettings(CoreWebView2 core, Settings settings, bool agentWindow)
     {
         core.Profile.PreferredTrackingPreventionLevel = settings.TrackingPrevention switch
         {
@@ -180,7 +180,17 @@ public sealed class BrowserEnvironment
             "Dark" => CoreWebView2PreferredColorScheme.Dark,
             _ => CoreWebView2PreferredColorScheme.Auto,
         };
-        core.Settings.IsPasswordAutosaveEnabled = settings.SavePasswords;
+        core.Settings.IsPasswordAutosaveEnabled = SavesPasswords(settings, agentWindow);
         core.Settings.IsGeneralAutofillEnabled = settings.FormAutofill;
     }
+
+    /// <summary>
+    /// Whether a view offers to save a password typed into it: only in the person's windows.
+    /// What an agent types into a login is not the person saying yes to keeping it, and the
+    /// engine's "Save your password?" box for an agent's hidden window would come up on its
+    /// own, beside nothing. Saved passwords still fill in everywhere, agent windows included:
+    /// this switch only governs saving (measured: a view with it off fills on load and never
+    /// asks). See "Saved passwords" in CLAUDE.md.
+    /// </summary>
+    internal static bool SavesPasswords(Settings settings, bool agentWindow) => settings.SavePasswords && !agentWindow;
 }

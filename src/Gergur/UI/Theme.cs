@@ -34,6 +34,17 @@ public static class Theme
     public static readonly Color Accent = Color.FromArgb(250, 61, 77);
     /// <summary>"Working right now", for an agent: green, because the crimson accent beside it reads as a warning.</summary>
     public static readonly Color Live = Color.FromArgb(87, 204, 140);
+    /// <summary>
+    /// An agent's: the blue of the cursor it draws on the pages it drives, for the band
+    /// across its window and the AGENT pill on its tabs. Deliberately off the crimson
+    /// palette, so nothing of an agent's reads as the person's own.
+    /// </summary>
+    public static readonly Color Agent = Color.FromArgb(61, 123, 250);
+    /// <summary>The band across an agent's window: a dark blue the near-white text reads on.</summary>
+    public static readonly Color AgentBg = Color.FromArgb(17, 29, 61);
+    public static readonly Color AgentHover = Color.FromArgb(33, 52, 102);
+    public static readonly Color AgentPressed = Color.FromArgb(45, 70, 135);
+    public static readonly Color AgentTextDim = Color.FromArgb(170, 186, 222);
     public static readonly Color InputBg = Color.FromArgb(48, 20, 28);
     public static readonly Color Border = Color.FromArgb(92, 42, 56);
 

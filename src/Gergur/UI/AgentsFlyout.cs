@@ -3,8 +3,10 @@ using Gergur.App;
 namespace Gergur.UI;
 
 /// <summary>A tab an agent has worked in, as the agents panel shows it.</summary>
-/// <param name="InAgentWindow">In a window an agent opened, behind the person's: hidden unless brought forward.</param>
-internal sealed record AgentTabInfo(string Id, string Title, string Url, bool InAgentWindow);
+/// <param name="Hidden">In an agent's window that is hidden from the person: off screen, the taskbar and Alt+Tab until shown.</param>
+/// <param name="InAgentWindow">In a window an agent opened and the person has not taken over, hidden or not: one that can be hidden.</param>
+/// <param name="Asleep">Suspended or discarded: there is nothing fresh to photograph.</param>
+internal sealed record AgentTabInfo(string Id, string Title, string Url, bool Hidden, bool InAgentWindow = false, bool Asleep = false);
 
 /// <summary>
 /// The panel the agents button drops: every agent that has used this browser since it
@@ -22,12 +24,14 @@ internal sealed class AgentsFlyout : FlyoutPanel
     private readonly Func<string, AgentTabInfo?> _tab;
     private readonly Action<string> _showTab;
     private readonly Func<string> _footer;
+    private readonly Action _openPage;
     private Font _bold = null!;
     private Font _small = null!;
     private Font _icons = null!;
     private Rectangle _header;
     private Rectangle _message;
     private Rectangle _footerBox;
+    private HotSpot? _pageSpot;
     private int _activeCount;
     private DateTime _lastRefreshUtc;
     private readonly List<(AgentSnapshot Agent, Rectangle Bounds)> _agentRows = new();
@@ -37,12 +41,14 @@ internal sealed class AgentsFlyout : FlyoutPanel
     /// <param name="tab">A tab by id, or null once it has closed.</param>
     /// <param name="showTab">Brings a tab and its window forward.</param>
     /// <param name="footer">The line at the bottom: whether the agent API is on, and where.</param>
-    public AgentsFlyout(Func<IReadOnlyList<AgentSnapshot>> snapshot, Func<string, AgentTabInfo?> tab, Action<string> showTab, Func<string> footer)
+    /// <param name="openPage">Opens the agents page (gergur://agents), which shows all of it and more.</param>
+    public AgentsFlyout(Func<IReadOnlyList<AgentSnapshot>> snapshot, Func<string, AgentTabInfo?> tab, Action<string> showTab, Func<string> footer, Action openPage)
     {
         _snapshot = snapshot;
         _tab = tab;
         _showTab = showTab;
         _footer = footer;
+        _openPage = openPage;
         EnsureFonts();
         AccessibleName = "Agents";
     }
@@ -109,7 +115,8 @@ internal sealed class AgentsFlyout : FlyoutPanel
             _message = Rectangle.Empty;
             foreach (var agent in agents.Take(MaxAgents))
             {
-                var row = new Rectangle(pad, y, width - pad * 2, S(52));
+                // A third line for what it says it is doing, when it has said.
+                var row = new Rectangle(pad, y, width - pad * 2, S(agent.Task is null ? 52 : 70));
                 _agentRows.Add((agent, row));
                 y += row.Height;
                 int shown = 0;
@@ -123,7 +130,7 @@ internal sealed class AgentsFlyout : FlyoutPanel
                     shown++;
                     string name = string.IsNullOrWhiteSpace(tab.Title) ? tab.Url : tab.Title;
                     var spot = new HotSpot(new Rectangle(pad + S(40), y, width - pad * 2 - S(40), S(34)),
-                        () => _showTab(tab.Id), $"Show {name}", Tip: tab.InAgentWindow ? "Bring its window forward" : "Go to this tab");
+                        () => _showTab(tab.Id), $"Show {name}", Tip: tab.Hidden ? "Show its hidden window" : "Go to this tab");
                     AddSpot(spot);
                     _tabRows.Add((tab, spot));
                     y += spot.Bounds.Height;
@@ -133,6 +140,10 @@ internal sealed class AgentsFlyout : FlyoutPanel
         }
 
         y += S(4);
+        _pageSpot = new HotSpot(new Rectangle(pad, y, width - pad * 2, S(34)), _openPage, "Open the agents page",
+            Tip: "Every agent, what it is doing, its timeline and live pictures of its tabs");
+        AddSpot(_pageSpot);
+        y += _pageSpot.Bounds.Height + S(2);
         _footerBox = new Rectangle(S(16), y, width - S(32), S(30));
         y += _footerBox.Height + pad;
         return new Size(width, y);
@@ -158,8 +169,16 @@ internal sealed class AgentsFlyout : FlyoutPanel
         foreach (var (tab, spot) in _tabRows)
             PaintTab(g, tab, spot);
 
-        using (var pen = new Pen(Theme.Border))
-            g.DrawLine(pen, S(12), _footerBox.Top - S(2), Width - S(12), _footerBox.Top - S(2));
+        if (_pageSpot is { } page)
+        {
+            using (var pen = new Pen(Theme.Border))
+                g.DrawLine(pen, S(12), page.Bounds.Top - S(2), Width - S(12), page.Bounds.Top - S(2));
+            PaintHover(g, page);
+            var icon = new Rectangle(page.Bounds.X + S(8), page.Bounds.Y, S(24), page.Bounds.Height);
+            DrawLabel(g, AgentGlyphs.Page, _icons, icon, Theme.Text, center: true);
+            DrawLabel(g, "Open the agents page", Font,
+                Rectangle.FromLTRB(icon.Right + S(8), page.Bounds.Top, page.Bounds.Right - S(8), page.Bounds.Bottom), Theme.Text);
+        }
         DrawLabel(g, _footer(), _small, _footerBox, Theme.TextDim);
     }
 
@@ -188,7 +207,14 @@ internal sealed class AgentsFlyout : FlyoutPanel
         string when = active ? "active now" : DownloadText.Ago(agent.LastSeenUtc, now);
         DrawLabel(g, $"{agent.Kind} \u00B7 {when}", _small, nameBox, active ? Theme.Live : Theme.TextDim, right: true);
 
-        var lastBox = new Rectangle(left, row.Y + S(28), nameBox.Width, S(18));
+        int lastTop = row.Y + S(28);
+        if (agent.Task is { } task)
+        {
+            // In its own words, the line the person most wants: what it is up to.
+            DrawLabel(g, task, Font, new Rectangle(left, lastTop - S(1), nameBox.Width, S(20)), Theme.Text);
+            lastTop += S(19);
+        }
+        var lastBox = new Rectangle(left, lastTop, nameBox.Width, S(18));
         string last = agent.Recent.Count > 0 ? agent.Recent[0].Text : "";
         string count = agent.ActionCount == 1 ? "1 action" : $"{agent.ActionCount:N0} actions";
         DrawLabel(g, last.Length > 0 ? $"{last} \u00B7 {count}" : count, _small, lastBox, Theme.TextDim);
@@ -203,16 +229,16 @@ internal sealed class AgentsFlyout : FlyoutPanel
             g.DrawLine(pen, r.X - S(16), r.Y, r.X - S(16), r.Y + r.Height / 2);
         string title = string.IsNullOrWhiteSpace(tab.Title) ? tab.Url : tab.Title;
         string site = DownloadText.Site(tab.Url);
-        if (tab.InAgentWindow)
+        if (tab.Hidden)
             site = site.Length > 0 ? $"{site} \u00B7 hidden" : "hidden";
         var titleBox = new Rectangle(r.X + S(8), r.Y, r.Width - S(8) - S(36), r.Height);
         int siteWidth = site.Length == 0 ? 0 : Math.Min(TextRenderer.MeasureText(site, _small).Width + S(8), titleBox.Width / 2);
         DrawLabel(g, title, Font, new Rectangle(titleBox.X, titleBox.Y, titleBox.Width - siteWidth, titleBox.Height), Theme.Text);
         if (siteWidth > 0)
             DrawLabel(g, site, _small, titleBox, Theme.TextDim, right: true);
-        // A hidden tab says so: it is in a window behind the person's.
+        // A hidden tab says so: its window is hidden until shown from here.
         var icon = new Rectangle(r.Right - S(32), r.Y, S(28), r.Height);
-        DrawLabel(g, tab.InAgentWindow ? AgentGlyphs.Hidden : AgentGlyphs.Show, _icons, icon, Theme.TextDim, center: true);
+        DrawLabel(g, tab.Hidden ? AgentGlyphs.Hidden : AgentGlyphs.Show, _icons, icon, Theme.TextDim, center: true);
     }
 
     protected override void Dispose(bool disposing)
@@ -232,6 +258,34 @@ internal static class AgentGlyphs
 {
     public const string Robot = "\uE99A";
     public const string Show = "\uE8A7";      // OpenInNewWindow
-    public const string Hidden = "\uE7B3";    // an eye: look at a tab in a window behind yours
-    public const string SendBack = "\uED1A";  // Hide, an eye struck through: an agent's window back behind yours
+    public const string Hidden = "\uE7B3";    // an eye: look at a tab in a hidden window
+    public const string Page = "\uE8A1";      // PreviewLink: the agents page
+    /// <summary>
+    /// Hide, an eye struck through: an agent's window back into hiding. Segoe Fluent Icons
+    /// (Windows 11) has it; Segoe MDL2 Assets (Windows 10, this machine) does not and drew
+    /// an empty box, so there the plain eye is drawn with a stroke across it by hand
+    /// (<see cref="SendBackNeedsStrike"/>). Measured against segmdl2.ttf 1.79.
+    /// </summary>
+    public static readonly string SendBack = Theme.IconFontName == "Segoe Fluent Icons" ? "\uED1A" : Hidden;
+
+    /// <summary>Whether <see cref="SendBack"/> is the plain eye and needs its stroke drawn.</summary>
+    public static readonly bool SendBackNeedsStrike = Theme.IconFontName != "Segoe Fluent Icons";
+
+    /// <summary>Codepoints only Segoe Fluent Icons has, each with what stands in for it on MDL2.</summary>
+    internal static readonly IReadOnlyDictionary<string, string> FluentOnly = new Dictionary<string, string>
+    {
+        ["\uED1A"] = Hidden,
+    };
+
+    /// <summary>The stroke across an eye that makes it "hide": corner to corner, in the glyph's own colour.</summary>
+    internal static void DrawStrike(Graphics g, Rectangle box, Color color, float width)
+    {
+        int size = (int)(Math.Min(box.Width, box.Height) * 0.62);
+        int cx = box.Left + box.Width / 2, cy = box.Top + box.Height / 2;
+        var old = g.SmoothingMode;
+        g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+        using var pen = new Pen(color, width) { StartCap = System.Drawing.Drawing2D.LineCap.Round, EndCap = System.Drawing.Drawing2D.LineCap.Round };
+        g.DrawLine(pen, cx - size / 2, cy - size / 2, cx + size / 2, cy + size / 2);
+        g.SmoothingMode = old;
+    }
 }
