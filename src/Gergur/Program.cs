@@ -29,7 +29,7 @@ internal static class Program
             Thread.Sleep(3000); // grace for the shared browser process to exit
         }
 
-        using var mutex = new Mutex(initiallyOwned: true, @"Local\Gergur.SingleInstance", out bool isFirstInstance);
+        using var mutex = new Mutex(initiallyOwned: true, @"Local\Gergur.SingleInstance" + Settings.InstanceSuffix, out bool isFirstInstance);
         if (!isFirstInstance)
         {
             // Already running. As the default browser this is the common case: Windows

@@ -1633,7 +1633,11 @@ public sealed class MainForm : Form
     protected override void OnActivated(EventArgs e)
     {
         base.OnActivated(e);
-        _session?.NoteActive(this);
+        // A window the person cannot see was not brought forward by them: choosing a saved
+        // account activates an agent's hidden window for a second (AccountPick), and that must
+        // not make it the window a request naming none goes to.
+        if (!HiddenForAgent)
+            _session?.NoteActive(this);
     }
 
     protected override async void OnShown(EventArgs e)

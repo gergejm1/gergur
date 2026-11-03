@@ -59,7 +59,7 @@ sent. Prefer the id: see "Naming a tab" below.
 | GET or POST /dialogs | {"accept": false?, "text": "..."?} | recent page dialogs, and how the next confirm/prompt are answered |
 | GET /downloads | ?wait=1&timeout=s | the caller's own downloads: file, path, state, bytes |
 | POST /ask | {"question": "..."} or {"id": "ask-1"}, "timeout": s? | ask the person; a bar in their window. See "Asking the person" |
-| POST /login | {"submit": false?} | sign in with a saved password: {filled, user, submitted, via, stillAsking, url}. See "Saved passwords" |
+| POST /login | {"submit": false?, "account": "..."?} | sign in with a saved password, choosing the account and filling two-step password pages: {filled, user, submitted, via, stillAsking, url, picked}. See "Saved passwords" |
 | GET /settings | | {settings, restartRequired, vpnInForce, tunnelRunning}; credentials read as "(hidden)" |
 | POST /settings | {"BlocklistEnabled": false, ...} | change settings, returns {applied, restartNeededFor, unknown, persisted} |
 | POST /window | {"url": "..."?, "focus": true?, "muted": true?} | open another window, returns {window, id} |
@@ -890,15 +890,92 @@ the session scratchpad, not in the repo): the save prompt after a sign-in, Save 
 the fields filled on the next load before any input, a view with saving off still filled
 and never prompting, two accounts filling the most recent. The page scripts run in the
 test suite against a stand-in page under node (`LoginScripts.harness.js`, from
-`SavedLoginsTests`). Not possible: choosing another saved account (the engine showed no
-suggestion list to a protocol click and keys picked nothing), and filling the password
-page of a two-step sign-in after typing a saved username. Not airtight: a script can keep
+`SavedLoginsTests`). Not airtight: a script can keep
 what it reads somewhere (a global, storage) and hand it over in a later call once the field
 is gone, or wait for the engine to fill a form, read it and empty the field before it
 returns, so the look afterwards finds nothing; a page scripted through another tab the agent scripted (a window.open handle) is
 not caught; a "show password" field not named or marked as one is not recognised, and it
 would then show in a screenshot. Saved passwords cannot be listed or removed one by one
 from Gergur; WebView2 has no API for it, only clearing them all.
+
+#### Choosing the account, and two-step sign-ins
+
+`gergur_login` takes `account` (a username, 1 to 200 characters, no control characters,
+`AgentServer.CleanAccount`). What it does is decided from the page alone
+(`AgentServer.WantedAccount`, `PlanPick`):
+
+- One account wanted and already filled in: used as it is, no keyboard.
+- A password page with no username field (two-step, or a bare password form): the account
+  is taken from `account`, else from the page itself (`pageUser`: a hidden or plain input
+  before the field marked as a username or email, by autocomplete, type or a name like
+  `email` or `identifier`). Gergur adds a username field of its own before the password
+  field (`AddPickFieldJs`), which makes the engine fill the most recent saved account
+  passively; if that is the one wanted, done, with no keyboard. The field is always removed
+  before anything is sent.
+- Otherwise (another account wanted than the one filled, or the passive fill was another
+  one): the account is chosen from the engine's own list, the way a person does it
+  (`Tabs/AccountPick.cs`).
+
+The engine shows its list only to a page with the real Win32 keyboard focus (focus emulation
+over the protocol does not do it), and all Gergur windows share one UI thread. So a pick
+borrows this app's keyboard for one to two seconds. The person agreed to that while they are
+in Gergur; it is never taken from another app. The guards, each measured:
+
+- Only in an agent's own window (`OpenedByAgent`), never the person's (409), and one pick at
+  a time app wide (`AccountPick.Turn`, 503 when busy).
+- A hidden window is moved wholly left of every screen first (`AccountPick.Parked`) and put
+  back after. The list is a top-level window of the engine's browser process, owned by the
+  hidden window and so cloaked with it (inherited), and drawn beside the field.
+- If giving the page the focus brings Gergur in front of another app (`TookTheFront`;
+  Windows allows it after a while without input, and to a process the front app started),
+  the pick stops before any key (503 `PickInterrupted`). Measured before this check existed:
+  the person's typing in another app went into the test page.
+- No key goes in unless the list is there (`ListShown`: a shown window of the engine's
+  browser process whose root owner is the pick's window, beside it, so a popup of the
+  person's own window is never taken for it; `NoList` otherwise, and the answer is
+  `AccountNotSaved` with nothing sent). The page's `submit` is held off while keys go in
+  (`GuardJs`), not its keydown: holding keydown off held the list's choice off too. Without
+  the list, Enter in the field sent the form.
+- Typing the account narrows the list to it; ArrowDown, then Enter as a `rawKeyDown` with no
+  text (`ListEnter`). The usual Enter carries "\r", goes as a keyDown, and the list passed it
+  to the page. The list sometimes ignores an Enter that comes soon after it narrows (still up
+  1.5 s later in 3 picks of 15), so Enter waits 400 ms and is pressed again while the list is
+  still up and nothing was chosen (`EnterAttempts`), never with the list gone.
+- The account is read back from the page while the focus is held (`PickStateJs`, the
+  username and only the password's length). A pick that did not come out as the account
+  asked answers `AccountNotSaved` and empties the password field.
+- The whole pick is waited for at most `PickBudget` (15 s, 503 `PickTimedOut`), so a window
+  closing under it cannot hold the turn for good. Whatever ends it (refused, failed, thrown),
+  one `finally` empties the password unless the wanted account came out, and takes Gergur's
+  added field away, each best effort and logged.
+- After: given back first, with nothing awaited before it, so a page script that throws
+  cannot skip it. This thread's active window and focus are given back, and the foreground only when
+  the pick's own window (or something it owns) holds it (`GiveFrontBack`). The person moving
+  to another app mid-pick is theirs: in the live test they went from Gergur to a console
+  during a pick, and putting the front back would have pulled them out of it.
+- The hidden window activating for it never becomes the window requests go to
+  (`MainForm.OnActivated`).
+
+Verified live on 2026-11-03 (`scratchpad/livetest/pick-live.ps1`, 15 checks, a test instance
+on a seeded scratch profile with two made-up accounts, local pages): a second account chosen
+from the list and signed in with its own password, the account already filled used without
+the list, the two-step password page filled for the account it carries, a bare password page
+filled passively with the most recent and with `account` for the other, a never-saved account
+refused with nothing sent, refused in the person's window, no engine window ever drawn on a
+screen, the test instance never holding the foreground, and the window back in place and
+hidden. 15 of 15 in the last six runs, the last three after the review fixes, with the list traced as owned by the pick's window. Not verified live: a pick borrowing the keyboard of
+a person who is in Gergur at that moment (the test instance is a separate process, so the
+person was always in another app); a list with many accounts; a site's own script-driven
+username field.
+
+#### A test instance
+
+`GERGUR_DATA_DIR` moves the whole data folder (settings, profile, logs) and gives the
+instance its own single-instance mutex and pipe (`Settings.InstanceSuffix`, a hash of the
+folder), so a second Gergur runs beside the person's own without touching their profile,
+vault or settings. Use it for anything that needs saved logins: seed the scratch profile,
+never the real vault. Launch it through WMI (`Win32_Process.Create`), not as a child of the
+terminal: a child of the front app may take the foreground.
 
 ### Saying what you are doing
 

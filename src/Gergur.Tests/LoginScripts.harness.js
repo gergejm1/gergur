@@ -1,11 +1,14 @@
-// Runs AgentServer.PasswordStateJs and LoginStateJs against a small stand-in for a page, so
-// what they decide is exercised rather than read. Run by SavedLoginsTests with the two
-// scripts written to files: node LoginScripts.harness.js <passwordState.js> <loginState.js>
+// Runs AgentServer.PasswordStateJs, LoginStateJs and the account-choosing scripts against a
+// small stand-in for a page, so what they decide is exercised rather than read. Run by
+// SavedLoginsTests with the scripts written to files: node LoginScripts.harness.js
+// <passwordState.js> <loginState.js> <addPick.js> <pickState.js> <clearForPick.js> <emptyPassword.js> <removePick.js>
 // The stand-in has only what the scripts use; the real engine is the live test's job.
 "use strict";
 const fs = require("fs");
 const passwordStateSource = fs.readFileSync(process.argv[2], "utf8");
 const loginStateSource = fs.readFileSync(process.argv[3], "utf8");
+const [addPickSource, pickStateSource, clearSource, emptySource, removeSource] =
+    [4, 5, 6, 7, 8].map(i => fs.readFileSync(process.argv[i], "utf8"));
 
 let failures = 0;
 function check(name, actual, expected) {
@@ -29,6 +32,8 @@ class El {
         for (const c of children) this.append(c);
     }
     append(c) { c.parent = this; this.children.push(c); return c; }
+    before(c) { const at = this.parent.children.indexOf(this); c.parent = this.parent; this.parent.children.splice(at, 0, c); }
+    remove() { if (this.parent) this.parent.children.splice(this.parent.children.indexOf(this), 1); this.parent = null; }
     getAttribute(n) { return Object.prototype.hasOwnProperty.call(this.attrs, n) ? this.attrs[n] : null; }
     setAttribute(n, v) { this.attrs[n] = String(v); }
     getBoundingClientRect() { return this.rect; }
@@ -60,7 +65,7 @@ class El {
     }
 }
 class Input extends El {
-    constructor(props = {}) { super("input", Object.assign({ type: "text", value: "", name: "", id: "", disabled: false }, props)); }
+    constructor(props = {}) { super("input", Object.assign({ type: "text", value: "", name: "", id: "", disabled: false, readOnly: false }, props)); }
 }
 class Button extends El {
     constructor(props = {}) { super("button", Object.assign({ type: "submit", disabled: false }, props)); }
@@ -81,6 +86,7 @@ let page;
 function docOrder() { return [page, ...page.descendants()]; }
 function load(...children) {
     page = new El("document", {}, children);
+    page.createElement = tag => tag === "input" ? new Input() : new El(tag);
     for (const input of page.descendants().filter(e => e instanceof Input || e instanceof Button)) {
         let up = input.parent;
         while (up && !(up instanceof Form)) up = up.parent;
@@ -99,6 +105,11 @@ function run(source) {
 }
 const passwordState = () => run(passwordStateSource);
 const loginState = () => run(loginStateSource);
+const addPick = () => run(addPickSource);
+const pickState = () => run(pickStateSource);
+const clearForPick = () => run(clearSource);
+const emptyPassword = () => run(emptySource);
+const removePick = () => run(removeSource);
 
 // ---------------------------------------------------------------- PasswordStateJs
 load();
@@ -155,7 +166,9 @@ load(new Form({}, [
     pass = new Input({ type: "password", value: "secret-value" }),
     go = new Button({ type: "submit" }),
 ]));
-check("a filled form: the account, filled, a button", loginState(), { fields: 1, filled: true, user: "someone@example.com", button: true });
+check("a filled form: the account, filled, a button, a field to type in", loginState(),
+    { fields: 1, filled: true, user: "someone@example.com", button: true, userField: true, pageUser: null });
+check("the username field is marked with the nonce", user.getAttribute("data-gergur-login"), "user-n0nce");
 check("the field is marked with the nonce", pass.getAttribute("data-gergur-login"), "pass-n0nce");
 check("and so is the button", go.getAttribute("data-gergur-login"), "go-n0nce");
 check("and the answer never holds the password", JSON.stringify(loginState()).includes("secret-value"), false);
@@ -168,16 +181,59 @@ load(new Form({}, [
     new Input({ type: "submit" }),
 ]));
 check("empty; a username after it is not its; type=button and disabled passed over for input submit",
-    loginState(), { fields: 1, filled: false, user: null, button: true });
+    loginState(), { fields: 1, filled: false, user: null, button: true, userField: false, pageUser: null });
 
 load(new Input({ type: "password", value: "x", rect: { width: 0, height: 0 } }),
     new Input({ type: "password", value: "", style: { visibility: "hidden" } }),
     new Input({ type: "password", value: "y" }));
 check("hidden password fields are not counted, and no form means no button",
-    loginState(), { fields: 1, filled: true, user: null, button: false });
+    loginState(), { fields: 1, filled: true, user: null, button: false, userField: false, pageUser: null });
 
 load(new Form({}, [new Input({ type: "password", value: "a" }), new Input({ type: "password", value: "" })]));
 check("two shown password fields are counted as two", loginState().fields, 2);
+
+// ---------------------------------------------------------------- the account a page carries
+const lookFor = (...fields) => { load(new Form({}, [...fields, new Input({ type: "password" })])); return loginState(); };
+check("a read-only username is the account, not a field to type in",
+    lookFor(new Input({ type: "email", value: "person-a", readOnly: true })),
+    { fields: 1, filled: false, user: "person-a", button: false, userField: false, pageUser: null });
+check("a hidden field named username is the account a two-step page carries",
+    lookFor(new Input({ type: "hidden", name: "username", value: "person-a" })).pageUser, "person-a");
+check("so is a hidden field whose autocomplete says username",
+    lookFor(new Input({ type: "hidden", name: "x1", value: "person-a", attrs: { autocomplete: "username" } })).pageUser, "person-a");
+check("and one with the id identifier",
+    lookFor(new Input({ type: "hidden", id: "identifier", value: "person-a@example.com" })).pageUser, "person-a@example.com");
+check("a hidden token named like login_challenge is not an account",
+    lookFor(new Input({ type: "hidden", name: "login_challenge", value: "abc123" })).pageUser, null);
+check("nor a value with a space in it",
+    lookFor(new Input({ type: "hidden", name: "username", value: "two words" })).pageUser, null);
+load(new Form({}, [new Input({ type: "password" }), new Input({ type: "hidden", name: "username", value: "after" })]));
+check("nor one after the password field", loginState().pageUser, null);
+check("an editable username field means no page account",
+    lookFor(new Input({ type: "hidden", name: "username", value: "person-a" }), new Input({ type: "text" })).pageUser, null);
+
+// ---------------------------------------------------------------- choosing an account
+let pw;
+load(new Form({}, [new Input({ type: "hidden", name: "username", value: "person-a" }), pw = new Input({ type: "password" }), new Button()]));
+loginState();
+check("a username field of Gergur's own goes in", addPick(), true);
+const added = page.descendants().find(e => e.getAttribute && e.getAttribute("data-gergur-login") === "pick-n0nce");
+check("marked, a username field", [added && added.tagName, added && added.type, added && added.autocomplete], ["INPUT", "text", "username"]);
+check("just before the password field", pw.parent.children.indexOf(added) + 1, pw.parent.children.indexOf(pw));
+added.value = "person-b";
+pw.value = "not-a-real-pass-99";
+const picked = pickState();
+check("what was chosen: the username and that the password is filled", picked, { user: "person-b", filled: true });
+check("never the password", JSON.stringify(picked).includes("not-a-real-pass"), false);
+emptyPassword();
+check("emptying the password leaves the username", [added.value, pw.value], ["person-b", ""]);
+pw.value = "x";
+clearForPick();
+check("clearing for a pick empties both", [added.value, pw.value], ["", ""]);
+removePick();
+check("and the added field is taken away again", page.descendants().includes(added), false);
+load(new Form({}, [new Input({ type: "text" })]));
+check("with no marked password field nothing is added", addPick(), false);
 
 console.log(failures === 0 ? "all passed" : failures + " failed");
 process.exit(failures === 0 ? 0 : 1);

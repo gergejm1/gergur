@@ -143,8 +143,27 @@ public sealed class Settings
 
     [Browsable(false)]
     [JsonIgnore]
-    public static string DataDir { get; } =
-        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Gergur");
+    public static string DataDir { get; } = DataDirFrom(
+        Environment.GetEnvironmentVariable("GERGUR_DATA_DIR"),
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData));
+
+    /// <summary>
+    /// Where everything is kept: %LOCALAPPDATA%\Gergur, or the folder GERGUR_DATA_DIR names. The
+    /// second is for a test instance with a profile of its own (saved logins made up for a test
+    /// never go into the person's), and gives it its own single-instance names
+    /// (<see cref="InstanceSuffix"/>) so it runs beside the person's browser. Its own
+    /// settings.json must also move the agent port, and keep the phone drop off.
+    /// </summary>
+    internal static string DataDirFrom(string? overridden, string localAppData)
+        => string.IsNullOrWhiteSpace(overridden) ? Path.Combine(localAppData, "Gergur") : Path.GetFullPath(overridden.Trim());
+
+    /// <summary>Added to the single-instance mutex and pipe names: empty for the person's browser, a hash of the folder otherwise.</summary>
+    internal static string InstanceSuffix { get; } = SuffixFor(Environment.GetEnvironmentVariable("GERGUR_DATA_DIR"), DataDir);
+
+    internal static string SuffixFor(string? overridden, string dataDir)
+        => string.IsNullOrWhiteSpace(overridden)
+            ? ""
+            : "." + Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(dataDir.ToLowerInvariant())))[..12];
 
     [Browsable(false)]
     [JsonIgnore]

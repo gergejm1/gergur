@@ -166,6 +166,20 @@ public sealed class SavedLoginsTests
             start.ArgumentList.Add(Path.Combine(RepoRoot(), "src", "Gergur.Tests", "LoginScripts.harness.js"));
             start.ArgumentList.Add(state);
             start.ArgumentList.Add(login);
+            const string pickField = "[data-gergur-login=\"pick-n0nce\"]";
+            foreach (var (name, script) in new[]
+            {
+                ("add-pick.js", AgentServer.AddPickFieldJs("n0nce")),
+                ("pick-state.js", AgentServer.PickStateJs("n0nce", pickField)),
+                ("clear-for-pick.js", AgentServer.ClearForPickJs("n0nce", pickField)),
+                ("empty-password.js", AgentServer.EmptyPasswordJs("n0nce")),
+                ("remove-pick.js", AgentServer.RemovePickFieldJs("n0nce")),
+            })
+            {
+                string file = Path.Combine(dir, name);
+                File.WriteAllText(file, script);
+                start.ArgumentList.Add(file);
+            }
             using var node = Process.Start(start) ?? throw new InvalidOperationException("node did not start (it is needed by the checks)");
             var output = node.StandardOutput.ReadToEndAsync();
             var errors = node.StandardError.ReadToEndAsync();

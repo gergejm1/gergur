@@ -14,7 +14,7 @@ namespace Gergur.App;
 public static class SingleInstance
 {
     // Per user: two people signed in at once each get their own browser.
-    private static readonly string PipeName = "Gergur.Instance." + Environment.UserName;
+    private static readonly string PipeName = "Gergur.Instance." + Environment.UserName + Settings.InstanceSuffix;
 
     /// <summary>Listens for urls forwarded by later launches, for the life of the process.</summary>
     public static void StartListener(Action<string> onUrl)

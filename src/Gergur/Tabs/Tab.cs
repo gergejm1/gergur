@@ -147,6 +147,13 @@ public sealed class Tab : ITabHandle, IDisposable
     /// </summary>
     public bool HasView => _webView is not null;
 
+    /// <summary>
+    /// Gives the page the keyboard focus, as a click on it would. Only for
+    /// <see cref="AccountPick"/>: the engine shows its saved-account list to a focused page
+    /// alone. UI thread.
+    /// </summary>
+    internal void FocusView() => _webView?.Focus();
+
     public bool IsCurrent => _owner.ActiveTab == this;
 
     public bool IsPlayingAudio

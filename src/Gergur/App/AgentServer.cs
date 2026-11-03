@@ -457,7 +457,8 @@ public sealed class AgentServer
         double? NumberFrom(string name) => NumberValue(query, body, name);
 
         string? BodyString(string name)
-            => body is not null && body.RootElement.TryGetProperty(name, out var p) && p.ValueKind == JsonValueKind.String
+            => body is not null && body.RootElement.ValueKind == JsonValueKind.Object
+                && body.RootElement.TryGetProperty(name, out var p) && p.ValueKind == JsonValueKind.String
                 ? p.GetString()
                 : null;
 
@@ -468,16 +469,42 @@ public sealed class AgentServer
         // the form's own button (or Enter in the field) sends it. See "Saved passwords".
         async Task<(int, string, byte[])> LoginAsync()
         {
-            if (Target() is not { } tab)
+            if (TargetEntry() is not { } entry)
                 return (404, "application/json", Json(new { error = "no such tab" }));
+            var tab = entry.Tab;
             if (OwnPageRefused(tab) is { } refused)
                 return refused;
+            string? asked = null;
+            if (AccountNotText(body) || BodyString("account") is { } rawAccount && (asked = CleanAccount(rawAccount)) is null)
+                return (400, "application/json", Json(new { error = "account is the saved username to sign in as: one printable line of at most 200 characters" }));
             Acting(tab);
             string nonce = Convert.ToHexString(System.Security.Cryptography.RandomNumberGenerator.GetBytes(8)).ToLowerInvariant();
             var (raw, ready) = await OnUiAsync(() => tab.ReadScriptAsync(LoginStateJs(nonce), Tab.WakeTimeout));
             if (!ready)
                 return (503, "application/json", Json(new { error = "that tab's page did not finish loading in time" }));
             var state = ParseLoginState(raw);
+            string? wanted = state is null ? null : WantedAccount(state, asked);
+            string? chosen = null;
+            bool picked = false;
+            if (state is not null && PlanPick(state, wanted) is var plan && plan != PickPlan.None)
+            {
+                // Filling another account is acting on the page, so not on one an agent scripted.
+                if (tab.AgentScriptedThisDocument)
+                    return (409, "application/json", Json(new { error = ScriptedLoginPage }));
+                var pick = await PickAccountAsync(entry.Window, tab, nonce, plan, wanted);
+                if (pick.Refused is { } stopped)
+                    return stopped;
+                chosen = pick.User;
+                picked = pick.Borrowed;
+                if (wanted is not null && chosen != wanted)
+                    return (200, "application/json", Quiet(new { ok = false, filled = false, error = AccountNotSaved }));
+                (raw, ready) = await OnUiAsync(() => tab.ReadScriptAsync(LoginStateJs(nonce), Tab.WakeTimeout));
+                if (!ready)
+                    return (503, "application/json", Json(new { error = "that tab's page did not finish loading in time" }));
+                state = ParseLoginState(raw);
+                if (chosen is not null && state is not null)
+                    state = state with { User = state.User ?? chosen };
+            }
             if (LoginStop(state, submit: BoolFrom("submit") != false, tab.AgentScriptedThisDocument) is { } stop)
                 return (stop.Status, "application/json", Quiet(stop.Answer));
             bool hasButton = state!.Button;   // LoginStop stops on no state
@@ -537,6 +564,8 @@ public sealed class AgentServer
                 ok = true,
                 filled = true,
                 user = state.User,
+                // Chosen from the person's saved accounts, with the keyboard borrowed for it.
+                picked = picked ? true : (bool?)null,
                 submitted = true,
                 via,
                 // The same password field still on screen: refused (a wrong password, a captcha
@@ -546,6 +575,113 @@ public sealed class AgentServer
                 url = tab.CommittedSourceForOtherThreads,
                 dialogs = DialogsOut(tab.DialogsSince(dialogMark)),
             }));
+        }
+
+        // Gets the wanted saved account into the sign-in form: first by adding a username field
+        // the engine fills by itself (a password-only page), then, when that is not the one, by
+        // choosing it from the engine's list with the keyboard borrowed (AccountPick). User is
+        // the account the form now holds, or null; the password is emptied when it is not the
+        // wanted one, so another account's is never sent.
+        async Task<(string? User, bool Borrowed, (int, string, byte[])? Refused)> PickAccountAsync(
+            MainForm window, Tab tab, string nonce, PickPlan plan, string? wanted)
+        {
+            string field = plan == PickPlan.UserField ? $"[data-gergur-login=\"user-{nonce}\"]" : $"[data-gergur-login=\"pick-{nonce}\"]";
+            bool added = false, keep = false;
+            // Best effort, after the fact: the answer already says what happened, so a page that
+            // went away meanwhile is written down rather than thrown over it.
+            async Task QuietlyAsync(string js, string what)
+            {
+                try
+                {
+                    await OnUiAsync(() => tab.ReadScriptAsync(js, Tab.WakeTimeout)).WaitAsync(PickBudget);
+                }
+                catch (Exception ex)
+                {
+                    DebugLog.WriteAlways($"after choosing a saved account, {what} failed: {ex.GetType().Name}: {ex.Message}");
+                }
+            }
+            try
+            {
+                if (plan == PickPlan.AddedField)
+                {
+                    var (addRaw, _) = await OnUiAsync(() => tab.ReadScriptAsync(AddPickFieldJs(nonce), Tab.WakeTimeout));
+                    if (addRaw != "true")
+                        return (null, false, null);
+                    added = true;
+                    await Task.Delay(700);   // the engine fills the most recent account into it by itself
+                    var (firstRaw, _) = await OnUiAsync(() => tab.ReadScriptAsync(PickStateJs(nonce, field), Tab.WakeTimeout));
+                    var first = ParsePickState(firstRaw);
+                    if (first is { Filled: true } && (wanted is null || first.User == wanted))
+                    {
+                        keep = true;
+                        return (first.User, false, null);
+                    }
+                    if (wanted is null)
+                        return (null, false, null);
+                }
+                if (!window.OpenedByAgent)
+                    return (null, false, (409, "application/json", Json(new { error = PickNeedsOwnWindow })));
+                if (!await AccountPick.Turn.WaitAsync(TimeSpan.FromSeconds(10)))
+                    return (null, false, (503, "application/json", Json(new { error = PickBusy })));
+                try
+                {
+                    // Which tab is in front is the UI thread's to read.
+                    await OnUiAsync(async () =>
+                    {
+                        if (window.Tabs is { } tabs && tabs.ActiveTab != tab)
+                            await tabs.ActivateAsync(tab);
+                        return true;
+                    });
+                    await OnUiAsync(() => tab.ReadScriptAsync(ClearForPickJs(nonce, field), Tab.WakeTimeout));
+                    var (spot, _) = await LocateAsync(tab, field, animate: false);
+                    if (spot is not { CanClickAt: true })
+                        return (null, false, (200, "application/json", Quiet(new { ok = false, filled = false, error = PickFieldUnreachable })));
+                    // Read on the UI thread, inside the pick, while the focus is still held.
+                    async Task<bool> Chosen()
+                        => ParsePickState((await tab.ReadScriptAsync(PickStateJs(nonce, field), TimeSpan.FromSeconds(1))).Result)
+                            is { Filled: true } now && now.User == wanted;
+                    // Again directly before the keyboard is borrowed: a script since the first look
+                    // could have pointed the form somewhere else.
+                    if (tab.AgentScriptedThisDocument)
+                        return (null, false, (409, "application/json", Json(new { error = ScriptedLoginPage })));
+                    // Bounded: a window closing before the UI thread runs the pick would leave this
+                    // waiting for good, holding the turn. Every step inside has a budget far under it.
+                    var outcome = await OnUiAsync(() => AccountPick.RunAsync(window, tab, spot.X, spot.Y, wanted!, Chosen)).WaitAsync(PickBudget);
+                    if (outcome == AccountPick.Outcome.Interrupted)
+                        return (null, false, (503, "application/json", Json(new { error = PickInterrupted })));
+                }
+                catch (TabInput.InputFailedException failed)
+                {
+                    return (null, true, (503, "application/json", Json(new { error = failed.Message })));
+                }
+                catch (TimeoutException)
+                {
+                    return (null, true, (503, "application/json", Json(new { error = PickTimedOut })));
+                }
+                finally
+                {
+                    AccountPick.Turn.Release();
+                }
+                var (afterRaw, _) = await OnUiAsync(() => tab.ReadScriptAsync(PickStateJs(nonce, field), Tab.WakeTimeout));
+                var after = ParsePickState(afterRaw);
+                // Not chosen: the field may well hold the account, as typed, with no password or
+                // another account's behind it. That is never taken for the account.
+                if (after is { Filled: true } && after.User == wanted)
+                {
+                    keep = true;
+                    return (wanted, true, null);
+                }
+                return (null, true, null);
+            }
+            finally
+            {
+                // Whatever came of it, refused, failed or thrown: another account's password is
+                // never left in the page to be sent, and Gergur's own field goes.
+                if (!keep)
+                    await QuietlyAsync(EmptyPasswordJs(nonce), "emptying the password field");
+                if (added)
+                    await QuietlyAsync(RemovePickFieldJs(nonce), "removing the added username field");
+            }
         }
 
         switch ((method, path))
@@ -2057,10 +2193,11 @@ public sealed class AgentServer
             },
             []),
         Tool("gergur_login",
-            "Sign in with a password the person saved in Gergur. When the person logs in to a site in their own window, Gergur asks whether to save it; a saved login then fills in by itself as that site's sign-in page loads, in your windows too. This checks that it did and presses the form's sign-in button (or Enter in the password field). The password never comes back to you. Call it on a freshly loaded sign-in page, before typing in it or running scripts there. If nothing is filled, no login is saved for the site: ask the person with gergur_ask_person. For a site that asks for the username on one page and the password on the next, type the username and continue yourself, then call this. Reports the account it signed in as and where the page went.",
+            "Sign in with a password the person saved in Gergur. When the person logs in to a site in their own window, Gergur asks whether to save it; a saved login then fills in by itself as that site's sign-in page loads, in your windows too. This checks that it did and presses the form's sign-in button (or Enter in the password field). The password never comes back to you. Call it on a freshly loaded sign-in page, before typing in it or running scripts there. With several saved accounts the most recent fills in; name another with account and it is chosen from the person's saved ones (in your own window; it borrows the keyboard for about a second). For a site that asks for the username on one page and the password on the next, type the username and continue yourself, then call this on the password page: it fills the password for the username that page carries. If nothing is filled, no login is saved for the site: ask the person with gergur_ask_person. Reports the account it signed in as and where the page went.",
             new
             {
-                submit = new { type = "boolean", description = "Press sign in (true, the default), or only check whether a saved login is filled in (false)." },
+                submit = new { type = "boolean", description = "Press sign in (true, the default), or only fill in and check (false)." },
+                account = Text("The saved username to sign in as, when the person has saved more than one for this site. Leave it out for the one the browser fills in."),
                 id = Id(),
                 index = Index(),
             },
@@ -2389,6 +2526,39 @@ public sealed class AgentServer
         + "before typing in it. Still empty: ask the person with gergur_ask_person to sign in, or to sign in once in "
         + "their own window and choose Save.";
 
+    internal const string AccountNotSaved =
+        "the person has no saved login for that account on this site (or saved it under another username), so nothing "
+        + "was sent and the password field was left empty. Call gergur_login again without account for the one the browser "
+        + "fills in, or ask the person with gergur_ask_person.";
+
+    internal const string PickNeedsOwnWindow =
+        "choosing one of the person's saved accounts borrows the keyboard for about a second, so it is only done in your "
+        + "own window, never the person's. Open the sign-in page there (gergur_open_window) and call gergur_login again.";
+
+    internal const string PickInterrupted =
+        "the person is using another app, and choosing a saved account would have taken their keyboard from it, so it "
+        + "was not done. Try again in a little while.";
+
+    internal const string PickTimedOut = "choosing the saved account did not finish in time; nothing was sent. Try again.";
+
+    /// <summary>The longest a pick, or the tidying after it, is waited for.</summary>
+    internal static readonly TimeSpan PickBudget = TimeSpan.FromSeconds(15);
+
+    /// <summary>
+    /// Whether the body names an account that is not text (a number, a list): refused rather
+    /// than ignored, since ignored it would sign in as the default account while the agent
+    /// believes it chose another. Null counts as not named.
+    /// </summary>
+    internal static bool AccountNotText(JsonDocument? body)
+        => body is not null && body.RootElement.ValueKind == JsonValueKind.Object
+            && body.RootElement.TryGetProperty("account", out var account)
+            && account.ValueKind is not (JsonValueKind.String or JsonValueKind.Null);
+
+    internal const string PickBusy ="another agent is choosing a saved account at this moment; try again in a few seconds.";
+
+    internal const string PickFieldUnreachable =
+        "the username field could not be clicked (something covers it, or it is off the page), so no saved account was chosen.";
+
     internal const string ScriptedLoginPage =
         "a script was run in this page (gergur_run_javascript) since it loaded, or the tab went back or forward since "
         + "one was, so a saved password is not sent from it: the script could have changed where the form goes. Load "
@@ -2455,7 +2625,129 @@ public sealed class AgentServer
     /// first holds something, the username beside it, a button that sends its form, and whether
     /// there are password fields it cannot reach (in a frame or a shadow root).
     /// </summary>
-    internal sealed record LoginState(int Fields, bool Filled, string? User, bool Button, bool Elsewhere = false);
+    /// <param name="UserField">The username before the password is a field that can be typed in (marked user-nonce).</param>
+    /// <param name="PageUser">With no such field, the username a two-step password page carries, in a hidden or read-only field.</param>
+    internal sealed record LoginState(int Fields, bool Filled, string? User, bool Button, bool Elsewhere = false,
+        bool UserField = false, string? PageUser = null);
+
+    /// <summary>How /login gets the wanted saved account into the form, if it has to.</summary>
+    internal enum PickPlan
+    {
+        /// <summary>What is filled is what is wanted, or there is nothing to choose by.</summary>
+        None,
+        /// <summary>Choose it in the page's own username field.</summary>
+        UserField,
+        /// <summary>Add a username field before the password (a password-only page) and fill through that.</summary>
+        AddedField,
+    }
+
+    /// <summary>
+    /// The account to sign in as: the one asked for, or on a two-step password page the engine
+    /// did not fill, the username that page carries. Never the page's choice over what the engine
+    /// already filled when nothing was asked for, so a page with a stray hidden field signs in as
+    /// it always did.
+    /// </summary>
+    internal static string? WantedAccount(LoginState state, string? asked)
+        => asked ?? (!state.Filled && !state.UserField ? state.User ?? state.PageUser : null);
+
+    /// <summary>What has to happen for <paramref name="wanted"/> to be in the form, on a page with one password field.</summary>
+    internal static PickPlan PlanPick(LoginState state, string? wanted)
+    {
+        if (state.Fields != 1)
+            return PickPlan.None;
+        if (wanted is null)
+            // Nothing to choose by. A password-only page the engine did not fill may still be
+            // filled through an added username field, which takes no keyboard.
+            return !state.Filled && !state.UserField ? PickPlan.AddedField : PickPlan.None;
+        if (state.Filled && state.User == wanted)
+            return PickPlan.None;
+        return state.UserField ? PickPlan.UserField : PickPlan.AddedField;
+    }
+
+    /// <summary>The account as asked for: one printable line of at most 200 characters, trimmed; null when it is not one.</summary>
+    internal static string? CleanAccount(string raw)
+    {
+        string account = raw.Trim();
+        return account.Length is > 0 and <= 200 && !account.Any(char.IsControl) ? account : null;
+    }
+
+    /// <summary>What <see cref="PickStateJs"/> read: the username in the field chosen through, and whether the password field holds something.</summary>
+    internal sealed record PickState(string? User, bool Filled);
+
+    internal static PickState? ParsePickState(string raw)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(raw);
+            var e = doc.RootElement;
+            if (e.ValueKind != JsonValueKind.Object)
+                return null;
+            string? user = e.TryGetProperty("user", out var u) && u.ValueKind == JsonValueKind.String ? u.GetString() : null;
+            return new PickState(user, e.TryGetProperty("filled", out var f) && f.ValueKind == JsonValueKind.True);
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Puts a username field of Gergur's own (marked pick-nonce) just before the password field
+    /// /login marked: on a page that asks for the password alone, the engine then fills a saved
+    /// account into both by itself, and its list can be opened from it. Removed again by
+    /// <see cref="RemovePickFieldJs"/> before anything is sent.
+    /// </summary>
+    internal static string AddPickFieldJs(string nonce) => $$"""
+        (() => {
+            const p = document.querySelector('[data-gergur-login="pass-{{nonce}}"]');
+            if (!p) return false;
+            const f = document.createElement('input');
+            f.type = 'text';
+            f.autocomplete = 'username';
+            f.setAttribute('data-gergur-login', 'pick-{{nonce}}');
+            f.style.cssText = 'display:block;width:260px;height:30px;margin:4px 0';
+            p.before(f);
+            return true;
+        })()
+        """;
+
+    /// <summary>The username in the field chosen through, and whether the password field holds something: never the password.</summary>
+    internal static string PickStateJs(string nonce, string field) => $$"""
+        (() => {
+            const p = document.querySelector('[data-gergur-login="pass-{{nonce}}"]');
+            const f = document.querySelector({{JsonSerializer.Serialize(field)}});
+            return { user: f && f.value ? f.value.slice(0, 200) : null, filled: !!p && p.value.length > 0 };
+        })()
+        """;
+
+    /// <summary>Empties the field chosen through and the password field, so typing the account narrows the engine's list to it.</summary>
+    internal static string ClearForPickJs(string nonce, string field) => $$"""
+        (() => {
+            const p = document.querySelector('[data-gergur-login="pass-{{nonce}}"]');
+            const f = document.querySelector({{JsonSerializer.Serialize(field)}});
+            if (f) f.value = '';
+            if (p) p.value = '';
+            return true;
+        })()
+        """;
+
+    /// <summary>Empties the password field: what the engine filled is not the account wanted.</summary>
+    internal static string EmptyPasswordJs(string nonce) => $$"""
+        (() => {
+            const p = document.querySelector('[data-gergur-login="pass-{{nonce}}"]');
+            if (p) p.value = '';
+            return true;
+        })()
+        """;
+
+    /// <summary>Takes away the username field <see cref="AddPickFieldJs"/> put in.</summary>
+    internal static string RemovePickFieldJs(string nonce) => $$"""
+        (() => {
+            const f = document.querySelector('[data-gergur-login="pick-{{nonce}}"]');
+            if (f) f.remove();
+            return true;
+        })()
+        """;
 
     /// <summary>
     /// Looks at the sign-in form without reading the password: how many password fields are
@@ -2487,13 +2779,28 @@ public sealed class AgentServer
             const users = scope.filter(i => i instanceof HTMLInputElement && ['text', 'email', 'tel'].includes(i.type)
                 && shown(i) && (p.compareDocumentPosition(i) & Node.DOCUMENT_POSITION_PRECEDING));
             const u = users.length ? users[users.length - 1] : null;
+            const userField = !!u && !u.readOnly && !u.disabled;
+            if (userField) u.setAttribute('data-gergur-login', 'user-{{nonce}}');
+            // A two-step password page often carries the username it asked for on the page
+            // before, in a hidden or read-only field. Only one that says it is a username.
+            let pageUser = null;
+            if (!userField && !(u && u.value)) {
+                const says = i => /\b(username|email)\b/i.test(i.getAttribute('autocomplete') || '') || i.type === 'email'
+                    || /^(user(_?name)?|e?-?mail(_?address)?|identifier|login(_?name)?|account(_?name)?)$/i.test(i.name || '')
+                    || /^(user(_?name)?|e?-?mail(_?address)?|identifier|login(_?name)?|account(_?name)?)$/i.test(i.id || '');
+                const known = scope.filter(i => i instanceof HTMLInputElement && i !== p && ['hidden', 'text', 'email', 'tel'].includes(i.type)
+                    && i.value && i.value.length <= 200 && !/\s/.test(i.value) && says(i)
+                    && (p.compareDocumentPosition(i) & Node.DOCUMENT_POSITION_PRECEDING));
+                if (known.length) pageUser = known[known.length - 1].value;
+            }
             let button = null;
             if (p.form)
                 button = [...p.form.elements].find(b => shown(b) && !b.disabled
                     && ((b instanceof HTMLButtonElement && b.type === 'submit')
                         || (b instanceof HTMLInputElement && (b.type === 'submit' || b.type === 'image'))));
             if (button) button.setAttribute('data-gergur-login', 'go-{{nonce}}');
-            return { fields: fields.length, filled: p.value.length > 0, user: u && u.value ? u.value.slice(0, 100) : null, button: !!button };
+            return { fields: fields.length, filled: p.value.length > 0, user: u && u.value ? u.value.slice(0, 200) : null, button: !!button,
+                userField, pageUser };
         })()
         """;
 
@@ -2537,8 +2844,8 @@ public sealed class AgentServer
             if (e.ValueKind != JsonValueKind.Object || !e.TryGetProperty("fields", out var f) || f.ValueKind != JsonValueKind.Number)
                 return null;
             bool B(string name) => e.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.True;
-            string? user = e.TryGetProperty("user", out var u) && u.ValueKind == JsonValueKind.String ? u.GetString() : null;
-            return new LoginState(f.GetInt32(), B("filled"), user, B("button"), B("elsewhere"));
+            string? S(string name) => e.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() : null;
+            return new LoginState(f.GetInt32(), B("filled"), S("user"), B("button"), B("elsewhere"), B("userField"), S("pageUser"));
         }
         catch (Exception ex) when (ex is JsonException or FormatException or InvalidOperationException)
         {
