@@ -46,9 +46,14 @@ internal static class AccountPick
     /// Clicks the field at the point (page pixels), types the account, takes the first entry of
     /// the list it narrows to, and gives everything back. UI thread. Whether the right account
     /// came out is the caller's to read from the page.
+    /// An empty account types nothing and takes the list's first entry: for a form in another
+    /// site's frame, which the engine never fills by itself. <paramref name="inDocument"/> runs
+    /// the submit guard in the document the field is in (a frame's); the page's by default.
     /// </summary>
-    internal static async Task<Outcome> RunAsync(MainForm window, Tab tab, double x, double y, string account, Func<Task<bool>> chosen)
+    internal static async Task<Outcome> RunAsync(MainForm window, Tab tab, double x, double y, string account, Func<Task<bool>> chosen,
+        Func<string, TimeSpan, Task<(string Result, bool Ready)>>? inDocument = null)
     {
+        inDocument ??= tab.ReadScriptAsync;
         IntPtr foreground = GetForegroundWindow(), active = GetActiveWindow(), focus = GetFocus();
         bool gergurInFront = IsOurs(foreground);
         bool park = window.HiddenForAgent;
@@ -67,7 +72,7 @@ internal static class AccountPick
             // Before the list can open: running a script once it is up may close it. Taken off
             // in the finally whatever this answers: a script that ran and then timed out would
             // otherwise leave every later submit on the page held off, the person's included.
-            await tab.ReadScriptAsync(GuardJs, TimeSpan.FromSeconds(2));
+            await inDocument(GuardJs, TimeSpan.FromSeconds(2));
             tab.FocusView();
             if (TookTheFront(gergurInFront, IsOurs(GetForegroundWindow())))
                 return Outcome.Interrupted;
@@ -75,8 +80,9 @@ internal static class AccountPick
             await Task.Delay(150);
             if (TookTheFront(gergurInFront, IsOurs(GetForegroundWindow())))
                 return Outcome.Interrupted;
-            await TabInput.InsertTextAsync(tab, account);
-            await Task.Delay(350);   // for the list to narrow to what was typed
+            if (account.Length > 0)
+                await TabInput.InsertTextAsync(tab, account);
+            await Task.Delay(350);   // for the list to narrow to what was typed, or to show
             if (!ListShown(tab, window.Handle))
                 return Outcome.NoList;
             await TabInput.PressAsync(tab, TrustedInput.ParseChord("ArrowDown")!);
@@ -108,7 +114,7 @@ internal static class AccountPick
                 SetWindowPos(window.Handle, IntPtr.Zero, was.Left, was.Top, 0, 0, NoSizeNoZOrderNoActivate);
             try
             {
-                await tab.ReadScriptAsync(UnguardJs, TimeSpan.FromSeconds(2));
+                await inDocument(UnguardJs, TimeSpan.FromSeconds(2));
             }
             catch (Exception ex)
             {

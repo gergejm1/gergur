@@ -59,7 +59,7 @@ sent. Prefer the id: see "Naming a tab" below.
 | GET or POST /dialogs | {"accept": false?, "text": "..."?} | recent page dialogs, and how the next confirm/prompt are answered |
 | GET /downloads | ?wait=1&timeout=s | the caller's own downloads: file, path, state, bytes |
 | POST /ask | {"question": "..."} or {"id": "ask-1"}, "timeout": s? | ask the person; a bar in their window. See "Asking the person" |
-| POST /login | {"submit": false?, "account": "..."?} | sign in with a saved password, choosing the account and filling two-step password pages; on Google's account chooser, clicks the person's Google account for the site: {filled, user, submitted, via, stillAsking, url, picked}. See "Saved passwords" |
+| POST /login | {"submit": false?, "account": "..."?} | sign in with a saved password, choosing the account and filling two-step password pages and sign-in forms in a frame; on Google's account chooser, clicks the person's Google account for the site: {filled, user, submitted, via, stillAsking, url, picked, frame}. See "Saved passwords" |
 | GET /settings | | {settings, restartRequired, vpnInForce, tunnelRunning}; credentials read as "(hidden)" |
 | POST /settings | {"BlocklistEnabled": false, ...} | change settings, returns {applied, restartNeededFor, unknown, persisted} |
 | POST /window | {"url": "..."?, "focus": true?, "muted": true?} | open another window, returns {window, id} |
@@ -694,6 +694,15 @@ wakes it. The user's browsing is personal: read what the task requires, nothing 
   `adblock.js` skips pruning, cosmetic css and its forced reloads there, but its ad tick
   still mutes, runs at 16x and skips. Made for YouTube's server-side flag (see the
   playlist note above); whether relaxing YouTube lifts it, and how fast, is not known.
+  On 2026-11-03 the person reported their playlists stopping with the ad-blocker message
+  and moving on every song, with youtube.com already relaxed; while looking (a muted hidden
+  agent window on the real profile, about a dozen loads and a Mix advanced three songs) no
+  load was refused, and the person then said their playlists worked again. Nothing was
+  changed: the two ads let through in that window, run at 16x, may have counted, or a tab
+  opened before the relax still had the old script. Not established. Seen in the same
+  run and not yet looked into: both loads that served a pre-roll ran it out muted at 16x
+  in under a second, then the film never started (`unstarted-mode`, `readyState` 0, no
+  player response, for 45 s).
 - Settings are a page now (`gergur://settings`, `SettingsPage` behind it, the menu's
   Settings): every setting described from the attributes on `Settings`, in sections with
   the engine last, each change saved as it is made (`ISettingsHost.Commit`: save, then
@@ -865,8 +874,8 @@ does not keep passwords of its own:
   username before it, how it sent it (`via`), whether the same field is still asking
   afterwards (`stillAsking`: a wrong password, a captcha, or a page that signs in without
   leaving) and where the page went, never the password (`LoginStateJs` reads only its
-  length). Where it stops is `AgentServer.LoginStop`: no field (or one only in a frame or
-  shadow root it cannot click into, said as such), an empty field (no saved login), more
+  length). Where it stops is `AgentServer.LoginStop`: no field (or one only in a shadow
+  root, or a frame inside a frame, which it cannot click into, said as such), an empty field (no saved login), more
   than one password field shown (sign-up, change password), or a page an agent scripted.
   `submit: false` only looks, and is the one answer given on a scripted page.
 - A scripted page (`Tab.AgentScriptedThisDocument`): /eval marks the tab as it starts and
@@ -967,6 +976,52 @@ hidden. 15 of 15 in the last six runs, the last three after the review fixes, wi
 a person who is in Gergur at that moment (the test instance is a separate process, so the
 person was always in another app); a list with many accounts; a site's own script-driven
 username field.
+
+#### Sign-in forms in a frame
+
+A page whose sign-in form sits in a frame (a sign-in provider's, say) is signed in to by
+`gergur_login` as well (`FrameLoginAsync` in `AgentServer`). Only when the page itself has
+no password field: the frames the tab knows of (`Tab.FrameCreated`, direct children only, at
+most 20 read) are each asked with `FrameLoginStateJs`, and only one may hold a password field
+(two: 409 `SeveralFramesAsk`). A frame inside a frame is not reached.
+
+- The engine never fills a saved password into another site's frame by itself (measured: the
+  same saved login fills when the provider's page is opened on its own). It does once an
+  account is chosen from its list, so the frame's sign-in is the page's account pick
+  (`AccountPick.RunAsync` with the frame's own script runner, `inDocument`), held to the same
+  rules: an agent's own window only, one at a time, keyboard for about a second, nothing kept
+  unless the account wanted came out, the password emptied otherwise. With no `account` it
+  types nothing and takes the first entry the browser lists, which is not always the most
+  recently used (measured: it was the other one). `submit: false` on an unfilled frame says
+  so (`FrameFillsOnChoice`) and touches nothing.
+- Where to click is found in the page, since the DevTools frame tree of the page leaves out
+  another site's frame (measured): the one frame whose `src` is on the frame's own origin,
+  and only if its content box is the frame's own view size within 2 px (`FrameBoxJs`,
+  `SameFrame`), and not drawn scaled, turned or skewed by itself or anything around it (its
+  drawn and laid-out sizes agree within a pixel), since a point in the frame would then be
+  another point on the page and a click could reach another control of the provider's
+  form; otherwise `FrameNotPlaced`. The point is the box's corner plus the element's
+  centre in the frame, and must lie inside both (`PointInFrame`).
+- Right before each click, on the UI thread with nothing awaited between (`LastLookAsync`):
+  the page's own hit test at that point must be the frame (covered: `FrameNotReachable`),
+  the page not scripted by an agent, the address unchanged and the frame still there
+  (`FrameMovedOn`). Sent by a click on its button, or with none, a click in the password
+  field, Escape (for the list) and Enter. Keys go wherever the keyboard is, so before each
+  of the two (`KeyboardStillThere`, on the UI thread, one block for both) the page's focused
+  element must be a frame on that site (`FrameFocusedJs`), the frame's the field clicked
+  (`FocusedJs`; not `document.hasFocus()`, which an agent's hidden window never has), the
+  page unscripted and unchanged. The answer adds `frame` (the frame's origin).
+
+Verified on 2026-11-03 in a test instance with two made-up saved accounts for a local
+provider in a frame of another local site (`scratchpad/livetest/frame-live.ps1`, 11 checks,
+hidden agent window): only looking sends nothing; a named account chosen, signed in with its
+own password; an account not saved refused with nothing sent; none named takes the first
+listed, in a frame far down the page; Enter with no button; two frames refused; a covered
+frame not clicked; a scripted page refused; a page with no form said so; no window of the
+instance on screen at any point. Run again, 11 of 11, after the focus check before Enter and
+the scaled-frame refusal were added. Neither refusal has been seen happen live (no test page
+moves the focus or scales its frame); they rest on the unit tests. Not verified: a real provider's frame, and a frame whose
+`src` redirected to another site before the form (it is then not found, and refused).
 
 #### A test instance
 
@@ -1075,6 +1130,38 @@ time unnamed, nothing on a scripted page, and no window of the test instance on 
 point (every visible, uncloaked, unminimised window of it and its engine processes polled
 every 50 ms). Not seen live: the quiet return's answer (the browser finished it within
 milliseconds, before a call could arrive), nor any of it against Google.
+
+### Agent watching
+
+When an agent reads or acts on a tab in one of the person's own windows (asked to look at
+what they have open, say), a soft edge in the agents' blue lights around that window's page
+with a pill at the top: "Agent watching · Claude Code", or "Agent watching another tab" when
+the tab is not the one shown (`UI/AgentWatchGlow.cs`). It stays 4 s after the agent's last
+touch and fades in about 0.3 s. Agents' own windows have their band instead and never show
+it, nor does a hidden or minimised window. Every endpoint that names a tab goes through
+`AgentServer.TargetEntry`, which is the one place it is raised (`MainForm.AgentLookedIn`,
+posted to the UI thread, never waited on).
+
+It is a window of its own over the page, owned by the person's window (the page is the
+engine's window, which nothing of the form can draw over, and taking pixels from it would
+reflow the page): layered with per-pixel alpha (`UpdateLayeredWindow`), transparent to the
+mouse (`WS_EX_TRANSPARENT`, `HTTRANSPARENT`), never activated (`WS_EX_NOACTIVATE`,
+`ShowWithoutActivation`, `MA_NOACTIVATE`), off the taskbar and Alt+Tab
+(`WS_EX_TOOLWINDOW`). It follows the window as it moves and resizes and goes when it is
+minimised.
+
+Verified on 2026-11-03: the real glow driven as a real window on a hidden desktop (26
+checks: never activated, focus kept, clicks on its edge and middle reach the page under it,
+owned, follows a move and a resize, held then faded by its own timer, gone on minimise, the
+pixels of the edge and the pill), and end to end in a test instance (a read of a tab in a
+person-style window brought it up, the foreground never moved, it was gone after the hold,
+an agent window showed nothing). That end-to-end run put its test window and glow on the
+person's screen for about 10 s, without focus: `SetWindowPlacement` pulls a window placed
+off every monitor back onto one. Not done again in that form. Not yet seen by the person
+in their own Gergur.
+
+`initialize`'s `instructions` also tell agents that Sign in with Google is a click on the
+site's Google button followed by `gergur_login`, with `account` remembered for the site.
 
 ### Saying what you are doing
 

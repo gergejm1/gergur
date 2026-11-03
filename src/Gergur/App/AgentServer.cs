@@ -439,7 +439,14 @@ public sealed class AgentServer
                 StringValue(query, body, "id"),
                 ResolveIndex(query, body),
                 active is null ? -1 : all.FindIndex(e => e.Tab == active.Value.Tab));
-            return at >= 0 && at < all.Count ? all[at] : null;
+            if (at < 0 || at >= all.Count)
+                return null;
+            // Every read of a tab and every act on one goes through here: in one of the
+            // person's own windows, it says "Agent watching" over the page (AgentWatchGlow).
+            var (window, tab) = all[at];
+            if (!window.OpenedByAgent)
+                window.AgentLookedIn(tab, CurrentRequest.Value?.Caller?.Name ?? "An agent");
+            return all[at];
         }
 
         string? StringFrom(string name) => StringValue(query, body, name);
@@ -492,6 +499,10 @@ public sealed class AgentServer
             if (!ready)
                 return (503, "application/json", Json(new { error = "that tab's page did not finish loading in time" }));
             var state = ParseLoginState(raw);
+            // No password in the page itself: a sign-in form inside one of its frames, often a
+            // sign-in provider's from another site.
+            if (state is { Fields: 0 } && await FrameLoginAsync(entry.Window, tab, nonce, asked) is { } framed)
+                return framed;
             // No password here, and Google's chooser up over the page: what it offers is said
             // (no account known for the site, the one named not among them) rather than that
             // there is no password field.
@@ -584,6 +595,269 @@ public sealed class AgentServer
                 via,
                 // The same password field still on screen: refused (a wrong password, a captcha
                 // or a code to enter), or a page that signs in without leaving. Read the page.
+                stillAsking = stillRaw == "true",
+                note,
+                url = tab.CommittedSourceForOtherThreads,
+                dialogs = DialogsOut(tab.DialogsSince(dialogMark)),
+            }));
+        }
+
+        // A sign-in form inside a frame the page holds (not a frame inside that). The engine
+        // never fills another site's frame by itself (measured: the same saved login filled the
+        // provider's page on its own and stayed out of it framed), only from its list once the
+        // field is clicked, so the account is chosen from that list, as on a page
+        // (AccountPick, the keyboard borrowed for about a second, in the agent's own window):
+        // the one named, else the list's first. Then the frame's button, or Enter in its
+        // password field, with real clicks placed through the frame. Null when no frame asks
+        // for a password.
+        async Task<(int, string, byte[])?> FrameLoginAsync(MainForm window, Tab tab, string nonce, string? asked)
+        {
+            var answers = await OnUiAsync(() => tab.ReadFramesAsync(FrameLoginStateJs(nonce), TimeSpan.FromSeconds(3)));
+            var asking = answers.Select(a => (a.Frame, Read: ParseFrameLogin(a.Result)))
+                .Where(a => a.Read is { State.Fields: > 0 }).ToList();
+            if (asking.Count == 0)
+                return null;
+            if (asking.Count > 1)
+                return (409, "application/json", Json(new { error = SeveralFramesAsk }));
+            var frame = asking[0].Frame;
+            var read = asking[0].Read!;
+            var state = read.State;
+            string url = tab.CommittedSourceForOtherThreads;
+            Task<(string Result, bool Ready)> InFrame(string js, TimeSpan budget) => tab.ReadFrameScriptAsync(frame, js, budget);
+
+            // Where an element of the frame is in the page's view, the frame brought into view
+            // and the element into the frame's: the frame's own box in the page, the element's
+            // centre in the frame.
+            async Task<(FrameClick Why, (double X, double Y) Point)> PlaceAsync(string selector)
+            {
+                var (boxRaw, boxReady) = await OnUiAsync(() => tab.ReadScriptAsync(FrameBoxJs(read.Origin, null), Tab.WakeTimeout));
+                if (!boxReady || ParseFrameBox(boxRaw) is not { } box || !SameFrame(box, read))
+                    return (FrameClick.NotPlaced, default);
+                var (spotRaw, inTime) = await OnUiAsync(() => InFrame(LocateJs(selector, animate: false), Tab.WakeTimeout));
+                if (!inTime || ParseLocated(spotRaw) is not { } spot || PointInFrame(box, spot) is not { } point)
+                    return (FrameClick.NotReachable, default);
+                return (FrameClick.Clicked, point);
+            }
+
+            // Looked at directly before acting on the frame, on the UI thread: the page's hit
+            // test says the point is the frame's (nothing of the page over it), the page is not
+            // scripted, and neither it nor the frame moved on.
+            async Task<FrameClick> LastLookAsync((double X, double Y) point)
+            {
+                var (hitRaw, _) = await tab.ReadScriptAsync(FrameBoxJs(read.Origin, point), TimeSpan.FromSeconds(2));
+                if (ParseFrameBox(hitRaw) is not { Hit: true })
+                    return FrameClick.NotReachable;
+                if (tab.AgentScriptedThisDocument)
+                    return FrameClick.Scripted;
+                if (tab.CommittedSourceForOtherThreads != url || Tab.FrameGone(frame))
+                    return FrameClick.MovedOn;
+                return FrameClick.Clicked;
+            }
+
+            (int, string, byte[]) Refusal(FrameClick why) => why switch
+            {
+                FrameClick.Scripted => (409, "application/json", Json(new { error = ScriptedLoginPage })),
+                FrameClick.MovedOn => (200, "application/json", Quiet(new { ok = false, filled = state.Filled, user = state.User, frame = read.Origin, error = FrameMovedOn })),
+                FrameClick.NotPlaced => (200, "application/json", Quiet(new { ok = false, filled = state.Filled, user = state.User, frame = read.Origin, error = FrameNotPlaced })),
+                _ => (200, "application/json", Quiet(new { ok = false, filled = state.Filled, user = state.User, frame = read.Origin, error = FrameNotReachable })),
+            };
+
+            // Only looking: a frame's form is empty until an account is chosen from the list, so
+            // empty here says nothing about whether one is saved.
+            if (BoolFrom("submit") == false && state is { Fields: 1, Filled: false })
+                return (200, "application/json", Quiet(new { ok = true, filled = false, frame = read.Origin, submitted = false, note = FrameFillsOnChoice }));
+            bool picked = false;
+            if (state.Fields == 1 && (!state.Filled || asked is not null && state.User != asked) && BoolFrom("submit") != false)
+            {
+                // Choosing from the list is acting on the page, so not on one an agent scripted.
+                if (tab.AgentScriptedThisDocument)
+                    return (409, "application/json", Json(new { error = ScriptedLoginPage }));
+                if (!window.OpenedByAgent)
+                    return (409, "application/json", Json(new { error = PickNeedsOwnWindow }));
+                string field = state.UserField ? $"[data-gergur-login=\"user-{nonce}\"]" : $"[data-gergur-login=\"pass-{nonce}\"]";
+                bool keep = false;
+                if (!await AccountPick.Turn.WaitAsync(TimeSpan.FromSeconds(10)))
+                    return (503, "application/json", Json(new { error = PickBusy }));
+                try
+                {
+                    await OnUiAsync(async () =>
+                    {
+                        if (window.Tabs is { } tabs && tabs.ActiveTab != tab)
+                            await tabs.ActivateAsync(tab);
+                        return true;
+                    });
+                    if (state.UserField)
+                        await OnUiAsync(() => InFrame(ClearForPickJs(nonce, field), Tab.WakeTimeout));
+                    var (placed, point) = await PlaceAsync(field);
+                    if (placed != FrameClick.Clicked)
+                        return Refusal(placed);
+                    // Read on the UI thread, inside the pick, while the focus is still held.
+                    async Task<bool> Chosen()
+                        => ParseLoginState((await InFrame(LoginStateJs(nonce), TimeSpan.FromSeconds(1))).Result)
+                            is { Filled: true } now && (asked is null || now.User == asked);
+                    var outcome = await OnUiAsync(async () =>
+                    {
+                        var look = await LastLookAsync(point);
+                        if (look != FrameClick.Clicked)
+                            return (Look: look, Pick: AccountPick.Outcome.NoList);
+                        return (Look: look, Pick: await AccountPick.RunAsync(window, tab, point.X, point.Y, asked ?? "", Chosen, InFrame));
+                    }).WaitAsync(PickBudget);
+                    if (outcome.Look != FrameClick.Clicked)
+                        return Refusal(outcome.Look);
+                    if (outcome.Pick == AccountPick.Outcome.Interrupted)
+                        return (503, "application/json", Json(new { error = PickInterrupted }));
+                    var (afterRaw, _) = await OnUiAsync(() => InFrame(LoginStateJs(nonce), Tab.WakeTimeout));
+                    if (ParseLoginState(afterRaw) is { Filled: true } after && (asked is null || after.User == asked))
+                    {
+                        keep = true;
+                        picked = true;
+                        state = after;
+                    }
+                    else
+                    {
+                        return (200, "application/json", Quiet(new { ok = false, filled = false, frame = read.Origin, error = asked is null ? NoSavedLogin : AccountNotSaved }));
+                    }
+                }
+                catch (TabInput.InputFailedException failed)
+                {
+                    return (503, "application/json", Json(new { error = failed.Message }));
+                }
+                catch (TimeoutException)
+                {
+                    return (503, "application/json", Json(new { error = PickTimedOut }));
+                }
+                finally
+                {
+                    AccountPick.Turn.Release();
+                    // Another account's password is never left in the frame to be sent.
+                    if (!keep)
+                    {
+                        try
+                        {
+                            await OnUiAsync(() => InFrame(EmptyPasswordJs(nonce), Tab.WakeTimeout)).WaitAsync(PickBudget);
+                        }
+                        catch (Exception ex)
+                        {
+                            DebugLog.WriteAlways($"after choosing a saved account in a frame, emptying the password failed: {ex.GetType().Name}: {ex.Message}");
+                        }
+                    }
+                }
+            }
+            if (LoginStop(state, submit: BoolFrom("submit") != false, tab.AgentScriptedThisDocument) is { } stop)
+                return (stop.Status, "application/json", Quiet(WithFrame(stop.Answer, read.Origin)));
+
+            int dialogMark = tab.DialogCount;
+            string? via = null, note = null;
+
+            // One real click at an element of the frame, placed through it, with the last look
+            // and the click on the UI thread and nothing awaited after the look's checks.
+            async Task<FrameClick> ClickInFrameAsync(string selector)
+            {
+                var (placed, point) = await PlaceAsync(selector);
+                if (placed != FrameClick.Clicked)
+                    return placed;
+                return await OnUiAsync(async () =>
+                {
+                    var look = await LastLookAsync(point);
+                    if (look != FrameClick.Clicked)
+                        return look;
+                    await TabInput.ClickAsync(tab, point.X, point.Y);
+                    return FrameClick.Clicked;
+                });
+            }
+
+            async Task<(int, string, byte[])?> ClickedOrRefused(string selector, string how)
+            {
+                FrameClick done;
+                try
+                {
+                    done = await ClickInFrameAsync(selector);
+                }
+                catch (TabInput.InputFailedException failed) when (failed.Busy)
+                {
+                    return (503, "application/json", Json(new { error = failed.Message }));
+                }
+                catch (TabInput.InputFailedException failed) when (failed.MayHaveLanded)
+                {
+                    // Never tried again: that could send it twice.
+                    via = how;
+                    note = $"{failed.Message}. The click may still have landed, so it was not tried again.";
+                    return null;
+                }
+                catch (TabInput.InputFailedException failed)
+                {
+                    return (503, "application/json", Json(new { error = failed.Message }));
+                }
+                return done == FrameClick.Clicked ? null : Refusal(done);
+            }
+
+            if (state.Button)
+            {
+                if (await ClickedOrRefused($"[data-gergur-login=\"go-{nonce}\"]", "button") is { } refused)
+                    return refused;
+                via ??= "button";
+            }
+            else
+            {
+                // Into the password field (a script cannot move the keyboard into another
+                // site's frame), the engine's list it may open closed, then Enter.
+                if (await ClickedOrRefused($"[data-gergur-login=\"pass-{nonce}\"]", "enter") is { } refused)
+                    return refused;
+                if (via is null)
+                {
+                    await Task.Delay(250);
+                    // Where the keys go is wherever the keyboard is, so each key waits on a last
+                    // look that the field clicked still has it: not scripted, page and frame
+                    // unchanged, the frame focused with that field in it. A page that moved the
+                    // focus or went elsewhere in between gets no Enter.
+                    async Task<FrameClick> KeyboardStillThere()
+                    {
+                        var (pageRaw, _) = await tab.ReadScriptAsync(FrameFocusedJs(read.Origin), TimeSpan.FromSeconds(1));
+                        var (focusRaw, _) = await InFrame(FocusedJs($"[data-gergur-login=\"pass-{nonce}\"]"), TimeSpan.FromSeconds(1));
+                        if (tab.AgentScriptedThisDocument)
+                            return FrameClick.Scripted;
+                        if (pageRaw != "true" || focusRaw != "true" || tab.CommittedSourceForOtherThreads != url || Tab.FrameGone(frame))
+                            return FrameClick.MovedOn;
+                        return FrameClick.Clicked;
+                    }
+                    FrameClick keys;
+                    try
+                    {
+                        keys = await OnUiAsync(async () =>
+                        {
+                            var look = await KeyboardStillThere();
+                            if (look != FrameClick.Clicked)
+                                return look;
+                            await TabInput.PressAsync(tab, TrustedInput.ParseChord("Escape")!);
+                            look = await KeyboardStillThere();
+                            if (look != FrameClick.Clicked)
+                                return look;
+                            await TabInput.PressAsync(tab, TrustedInput.ParseChord("Enter")!);
+                            return FrameClick.Clicked;
+                        });
+                    }
+                    catch (TabInput.InputFailedException failed)
+                    {
+                        return (503, "application/json", Json(new { error = failed.Message }));
+                    }
+                    if (keys != FrameClick.Clicked)
+                        return Refusal(keys);
+                    via = "enter";
+                }
+            }
+            await Task.Delay(1500); // for the frame to move on, or say the password was wrong
+            var (stillRaw, _) = await OnUiAsync(() => InFrame(StillAskingJs(nonce), TimeSpan.FromSeconds(3)));
+            return (200, "application/json", Quiet(new
+            {
+                ok = true,
+                filled = true,
+                user = state.User,
+                // Chosen from the person's saved accounts, with the keyboard borrowed for it.
+                picked = picked ? true : (bool?)null,
+                submitted = true,
+                via,
+                // The site the form came from: its saved password is the one that was sent.
+                frame = read.Origin,
                 stillAsking = stillRaw == "true",
                 note,
                 url = tab.CommittedSourceForOtherThreads,
@@ -2292,7 +2566,9 @@ public sealed class AgentServer
         "Gergur is the user's own browser, logged in as them. Before acting, call gergur_set_task with a few words on what "
         + "you are doing; the user sees it. Work in your own window (gergur_open_window): it stays hidden from the user "
         + "unless they choose to look. To sign in to a site, load its sign-in page and call gergur_login: the person's "
-        + "saved passwords fill in by themselves and you never see them.";
+        + "saved passwords fill in by themselves and you never see them. For Sign in with Google, click the site's Google "
+        + "button and call gergur_login: it chooses the Google account the person uses there, or the one you name in "
+        + "account, which is then remembered for the site.";
 
     /// <summary>The refusal for an MCP agent that has not said what it is doing, or null when it may go ahead.</summary>
     internal static object? TaskRefusal(string tool, AgentCaller? caller, Func<string, string?> taskOf)
@@ -2436,7 +2712,7 @@ public sealed class AgentServer
             },
             []),
         Tool("gergur_login",
-            "Sign in with a password the person saved in Gergur. When the person logs in to a site in their own window, Gergur asks whether to save it; a saved login then fills in by itself as that site's sign-in page loads, in your windows too. This checks that it did and presses the form's sign-in button (or Enter in the password field). The password never comes back to you. Call it on a freshly loaded sign-in page, before typing in it or running scripts there. With several saved accounts the most recent fills in; name another with account and it is chosen from the person's saved ones (in your own window; it borrows the keyboard for about a second). For a site that asks for the username on one page and the password on the next, type the username and continue yourself, then call this on the password page: it fills the password for the username that page carries. If nothing is filled, no login is saved for the site: ask the person with gergur_ask_person. Reports the account it signed in as and where the page went. On Google's account chooser (after Sign in with Google, as a page or as the browser's own chooser in your window), it chooses the Google account the person uses for that site, remembered from their own sign-ins, or the one named in account, which is then remembered for the site; it never clicks Google's consent screen or signs an account up to a site for the first time, which are the person's to decide.",
+            "Sign in with a password the person saved in Gergur. When the person logs in to a site in their own window, Gergur asks whether to save it; a saved login then fills in by itself as that site's sign-in page loads, in your windows too. This checks that it did and presses the form's sign-in button (or Enter in the password field). The password never comes back to you. Call it on a freshly loaded sign-in page, before typing in it or running scripts there. With several saved accounts the most recent fills in; name another with account and it is chosen from the person's saved ones (in your own window; it borrows the keyboard for about a second). A sign-in form inside a frame the page holds (a sign-in provider's, say) is signed in to the same way, with the password saved for the frame's site; the browser never fills another site's frame by itself, so there the account is chosen from the person's saved ones in your own window (the one named, else the first the browser lists), borrowing the keyboard for about a second. For a site that asks for the username on one page and the password on the next, type the username and continue yourself, then call this on the password page: it fills the password for the username that page carries. If nothing is filled, no login is saved for the site: ask the person with gergur_ask_person. Reports the account it signed in as and where the page went. On Google's account chooser (after Sign in with Google, as a page or as the browser's own chooser in your window), it chooses the Google account the person uses for that site, remembered from their own sign-ins, or the one named in account, which is then remembered for the site; it never clicks Google's consent screen or signs an account up to a site for the first time, which are the person's to decide.",
             new
             {
                 submit = new { type = "boolean", description = "Press sign in (true, the default), or only fill in and check (false)." },
@@ -2751,13 +3027,33 @@ public sealed class AgentServer
         + "passwords without ever reading them. Use gergur_login to sign in, or the other tools to work on the page.";
 
     internal const string NoPasswordField =
-        "there is no password field on this page. If it asks for the username first, type it and continue, then call "
-        + "gergur_login on the page that asks for the password. A sign-in form inside a frame from another site, which "
-        + "some sites use, cannot be reached either: then ask the person with gergur_ask_person.";
+        "there is no password field on this page, nor in a frame it holds. If it asks for the username first, type it and "
+        + "continue, then call gergur_login on the page that asks for the password. A sign-in form in a frame inside "
+        + "another frame cannot be reached: then ask the person with gergur_ask_person.";
 
     internal const string PasswordElsewhere =
-        "the password field on this page is inside a frame or a component that gergur_login cannot reach, so it cannot sign "
-        + "in here. Ask the person with gergur_ask_person to sign in.";
+        "the password field on this page is inside a component, or a frame inside a frame, that gergur_login cannot reach, "
+        + "so it cannot sign in here. Ask the person with gergur_ask_person to sign in.";
+
+    internal const string SeveralFramesAsk =
+        "more than one frame on this page asks for a password, so none is signed in to. Ask the person with gergur_ask_person.";
+
+    internal const string FrameFillsOnChoice =
+        "the sign-in form is inside a frame from another site, which the browser fills only once an account is chosen from "
+        + "its list; gergur_login without submit false chooses one (the account named, else the first the browser lists) and signs in.";
+
+    internal const string FrameNotPlaced =
+        "the sign-in form's frame could not be told apart on the page to click into (another frame comes from the same "
+        + "site, it is inside another frame, or the page draws it scaled or turned). Nothing was sent; ask the person with "
+        + "gergur_ask_person.";
+
+    internal const string FrameNotReachable =
+        "the sign-in form's button or password field in its frame could not be clicked (covered, or out of view). Nothing "
+        + "was sent; read the page, or ask the person.";
+
+    internal const string FrameMovedOn =
+        "the page or its sign-in frame moved on before the form could be sent, so nothing was. Read the page; call "
+        + "gergur_login again if it still asks.";
 
     internal const string SeveralPasswordFields =
         "this page shows more than one password field (a sign-up or change-password form, most likely), so a saved "
@@ -3087,6 +3383,150 @@ public sealed class AgentServer
                 userField, pageUser };
         })()
         """;
+
+    /// <summary><see cref="LoginStateJs"/> in a frame, with where the frame is: its address and its site's origin.</summary>
+    internal static string FrameLoginStateJs(string nonce)
+        => $"(() => ({{ state: {LoginStateJs(nonce).Trim()}, href: location.href, origin: location.origin, vw: innerWidth, vh: innerHeight }}))()";
+
+    /// <summary>What <see cref="FrameLoginStateJs"/> found in a frame, with the frame's own view size.</summary>
+    internal sealed record FrameLogin(LoginState State, string Href, string Origin, double ViewW = double.NaN, double ViewH = double.NaN);
+
+    internal static FrameLogin? ParseFrameLogin(string raw)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(raw);
+            var e = doc.RootElement;
+            if (e.ValueKind != JsonValueKind.Object
+                || !e.TryGetProperty("state", out var state)
+                || !e.TryGetProperty("href", out var href) || href.ValueKind != JsonValueKind.String
+                || !e.TryGetProperty("origin", out var origin) || origin.ValueKind != JsonValueKind.String
+                || ParseLoginState(state.GetRawText()) is not { } parsed)
+                return null;
+            double N(string name) => e.TryGetProperty(name, out var n) && n.ValueKind == JsonValueKind.Number ? n.GetDouble() : double.NaN;
+            return new FrameLogin(parsed, href.GetString()!, origin.GetString()!, N("vw"), N("vh"));
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>An answer with the frame it came from added.</summary>
+    internal static System.Text.Json.Nodes.JsonNode WithFrame(object answer, string origin)
+    {
+        var node = JsonSerializer.SerializeToNode(answer)!;
+        node["frame"] = origin;
+        return node;
+    }
+
+    internal enum FrameClick { Clicked, Scripted, MovedOn, NotPlaced, NotReachable }
+
+    /// <summary>
+    /// A frame's content box in the page's view, in the page's CSS pixels, and with a point
+    /// asked about, whether the page's own hit test there finds the frame (nothing of the page
+    /// over it).
+    /// </summary>
+    internal sealed record FrameBox(double X, double Y, double W, double H, double ViewW, double ViewH, bool? Hit);
+
+    /// <summary>
+    /// Run in the page: its one frame whose address is on <paramref name="origin"/> (the frame's
+    /// own site), brought into view when no point is asked about, its content box measured, and
+    /// the point, when asked about, hit tested. The frame's element is the page's; the frame may
+    /// be another site's, in another process, which the DevTools frame tree of the page leaves
+    /// out (measured), so the page is asked. Count is how many frames are on that site, or -1
+    /// when the frame is drawn scaled, turned or skewed (by itself or anything around it): its
+    /// laid-out size and drawn size then differ, and a point in the frame would not be the same
+    /// point on the page, so a click could land on another control of the frame.
+    /// </summary>
+    internal static string FrameBoxJs(string origin, (double X, double Y)? point) => $$"""
+        (() => {
+            const want = {{JsonSerializer.Serialize(origin)}};
+            const all = [...document.querySelectorAll('iframe, frame')].filter(f => {
+                try { return new URL(f.getAttribute('src') || '', location.href).origin === want; } catch (e) { return false; }
+            });
+            if (all.length !== 1) return { count: all.length };
+            const f = all[0];
+            const asked = {{(point is { } p ? $"[{p.X.ToString(System.Globalization.CultureInfo.InvariantCulture)}, {p.Y.ToString(System.Globalization.CultureInfo.InvariantCulture)}]" : "null")}};
+            if (!asked) f.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+            const r = f.getBoundingClientRect(), s = getComputedStyle(f);
+            if (Math.abs(r.width - f.offsetWidth) > 1 || Math.abs(r.height - f.offsetHeight) > 1) return { count: -1 };
+            const n = v => parseFloat(v) || 0;
+            const x = r.left + f.clientLeft + n(s.paddingLeft), y = r.top + f.clientTop + n(s.paddingTop);
+            const w = f.clientWidth - n(s.paddingLeft) - n(s.paddingRight);
+            const h = f.clientHeight - n(s.paddingTop) - n(s.paddingBottom);
+            return { count: 1, x, y, w, h, vw: innerWidth, vh: innerHeight, hit: asked ? document.elementFromPoint(asked[0], asked[1]) === f : null };
+        })()
+        """;
+
+    /// <summary>
+    /// Run in a frame: whether the element <paramref name="selector"/> names is the one focused
+    /// in it. True or false, nothing else of the page. (Not <c>document.hasFocus()</c>, which
+    /// asks about the window, and an agent's hidden window does not have the system's focus.)
+    /// </summary>
+    internal static string FocusedJs(string selector) => $$"""
+        (() => {
+            const a = document.activeElement;
+            return !!a && a.matches({{JsonSerializer.Serialize(selector)}});
+        })()
+        """;
+
+    /// <summary>
+    /// Run in the page: whether the element focused in it is a frame on <paramref name="origin"/>,
+    /// so keys pressed now go into that frame. True or false.
+    /// </summary>
+    internal static string FrameFocusedJs(string origin) => $$"""
+        (() => {
+            const a = document.activeElement;
+            if (!a || (a.tagName !== 'IFRAME' && a.tagName !== 'FRAME')) return false;
+            try { return new URL(a.getAttribute('src') || '', location.href).origin === {{JsonSerializer.Serialize(origin)}}; } catch (e) { return false; }
+        })()
+        """;
+
+    /// <summary>What <see cref="FrameBoxJs"/> answered: null unless exactly one frame is on the site.</summary>
+    internal static FrameBox? ParseFrameBox(string raw)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(raw);
+            var v = doc.RootElement;
+            if (v.ValueKind != JsonValueKind.Object || !v.TryGetProperty("count", out var count)
+                || count.ValueKind != JsonValueKind.Number || count.GetDouble() != 1)
+                return null;
+            double N(string name) => v.TryGetProperty(name, out var n) && n.ValueKind == JsonValueKind.Number ? n.GetDouble() : double.NaN;
+            bool? hit = v.TryGetProperty("hit", out var h) && h.ValueKind is JsonValueKind.True or JsonValueKind.False ? h.GetBoolean() : null;
+            return new FrameBox(N("x"), N("y"), N("w"), N("h"), N("vw"), N("vh"), hit);
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Whether the frame's element the page has is the frame that was read: its content box the
+    /// size of the frame's own view, to a pixel or two. Another frame of the same site that the
+    /// page shows at another size is not taken for it.
+    /// </summary>
+    internal static bool SameFrame(FrameBox box, FrameLogin frame)
+        => double.IsFinite(frame.ViewW) && double.IsFinite(frame.ViewH)
+            && Math.Abs(box.W - frame.ViewW) <= 2 && Math.Abs(box.H - frame.ViewH) <= 2;
+
+    /// <summary>
+    /// The point in the page's view at an element's centre in a frame, or null when it is not
+    /// one to click: the element covered or out of the frame's view, the point outside the
+    /// frame's box, or outside the page's view.
+    /// </summary>
+    internal static (double X, double Y)? PointInFrame(FrameBox box, Located spot)
+    {
+        double[] all = [box.X, box.Y, box.W, box.H, box.ViewW, box.ViewH, spot.X, spot.Y];
+        if (!spot.CanClickAt || all.Any(v => !double.IsFinite(v)))
+            return null;
+        if (spot.X < 0 || spot.Y < 0 || spot.X >= box.W || spot.Y >= box.H)
+            return null;
+        double x = box.X + spot.X, y = box.Y + spot.Y;
+        return x >= 0 && y >= 0 && x < box.ViewW && y < box.ViewH ? (x, y) : null;
+    }
 
     /// <summary>Whether the password field /login used is still on the page and shown: the sign-in did not go through, or asks again.</summary>
     internal static string StillAskingJs(string nonce) => $$"""

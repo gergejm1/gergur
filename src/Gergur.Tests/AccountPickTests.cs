@@ -122,6 +122,11 @@ public sealed class AccountPickTests
         string form = Code("UI/MainForm.cs");
         var login = Regex.Match(server, @"async Task<\(int, string, byte\[\]\)> LoginAsync\(\)[\s\S]*?\n        switch \(\(method, path\)\)").Value;
         Assert.NotEmpty(login);
+        // The sign-in in a frame has its own pick, held by FrameLoginAndWatchingTests; this is the page's.
+        int frameAt = login.IndexOf("async Task<(int, string, byte[])?> FrameLoginAsync(", StringComparison.Ordinal);
+        int frameEnd = login.IndexOf("async Task<(int, string, byte[])> GoogleLoginAsync(", StringComparison.Ordinal);
+        Assert.True(frameAt > 0 && frameEnd > frameAt);
+        login = login[..frameAt] + login[frameEnd..];
         // Not on a page an agent scripted, checked before and again right before the keyboard is borrowed.
         Assert.Matches(@"plan != PickPlan\.None\)\s*\{\s*if \(tab\.AgentScriptedThisDocument\)\s*return \(409", login);
         Assert.Matches(@"if \(tab\.AgentScriptedThisDocument\)\s*return \(null, false, \(409[^;]*;\s*var outcome = await OnUiAsync\(\(\) => AccountPick\.RunAsync", login);
@@ -153,7 +158,7 @@ public sealed class AccountPickTests
         // The focus, the front window and the window's place are given back whatever happened.
         // Given back first, with nothing awaited before it, and the unguard cannot throw past it.
         // The unguard is always sent: a guard script that ran and then timed out is still taken off.
-        Assert.Matches(@"finally\s*\{\s*GiveBack\(window\.Handle, foreground, active, focus\);\s*if \(park\)\s*SetWindowPos[^;]*;\s*try\s*\{\s*await tab\.ReadScriptAsync\(UnguardJs[^;]*;\s*\}\s*catch \(Exception", pick);
+        Assert.Matches(@"finally\s*\{\s*GiveBack\(window\.Handle, foreground, active, focus\);\s*if \(park\)\s*SetWindowPos[^;]*;\s*try\s*\{\s*await inDocument\(UnguardJs[^;]*;\s*\}\s*catch \(Exception", pick);
         Assert.DoesNotContain("guarded", pick);
         // The list is the one this window owns, not any popup of the engine nearby.
         Assert.Contains("bool owned = GetAncestor(h, RootOwner) == windowHandle;", pick);
@@ -161,11 +166,13 @@ public sealed class AccountPickTests
         Assert.Contains("bool park = window.HiddenForAgent;", pick);
         // Checked right after the focus is given and after the click, before anything is typed.
         Assert.Matches(@"tab\.FocusView\(\);\s*if \(TookTheFront\(gergurInFront, IsOurs\(GetForegroundWindow\(\)\)\)\)\s*return Outcome\.Interrupted;\s*await TabInput\.ClickAsync", pick);
-        Assert.Matches(@"await Task\.Delay\(150\);\s*if \(TookTheFront\(gergurInFront, IsOurs\(GetForegroundWindow\(\)\)\)\)\s*return Outcome\.Interrupted;\s*await TabInput\.InsertTextAsync", pick);
+        Assert.Matches(@"await Task\.Delay\(150\);\s*if \(TookTheFront\(gergurInFront, IsOurs\(GetForegroundWindow\(\)\)\)\)\s*return Outcome\.Interrupted;\s*if \(account\.Length > 0\)\s*await TabInput\.InsertTextAsync", pick);
         // The list is looked for cloaked or not: the hidden window's own list is cloaked with it.
         Assert.DoesNotContain("Cloaked(", pick);
         // No key unless the list is there, and the page's own Enter held off while they go in.
-        Assert.Matches(@"await tab\.ReadScriptAsync\(GuardJs[^;]*;\s*tab\.FocusView\(\);", pick);
+        Assert.Matches(@"await inDocument\(GuardJs[^;]*;\s*tab\.FocusView\(\);", pick);
+        // In the page itself unless a frame's sign-in passes its own runner.
+        Assert.Contains("inDocument ??= tab.ReadScriptAsync;", pick);
         Assert.Matches(@"if \(!ListShown\(tab, window\.Handle\)\)\s*return Outcome\.NoList;\s*await TabInput\.PressAsync\(tab, TrustedInput\.ParseChord\(""ArrowDown""\)", pick);
 
         // The hidden window activating for it does not become the window requests go to.

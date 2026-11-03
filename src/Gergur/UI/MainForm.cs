@@ -311,6 +311,10 @@ public sealed class MainForm : Form
         }
 
         _hostPanel = new Panel { Dock = DockStyle.Fill, BackColor = Theme.WindowBg };
+        // The page moves without the window too (the bookmarks bar, a page going fullscreen),
+        // and "Agent watching" stays over it.
+        _hostPanel.SizeChanged += (_, _) => FollowWatchGlow();
+        _hostPanel.LocationChanged += (_, _) => FollowWatchGlow();
 
         _tabStrip = new TabStripControl { Dock = DockStyle.Top, Height = 42, Font = new Font("Segoe UI", 9.5f) };
         _tabStrip.TabClicked += async (_, tab) => { await ActivateTabAsync(tab); };   // looking, not claiming: see ClaimForPerson
@@ -892,6 +896,57 @@ public sealed class MainForm : Form
         // Null while the window is still being built, which resizes it before the strip exists.
         if (_tabStrip is not null)
             _tabStrip.WindowMaximized = WindowState == FormWindowState.Maximized;
+        FollowWatchGlow();
+    }
+
+    protected override void OnLocationChanged(EventArgs e)
+    {
+        base.OnLocationChanged(e);
+        FollowWatchGlow();
+    }
+
+    /// <summary>"Agent watching" over the page, while an agent reads or acts on a tab of this window; see <see cref="AgentWatchGlow"/>.</summary>
+    private AgentWatchGlow? _watchGlow;
+
+    /// <summary>
+    /// An agent read or acted on <paramref name="tab"/>, one of this window's: shows "Agent
+    /// watching" over the page, in the person's windows only. Any thread; nothing waits on it.
+    /// </summary>
+    internal void AgentLookedIn(Tab tab, string agent)
+    {
+        if (IsDisposed || !IsHandleCreated)
+            return;
+        try
+        {
+            BeginInvoke(() => ShowWatchGlow(tab, agent, DateTime.UtcNow));
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or ObjectDisposedException)
+        {
+            // Closing: nobody left to tell.
+        }
+    }
+
+    /// <summary>Whether this window shows "Agent watching": the person's, and on screen with a page to show it over.</summary>
+    internal static bool ShowsWatchGlow(bool openedByAgent, bool hiddenForAgent, bool visible, bool minimized)
+        => !openedByAgent && !hiddenForAgent && visible && !minimized;
+
+    private void ShowWatchGlow(Tab tab, string agent, DateTime nowUtc)
+    {
+        if (IsDisposed || !ShowsWatchGlow(OpenedByAgent, HiddenForAgent, Visible, WindowState == FormWindowState.Minimized))
+            return;
+        var page = _hostPanel.RectangleToScreen(_hostPanel.ClientRectangle);
+        if (page.Width < 40 || page.Height < 40)
+            return;
+        _watchGlow ??= new AgentWatchGlow();
+        _watchGlow.ShowOver(this, page, AgentWatchGlow.Label(agent, Tabs?.ActiveTab == tab), nowUtc);
+    }
+
+    private void FollowWatchGlow()
+    {
+        if (_watchGlow is null || _hostPanel is null)
+            return;
+        bool shown = ShowsWatchGlow(OpenedByAgent, HiddenForAgent, Visible, WindowState == FormWindowState.Minimized);
+        _watchGlow.Follow(_hostPanel.RectangleToScreen(_hostPanel.ClientRectangle), shown);
     }
 
     /// <summary>Scales a design-time pixel count to this window's dpi.</summary>
@@ -1995,6 +2050,7 @@ public sealed class MainForm : Form
         _mainMenu?.Dispose();
         _downloadsPanel?.Dispose();
         _historyPanel?.Dispose();
+        _watchGlow?.Dispose();
         if (_agentsPanel is not null && _agentsHookedTo is not null)
             _agentsHookedTo.Agents.Changed -= _agentsPanel.AgentsChanged;
         _agentsPanel?.Dispose();

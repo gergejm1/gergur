@@ -381,6 +381,7 @@ public sealed class Tab : ITabHandle, IDisposable
         core.NavigationCompleted += OnNavigationCompleted;
         core.NewWindowRequested += OnNewWindowRequested;
         core.ProcessFailed += OnProcessFailed;
+        core.FrameCreated += OnFrameCreated;
         core.WebMessageReceived += OnWebMessageReceived;
         core.WindowCloseRequested += OnWindowCloseRequested;
         core.DownloadStarting += OnDownloadStarting;
@@ -482,6 +483,63 @@ public sealed class Tab : ITabHandle, IDisposable
     // The text is kept as well, because it carries the relaxed sites: a change to that list
     // swaps the registered script for one with the new list in it.
     private (CoreWebView2 Core, Task<string> Id, string Text)? _pageCleanupScript;
+
+    /// <summary>
+    /// The frames the page's own document holds (not frames inside those), for signing in to a
+    /// form inside one (/login). UI thread only.
+    /// </summary>
+    private readonly List<CoreWebView2Frame> _frames = [];
+
+    private void OnFrameCreated(object? sender, CoreWebView2FrameCreatedEventArgs e)
+    {
+        var frame = e.Frame;
+        _frames.Add(frame);
+        frame.Destroyed += (_, _) => _frames.Remove(frame);
+    }
+
+    /// <summary>
+    /// Runs script in each frame the page's own document holds, at most twenty, and gives back
+    /// what each answered in time. UI thread. Nothing when the tab has no live page.
+    /// </summary>
+    internal async Task<IReadOnlyList<(CoreWebView2Frame Frame, string Result)>> ReadFramesAsync(string js, TimeSpan budget)
+    {
+        if (Core is null)
+            return [];
+        RefuseOwnPage();
+        var asked = _frames.Where(f => !FrameGone(f)).Take(20).ToList();
+        var answers = await Task.WhenAll(asked.Select(f => ReadFrameScriptAsync(f, js, budget)));
+        return asked.Zip(answers).Where(x => x.Second.InTime).Select(x => (x.First, x.Second.Result)).ToList();
+    }
+
+    /// <summary>Runs script in one of this page's frames. UI thread. Not in time when the frame is gone.</summary>
+    internal async Task<(string Result, bool InTime)> ReadFrameScriptAsync(CoreWebView2Frame frame, string js, TimeSpan budget)
+    {
+        if (Core is null || FrameGone(frame) || !_frames.Contains(frame))
+            return ("null", false);
+        try
+        {
+            var (result, inTime) = await WithBudget(frame.ExecuteScriptAsync(js), budget, "null");
+            return (result ?? "null", inTime);
+        }
+        catch (Exception ex) when (ex is System.Runtime.InteropServices.COMException or InvalidOperationException or ArgumentException)
+        {
+            DebugLog.Write($"a frame's script failed: {ex.Message}");
+            return ("null", false);
+        }
+    }
+
+    /// <summary>Whether the frame is gone (its page navigated away, or the frame was removed). UI thread.</summary>
+    internal static bool FrameGone(CoreWebView2Frame frame)
+    {
+        try
+        {
+            return frame.IsDestroyed() != 0;
+        }
+        catch (Exception ex) when (ex is System.Runtime.InteropServices.COMException or InvalidOperationException)
+        {
+            return true;
+        }
+    }
 
     /// <summary>The FedCM chooser watch, in an agent's window only; see <see cref="FedCmWatch"/>.</summary>
     private FedCmWatch? _fedCm;
@@ -3085,8 +3143,9 @@ public sealed class Tab : ITabHandle, IDisposable
         // Belongs to the engine going away; holding it kept that engine's wrapper alive
         // until the next build.
         _pageCleanupScript = null;
-        // Its event receivers belong to the engine going away too.
+        // Its event receivers belong to the engine going away too, and so do its frames.
         Interlocked.Exchange(ref _fedCm, null)?.Dispose();
+        _frames.Clear();
 
         // The pixels went with the view. Leaving this latched meant a tab discarded after
         // fifteen minutes still claimed to have something to photograph, so a screenshot
