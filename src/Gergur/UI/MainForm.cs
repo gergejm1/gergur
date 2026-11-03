@@ -1801,6 +1801,11 @@ public sealed class MainForm : Form
         _session.Env.Core.BrowserProcessExited += OnBrowserProcessExited;
         _session.Env.Core.NewBrowserVersionAvailable += OnNewBrowserVersionAvailable;
         _session.StartAgent();
+        var ui = SynchronizationContext.Current;
+        if (ui is not null)
+            _session.StartUBlockLite(work => ui.Post(_ => work(), null));
+        else
+            DebugLog.WriteAlways("uBO Lite updates not started: no UI context to hand results back to");
         HookAgents();
         _session.StartPhoneBridge();
         // Only the first window listens, or an arrival would notify once per window.
@@ -3174,6 +3179,13 @@ public sealed class MainForm : Form
     }
 
     private void ShowMessage(string text) => _messageLabel.Text = text;
+
+    /// <summary>A line in the status bar from outside the window. UI thread.</summary>
+    internal void ShowStatus(string text)
+    {
+        if (!IsDisposed)
+            ShowMessage(text);
+    }
 
     /// <summary>
     /// Saves the settings, or says in a box why they were not. A run that could not read

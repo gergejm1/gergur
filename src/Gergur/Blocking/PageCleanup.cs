@@ -34,16 +34,27 @@ public static class PageCleanup
     /// </summary>
     internal const string RelaxedPlaceholder = "var RELAXED_SITES = [];";
 
+    /// <summary>The line that says whether uBlock Origin Lite runs, which leaves YouTube to it.</summary>
+    internal const string UBlockPlaceholder = "var UBOL_ACTIVE = false;";
+
     /// <summary>The script for these relaxed sites, or null when there has never been one. See <see cref="Compose"/>.</summary>
-    public static string? ScriptFor(IReadOnlyList<string> relaxed) => Script is { } script ? Compose(script, relaxed) : null;
+    public static string? ScriptFor(IReadOnlyList<string> relaxed, bool uBlockActive = false)
+        => Script is { } script ? Compose(script, relaxed, uBlockActive) : null;
 
     /// <summary>
     /// <paramref name="script"/> with <paramref name="relaxed"/> written over its placeholder
-    /// line, as a JSON array of plain names. A script without the line (an older copy being
-    /// tried by hot reload) is returned as it is, and relaxes nothing.
+    /// line, as a JSON array of plain names, and with uBlock Origin Lite marked as running when
+    /// it is. A script without a line (an older copy being tried by hot reload) is returned
+    /// without that change.
     /// </summary>
-    internal static string Compose(string script, IReadOnlyList<string> relaxed)
+    internal static string Compose(string script, IReadOnlyList<string> relaxed, bool uBlockActive = false)
     {
+        if (uBlockActive)
+        {
+            int u = script.IndexOf(UBlockPlaceholder, StringComparison.Ordinal);
+            if (u >= 0)
+                script = string.Concat(script.AsSpan(0, u), "var UBOL_ACTIVE = true;", script.AsSpan(u + UBlockPlaceholder.Length));
+        }
         if (relaxed.Count == 0)
             return script;
         int at = script.IndexOf(RelaxedPlaceholder, StringComparison.Ordinal);

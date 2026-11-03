@@ -40,6 +40,8 @@ public sealed class BrowserEnvironment
         var options = new CoreWebView2EnvironmentOptions
         {
             AdditionalBrowserArguments = BuildBrowserArguments(settings),
+            // For uBlock Origin Lite (Blocking/UBlockLite.cs), the only extension Gergur loads.
+            AreBrowserExtensionsEnabled = settings.UBlockLite,
         };
         var core = await CoreWebView2Environment.CreateAsync(
             browserExecutableFolder: null, userDataFolder, options);
@@ -141,6 +143,8 @@ public sealed class BrowserEnvironment
             ApplyViewSettings(webView.CoreWebView2, Settings, agentWindow);
             // Before the first page is asked for, once per run, and bounded: see SiteWorkarounds.
             await SiteWorkarounds.ResetServiceWorkersOnceAsync(webView.CoreWebView2);
+            // Before the first page too, so the first page already has it. Once per run, bounded.
+            await Blocking.UBlockLite.EnsureLoadedOnceAsync(webView.CoreWebView2.Profile, Settings);
             return webView;
         }
         catch

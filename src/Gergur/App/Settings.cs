@@ -69,6 +69,10 @@ public sealed class Settings
     [Description("Sites, separated by semicolons, where requests are not blocked and ads are not taken out of the page; a video ad that plays is still muted, sped up and skipped. For YouTube, which stops playing videos for a browser it decides blocks ads. Applies from the next page each tab loads.")]
     public string RelaxedSites { get; set; } = "";
 
+    [Category(Privacy), DisplayName("uBlock Origin Lite")]
+    [Description("Runs uBlock Origin Lite inside the browser, downloaded from its releases on GitHub and kept up to date (checked every six hours; a new version takes over at the next start). Its YouTube rules keep videos and playlists playing where YouTube refuses a browser it thinks blocks ads, and while it runs Gergur's own YouTube ad code stands down. The check and download go straight to GitHub, not through the VPN. Needs a restart.")]
+    public bool UBlockLite { get; set; } = true;
+
     [Category(Privacy), DisplayName("Save passwords")]
     [Description("Offer to save a password when you sign in to a site, and fill saved ones in. Kept encrypted inside the profile. Agents sign in with saved ones (gergur_login) and never see them; their own windows never offer to save. Applies at once, open tabs included.")]
     public bool SavePasswords { get; set; } = true;
@@ -173,7 +177,7 @@ public sealed class Settings
     public static readonly IReadOnlySet<string> RestartRequired = new HashSet<string>
     {
         nameof(ProcessPerSite), nameof(DisableSiteIsolation), nameof(DisableSpareRenderer),
-        nameof(DisableFedCm), nameof(V8ScavengerMaxMb),
+        nameof(DisableFedCm), nameof(V8ScavengerMaxMb), nameof(UBlockLite),
         nameof(ExtraBrowserArguments), nameof(VpnEnabled), nameof(VpnLocalPort),
         nameof(VpnBypassHosts), nameof(AgentServerEnabled), nameof(AgentServerPort),
         // DropPort only. The phone drop itself is turned on and off from the menu, which

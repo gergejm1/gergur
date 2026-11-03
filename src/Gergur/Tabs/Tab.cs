@@ -586,7 +586,9 @@ public sealed class Tab : ITabHandle, IDisposable
 
     /// <summary>The cleanup script these settings want registered, or none.</summary>
     private static string? CleanupScriptFor(Settings settings)
-        => settings.PageAdCleanup ? Blocking.PageCleanup.ScriptFor(Blocking.RelaxedSites.Parse(settings.RelaxedSites)) : null;
+        => settings.PageAdCleanup
+            ? Blocking.PageCleanup.ScriptFor(Blocking.RelaxedSites.Parse(settings.RelaxedSites), Blocking.UBlockLite.LoadedId is not null)
+            : null;
 
     // Settings that changed while this tab was suspended, applied when it wakes. Nothing is
     // pushed into a suspended view, because calls into one can wake it, and a tab woken

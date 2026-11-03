@@ -18,6 +18,10 @@
     // as the site meant them to. A video ad that plays is still muted, run at 16x and
     // skipped by the tick below, which is what lets YouTube see its ads being shown.
     var RELAXED_SITES = [];
+    // Whether uBlock Origin Lite runs in this browser (Gergur writes true over this line,
+    // PageCleanup.Compose). It then has YouTube to itself: its rules there change by the
+    // week, and two hands pruning and hooking the same player fight each other.
+    var UBOL_ACTIVE = false;
     function relaxedHere() {
         var host = String(location.hostname || "").toLowerCase().replace(/\.$/, "");
         for (var r = 0; r < RELAXED_SITES.length; r++) {
@@ -358,6 +362,9 @@
             (document.head || document.documentElement).appendChild(style);
         } catch (e) { }
     }
+    // Nothing at all on YouTube while uBlock Origin Lite runs: no hiding, no pruning, no tick.
+    if (UBOL_ACTIVE && /(^|\.)youtube(-nocookie)?\.com$/.test(location.hostname)) return;
+
     var RELAXED = typeof location !== "undefined" && relaxedHere();
     if (RELAXED) {
         // Nothing hidden on a relaxed site; the YouTube section below still runs for the tick.

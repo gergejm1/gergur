@@ -702,7 +702,60 @@ wakes it. The user's browsing is personal: read what the task requires, nothing 
   opened before the relax still had the old script. Not established. Seen in the same
   run and not yet looked into: both loads that served a pre-roll ran it out muted at 16x
   in under a second, then the film never started (`unstarted-mode`, `readyState` 0, no
-  player response, for 45 s).
+  player response, for 45 s). Later the same day it came back: the person's playlist tab
+  (a Mix, loaded 24 minutes before) had every song `ERROR` with
+  `bkaEnforcementMessageViewModel` and moved on every couple of seconds, a reload of one
+  song played, and a fresh hidden window was refused too, with the vpn off. The flagged
+  verdict covers the session, and the songs a playlist fetches in the page are where it
+  shows. What answers it is below.
+- uBlock Origin Lite runs inside the engine (`Settings.UBlockLite`, on by default,
+  `Blocking/UBlockLite.cs`), for the YouTube refusal above. uBlock's current YouTube rules
+  (its "Quick fixes" list) do not fight the flag, they avoid it: they rewrite the player's
+  request so YouTube serves it as a kind of playback that carries no ads, ask again in
+  another such form when a video comes back refused, rename the ad fields in the answers
+  rather than delete them (deleting hung the player here), and quiet YouTube's tamper
+  checks. They change every few days and are built into each uBO Lite release, so Gergur
+  takes each release rather than copying them.
+  - WebView2 loads it as a browser extension (`AreBrowserExtensionsEnabled`, then
+    `CoreWebView2Profile.AddBrowserExtensionAsync` on the unpacked folder). It lives at
+    `extensions\ubol\current` in the data folder, always that path, so the engine keeps its
+    id and settings; the engine also keeps it registered in the profile between runs. It is
+    loaded before the first page of a run (`EnsureLoadedOnceAsync`, in `CreateWebViewAsync`,
+    bounded at 10 s).
+  - Kept current from github.com/uBlockOrigin/uBOL-home: the latest release's tag is read
+    from GitHub's API a minute after start (3 s when there is none yet) and every six hours,
+    and the download address is built from the tag (`DownloadUrl`), never taken from the
+    answer. The archive is unpacked only inside its folder (bounded in entries and size), and
+    only a manifest that is uBO Lite's at that version counts; a folder is used only once its
+    `.gergur-complete` marker is written. The first download goes into `current` and is
+    loaded at once (engine calls on the UI thread, `AppSession.StartUBlockLite`), and tabs
+    already open switch over from their next page. Later ones wait in `pending` and are
+    swapped in at the next start before the engine starts (`PromotePending`), since a loaded
+    extension's files are in use. The status line says when one arrived. Releases are not
+    signed: this is the same trust as installing it from that page by hand, over HTTPS. Its
+    requests go direct, not through the vpn, like the blocklist download.
+  - While it is loaded, `adblock.js` does nothing at all on YouTube (`UBOL_ACTIVE`, written
+    in by `PageCleanup.Compose`): no hiding, no pruning, no 16x tick. Two hands on the same
+    player fight, and the 16x run-out of ads is a likely reason YouTube flagged this browser.
+  - The setting needs a restart and is refused over the API (`DialogOnly`): an extension in
+    every page of every session is the person's to turn off.
+  - uBO Lite has no toolbar here: its popup and dashboard are not reachable, so it runs with
+    its defaults.
+  - Its network rules (`declarativeNetRequest`) block nothing in WebView2, measured: with
+    Gergur's own blocklist and page cleanup off, a page's requests to EasyList and
+    EasyPrivacy staples (adsbygoogle.js, analytics.js, gpt.js, ad_status.js) all went
+    through, and the same with Gergur's request interception taken out entirely. Its page
+    scripts do run. Gergur's blocklist goes on blocking hosts as before.
+
+  Verified on 2026-11-03 in a test instance (`scratchpad/livetest/ubol-live.ps1`,
+  `ubol-update.ps1`, Gergur's own blocking off so what is blocked is uBO Lite's, signed out,
+  hidden muted agent windows, no window on screen): downloaded about 5 s after a fresh start
+  and loaded while running; seven videos and three playlist songs played with no ad and no
+  refusal; the player's response held ad placements on every one of those 11 with it off and
+  on none with it on; an older installed copy loaded, the latest downloaded into pending while
+  it ran, and swapped in and loaded at the next start. Not verified: the person's flagged
+  session with it (it needs their profile), and that the engine reads the swapped files
+  rather than a copy of its own (it reports no version).
 - Settings are a page now (`gergur://settings`, `SettingsPage` behind it, the menu's
   Settings): every setting described from the attributes on `Settings`, in sections with
   the engine last, each change saved as it is made (`ISettingsHost.Commit`: save, then

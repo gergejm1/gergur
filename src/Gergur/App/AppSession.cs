@@ -2,6 +2,7 @@ using Gergur.Blocking;
 using Gergur.Data;
 using Gergur.Tabs;
 using Gergur.UI;
+using Microsoft.Web.WebView2.Core;
 
 namespace Gergur.App;
 
@@ -142,8 +143,78 @@ public sealed class AppSession
     public static async Task<AppSession> CreateAsync(Settings settings, VpnTunnel vpn)
     {
         var blocker = new RequestBlocker(settings.BlocklistEnabled) { Relaxed = RelaxedSites.Parse(settings.RelaxedSites) };
+        // A downloaded uBlock Origin Lite update takes over here, while no engine has its files open.
+        if (settings.UBlockLite)
+            Blocking.UBlockLite.PromotePending();
         var env = await BrowserEnvironment.CreateAsync(settings);
         return Current = new AppSession(settings, env, blocker, vpn);
+    }
+
+    private CancellationTokenSource? _uBlockStop;
+
+    /// <summary>
+    /// Keeps uBlock Origin Lite current for the life of the app (Blocking/UBlockLite.cs). UI
+    /// thread; the checks run off it and hand back through <paramref name="onUi"/>: a first
+    /// download is loaded into the profile at once, and what happened is said in the status
+    /// line of the window in use.
+    /// </summary>
+    public void StartUBlockLite(Action<Action> onUi)
+    {
+        if (!Settings.UBlockLite || _uBlockStop is not null)
+            return;
+        _uBlockStop = new CancellationTokenSource();
+        var stop = _uBlockStop.Token;
+        UBlockLite.Updated += text => onUi(() => WindowInUse()?.ShowStatus(text));
+        UBlockLite.LoadedLate += () => onUi(HandOver);
+        // Soon when there is none yet, so a first run is not long without it.
+        var first = UBlockLite.VersionIn(UBlockLite.CurrentFolder) is null ? TimeSpan.FromSeconds(3) : TimeSpan.FromMinutes(1);
+        _ = Task.Run(() => UBlockLite.KeepCurrentAsync(() => onUi(LoadUBlockNow), first, stop));
+    }
+
+    /// <summary>
+    /// UI thread: loads a first download into the profile through any live tab. With none
+    /// (every tab asleep), the next view built loads it (UBlockLite.EnsureLoadedOnceAsync).
+    /// </summary>
+    private void LoadUBlockNow()
+    {
+        MainForm[] windows;
+        lock (_windowsLock)
+            windows = _windows.ToArray();
+        foreach (var window in windows)
+        {
+            if (window.IsDisposed || window.Tabs is not { } tabs)
+                continue;
+            foreach (var tab in tabs.Tabs)
+            {
+                CoreWebView2Profile? profile = null;
+                try { profile = tab.Core?.Profile; }
+                catch (Exception ex) when (ex is InvalidOperationException or System.Runtime.InteropServices.COMException) { }
+                if (profile is not null)
+                {
+                    _ = LoadThenHandOverAsync(profile);
+                    return;
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Loads it, then hands YouTube over to it in the tabs already open: their page cleanup
+    /// script was registered before it ran, with Gergur's own YouTube code switched on, and
+    /// from their next page it is the version that leaves YouTube alone. UI thread.
+    /// </summary>
+    private async Task LoadThenHandOverAsync(CoreWebView2Profile profile)
+    {
+        await UBlockLite.LoadNowAsync(profile, Settings);
+        if (UBlockLite.LoadedId is not null)
+            HandOver();
+    }
+
+    /// <summary>UI thread: YouTube handed over in the tabs already open, and the person told it runs.</summary>
+    private void HandOver()
+    {
+        MainForm.ApplyLiveSettings(this);
+        WindowInUse()?.ShowStatus($"uBlock Origin Lite {UBlockLite.LoadedVersion} is running; pages loaded from now on use it.");
     }
 
     /// <summary>One server for the whole app; it reaches every window's tabs.</summary>

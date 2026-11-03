@@ -80,6 +80,9 @@ internal static class SettingsPatch
         // Sites where requests are not blocked and ads are not taken out. An agent that adds
         // one weakens the blocker for every later launch, and nothing shows it but this list.
         nameof(Settings.RelaxedSites),
+        // An extension that runs in every page of every session, and the blocker with it.
+        // Turning it off weakens the blocker for every later launch; it is the person's.
+        nameof(Settings.UBlockLite),
     };
 
     /// <summary>The values a setting spelled as a string is allowed to take.</summary>
