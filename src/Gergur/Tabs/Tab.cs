@@ -9,7 +9,7 @@ namespace Gergur.Tabs;
 /// <summary>
 /// One tab. Owns either a live WebView2 control or, when discarded, only its
 /// url/title/favicon. All WebView2 access funnels through this class: raw API
-/// calls silently resume suspended tabs and would defeat the lifecycle policy.
+/// calls silently resume suspended tabs and would wake a tab that is meant to be left alone.
 /// </summary>
 public sealed class Tab : ITabHandle, IDisposable
 {
@@ -284,7 +284,7 @@ public sealed class Tab : ITabHandle, IDisposable
 
             // Whatever the failed build left goes now, not on the next attempt. A view
             // assigned before the fault is live, parented and backed by a renderer while
-            // the tab still calls itself Discarded, so the lifecycle manager can never
+            // the tab still calls itself Discarded, so nothing else can ever
             // reclaim it, and for a background tab nobody reads again there is no next
             // attempt to clear it up.
             DropView();
@@ -380,6 +380,8 @@ public sealed class Tab : ITabHandle, IDisposable
             await adding;
         }
         await core.AddScriptToExecuteOnDocumentCreatedAsync(ErrorReporterScript);
+        // Gmail's service worker wedges every page it controls here; see SiteWorkarounds.
+        await core.AddScriptToExecuteOnDocumentCreatedAsync(SiteWorkarounds.GmailNoServiceWorkerScript);
 
         State = TabState.Hidden;
         if (navigateToStoredUrl && Url is not ("" or "about:blank"))
@@ -565,11 +567,11 @@ public sealed class Tab : ITabHandle, IDisposable
         // The person went to another tab while this one was waking, which for a discarded
         // tab is seconds of building a view. Showing it now would put its page over the tab
         // the strip says is selected, and every tab clicked after it would be fighting it.
-        // Built and left hidden is what the lifecycle manager expects of a background tab.
+        // Built and left hidden is what a background tab looks like.
         if (_webView is not null && _owner is { } manager && manager.ActiveTab != this)
         {
             Breadcrumbs.Note($"{Id} woke after the person moved on, left hidden");
-            LastActiveUtc = DateTime.UtcNow;   // built just now: not due to sleep on an old timestamp
+            LastActiveUtc = DateTime.UtcNow;   // built just now
             return;
         }
         if (_webView is null)
@@ -658,6 +660,64 @@ public sealed class Tab : ITabHandle, IDisposable
     /// <summary>Raised when the page enters or leaves its own fullscreen, which for a
     /// video means the chrome has to get out of the way.</summary>
     public event EventHandler<bool>? FullScreenChanged;
+
+    /// <summary>Whether the page is in its own fullscreen right now. False with no view to ask.</summary>
+    public bool IsFullScreen
+    {
+        get
+        {
+            try
+            {
+                return Core?.ContainsFullScreenElement ?? false;
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or ObjectDisposedException
+                or System.Runtime.InteropServices.COMException)
+            {
+                // A view being taken down answers by throwing, and the answer then is "no".
+                return false;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Asks the page to leave its fullscreen. Fire and forget: the window does not wait on the
+    /// answer, because a page that ignores the request is the case this is for.
+    /// </summary>
+    public void ExitFullScreen()
+    {
+        try
+        {
+            _ = Core?.ExecuteScriptAsync("document.fullscreenElement && document.exitFullscreen()");
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or ObjectDisposedException
+            or System.Runtime.InteropServices.COMException)
+        {
+            // Nothing to ask, so nothing to leave.
+        }
+    }
+
+    /// <summary>
+    /// What the window in front of this tab decided when the page last asked for the whole
+    /// screen: see <see cref="FullScreenPolicy"/>. Kept here and not in the window, so it goes
+    /// with the tab when it is moved to another window and is gone when the tab is.
+    /// </summary>
+    internal FullScreenVerdict FullScreenVerdict { get; set; }
+
+    private long _agentActedTicks;
+
+    /// <summary>
+    /// Records that an agent has just run something in this page. Script run through the engine
+    /// counts as a click by the person for the purposes of a fullscreen request, so the window
+    /// uses this to tell a video the person sent fullscreen from one an agent's click did.
+    /// </summary>
+    internal void NoteAgentAction() => Interlocked.Exchange(ref _agentActedTicks, DateTime.UtcNow.Ticks);
+
+    /// <summary>Whether <see cref="NoteAgentAction"/> was called within the last <paramref name="span"/>.</summary>
+    internal bool AgentActedWithin(TimeSpan span)
+    {
+        long ticks = Interlocked.Read(ref _agentActedTicks);
+        return ticks != 0 && DateTime.UtcNow - new DateTime(ticks, DateTimeKind.Utc) < span;
+    }
 
     public int FindMatchCount { get; private set; }
     public int FindActiveMatch { get; private set; }
@@ -790,6 +850,8 @@ public sealed class Tab : ITabHandle, IDisposable
         FullScreenChanged = null;
         ViewBuildFailed = null;
         PageRequest = null;
+        NotRespondingChanged = null;
+        DiscardedAfterHang = null;
     }
 
     /// <summary>
@@ -1902,7 +1964,7 @@ public sealed class Tab : ITabHandle, IDisposable
     public void OpenDevTools() { try { Core?.OpenDevToolsWindow(); } catch { } }
     public void OpenTaskManager() { try { Core?.OpenTaskManagerWindow(); } catch { } }
 
-    // --- ITabHandle (called only by TabLifecycleManager) ---
+    // --- ITabHandle (suspend and discard; nothing calls the suspend half on a timer any more) ---
 
     public async Task<bool> TrySuspendAsync()
     {
@@ -2333,8 +2395,7 @@ public sealed class Tab : ITabHandle, IDisposable
         DebugLog.WriteAlways($"engine process failed ({Id}): {e.ProcessFailedKind}, {e.Reason}, exit {e.ExitCode}");
         Breadcrumbs.Note($"{Id} engine process failed: {e.ProcessFailedKind}");
         // GPU/utility failures recover on their own; only a dead/hung renderer needs us.
-        if (e.ProcessFailedKind is CoreWebView2ProcessFailedKind.RenderProcessExited
-            or CoreWebView2ProcessFailedKind.RenderProcessUnresponsive)
+        if (e.ProcessFailedKind is CoreWebView2ProcessFailedKind.RenderProcessExited)
         {
             // Not from inside the callback: this disposes the very view that is calling
             // back, and the engine's callbacks are not written for that. And only if it is
@@ -2346,8 +2407,120 @@ public sealed class Tab : ITabHandle, IDisposable
                     Discard();
             });
         }
+        else if (e.ProcessFailedKind is CoreWebView2ProcessFailedKind.RenderProcessUnresponsive
+            && sender is CoreWebView2 hung)
+        {
+            // Not discarded at once. A heavy page on a busy machine may go unresponsive for a
+            // while and then carry on (suspected for Gmail while a game engine compiles, not
+            // reproduced), and throwing it away on the first report would kill it just as it
+            // was about to finish loading.
+            AfterCallback(() => _ = DiscardIfStillHungAsync(hung));
+        }
+        else if (e.ProcessFailedKind is CoreWebView2ProcessFailedKind.RenderProcessUnresponsive)
+        {
+            Breadcrumbs.Note($"{Id} an unresponsive report arrived with no view to wait on");
+        }
     }
 
+    /// <summary>How long an unresponsive page is left alone before it is asked whether it is there.</summary>
+    internal static readonly TimeSpan HungGrace = TimeSpan.FromSeconds(20);
+
+    /// <summary>How long it has to answer that question.</summary>
+    internal static readonly TimeSpan HungProbe = TimeSpan.FromSeconds(10);
+
+    /// <summary>
+    /// A page the engine reported as not responding, raised with true when it is being waited
+    /// on, and with false when that ends with the page back. Said out loud, because 40 seconds
+    /// of a frozen page with nothing on screen reads as the browser being broken.
+    /// </summary>
+    public event EventHandler<bool>? NotRespondingChanged;
+
+    // The view being waited on. Per view, not per tab: a view rebuilt during the wait and then
+    // hung again is a different page and needs its own.
+    private CoreWebView2? _watchedHung;
+
+    /// <summary>Whether this tab is being waited on as not responding, for a window that takes it over.</summary>
+    internal bool IsWaitingOnPage => _watchedHung is not null;
+
+    /// <summary>
+    /// A page that did not come back and is about to be discarded, so the person can be told it
+    /// was reloaded: that loses what was typed into it, and doing it silently reads as a glitch.
+    /// </summary>
+    public event EventHandler? DiscardedAfterHang;
+
+    internal enum HungVerdict { Gone, Recovered, Hung }
+
+    /// <summary>
+    /// What to make of a page that was reported as not responding: wait, check it is still the
+    /// view that was reported, ask it something, and check again. Apart from the engine, so
+    /// each outcome can be tested. A probe that cannot be issued or fails counts as no answer.
+    /// </summary>
+    internal static async Task<HungVerdict> JudgeHungPageAsync(
+        Func<Task> grace, Func<bool> stillTheSameView, Func<Task<bool>> probe)
+    {
+        await grace();
+        if (!stillTheSameView())
+            return HungVerdict.Gone;   // closed, discarded or rebuilt meanwhile
+        bool answered;
+        try { answered = await probe(); }
+        catch { answered = false; }
+        if (!stillTheSameView())
+            return HungVerdict.Gone;
+        return answered ? HungVerdict.Recovered : HungVerdict.Hung;
+    }
+
+    private async Task DiscardIfStillHungAsync(CoreWebView2 hung)
+    {
+        if (ReferenceEquals(_watchedHung, hung))
+        {
+            Breadcrumbs.Note($"{Id} second report for a page already being waited on");
+            return;
+        }
+        // Queued behind the callback, so the view may be gone by now: nothing to wait on or to say.
+        if (_disposed || _webView is null || !ReferenceEquals(Core, hung))
+        {
+            Breadcrumbs.Note($"{Id} not-responding report for a view that is already gone");
+            return;
+        }
+        _watchedHung = hung;
+        bool said = false;
+        try
+        {
+            Breadcrumbs.Note($"{Id} page not responding, waiting {HungGrace.TotalSeconds:0}s before asking it");
+            said = true;
+            NotRespondingChanged?.Invoke(this, true);
+            var verdict = await JudgeHungPageAsync(
+                () => Task.Delay(HungGrace),
+                () => !_disposed && _webView is not null && ReferenceEquals(Core, hung),
+                // Not asked of a view that is asleep: that would wake it. It counts as no answer, so
+                // a sleeping view the engine reports as unresponsive is discarded after the wait,
+                // as it was at once before: intended.
+                async () => State != TabState.Suspended
+                    && (await WithBudget(hung.ExecuteScriptAsync("1"), HungProbe, "")).InTime);
+            if (verdict != HungVerdict.Hung)
+            {
+                Breadcrumbs.Note($"{Id} page {(verdict == HungVerdict.Recovered ? "answered after all" : "is gone")}; kept");
+                return;
+            }
+            DebugLog.WriteAlways($"a page ({Id}) did not answer for {(HungGrace + HungProbe).TotalSeconds:0}s and was discarded");
+            Breadcrumbs.Note($"{Id} page still not answering, discarding it");
+            DiscardedAfterHang?.Invoke(this, EventArgs.Empty);
+            Discard();
+        }
+        catch (Exception ex)
+        {
+            DebugLog.WriteAlways($"a page that stopped responding could not be checked ({Id}): {ex.Message}");
+        }
+        finally
+        {
+            if (ReferenceEquals(_watchedHung, hung))
+                _watchedHung = null;
+            // Whatever became of the tab: the message is the window's to take down, and it only
+            // takes down its own words.
+            if (said)
+                NotRespondingChanged?.Invoke(this, false);
+        }
+    }
     /// <summary>
     /// Runs something once the engine callback that asked for it has returned. A view must
     /// not be disposed, nor its tab closed, from inside one of its own events: a page that
@@ -2396,6 +2569,7 @@ public sealed class Tab : ITabHandle, IDisposable
     {
         var webView = _webView;
         _webView = null;
+        _watchedHung = null;   // an engine wrapper is not kept past its view
         _committedSource = Url;   // no document now; the address is what a rebuild shows
         _navigationUnderWay = null;
         _ensureLiveTask = null;

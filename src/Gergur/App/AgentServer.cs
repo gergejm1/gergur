@@ -784,6 +784,9 @@ public sealed class AgentServer
                 string js = BodyString("js") ?? "";
                 if (js.Length == 0)
                     return (400, "application/json", Json(new { error = "js required" }));
+                // Script the engine runs counts as the person's own click for what a page may
+                // ask of the window, so the window is told who was acting.
+                tab.NoteAgentAction();
 
                 // The result of a promise used to come back as {}, so anything async had
                 // to park its answer on a global and be polled for from outside. Awaited
@@ -1586,6 +1589,9 @@ public sealed class AgentServer
     /// </summary>
     private async Task<(bool Worked, bool Ready)> ActOnPageAsync(Tab tab, string js)
     {
+        // A click or typing from here is the person's, as far as a fullscreen request can
+        // tell. The window is told it was an agent, so it does not take the screen for it.
+        tab.NoteAgentAction();
         var (raw, ready) = await OnUiAsync(() => tab.ReadScriptAsync(js, Tab.WakeTimeout));
         return (raw == "true", ready);
     }

@@ -516,6 +516,62 @@ wakes it. The user's browsing is personal: read what the task requires, nothing 
 - YouTube stops starting playback through the WARP exit once it has seen enough
   traffic from it, and it looks exactly like a broken ad blocker: permanent buffering,
   no error. Turn the VPN off before suspecting anything else.
+- Gmail is given no service worker (`SiteWorkarounds`). Its worker, once it controls a page
+  here, stops answering: every request the page makes waits out the engine's one minute
+  worker start limit and fails ("Not connected", blank account picture, a page that sits
+  in `interactive` and never loads). Measured 2026-11-02 on the real profile: the same
+  fetches from any other tab took 100 to 350 ms; with the registration removed the inbox
+  loaded complete in about six seconds; Gmail then registered a fresh worker on that load
+  and the next load hung again. So wiping the Service Worker folder only cures it for a
+  few days, which is what happened twice. x.com, Notion, Outlook and YouTube workers in the
+  same profile are fine. Why Gmail's cannot start was not found (not the size of the store,
+  not storage, not the network). `mail.google.com` pages get a script that unregisters
+  workers and deletes `navigator.serviceWorker`, and the first run clears Gmail's
+  registration once, and no other site's (`Storage.clearDataForOrigin` for
+  `https://mail.google.com`, `service_workers` only; `service-workers-reset` marker in the
+  data folder). Not yet confirmed in the real browser with the shipped build as of writing:
+  what was measured live is Gmail loading with its registration removed by hand. A symptom that
+  looks like this on another site: `navigator.serviceWorker.controller` is set and every
+  fetch from that page hangs while the same fetch from another tab is instant.
+- The tab strip is the title bar. The system one is removed by `WM_NCCALCSIZE` in
+  `MainForm.WndProc` (the client area starts at the window's top edge; a maximised window
+  is pushed back on screen by the frame thickness, `WindowFrame.ClientTop`), and the strip
+  draws minimise, maximise and close itself. Dragging, double clicking and the top
+  resize edge are answered through `WM_NCHITTEST`: the strip returns `HTTRANSPARENT` for
+  bare strip and the top few pixels so the window decides (`MainForm.FrameHit`).
+  Windows 10 here, so there is no snap layout flyout on the maximise button. Taking the
+  title bar out of the client area breaks WinForms' memory of the window's size, and this
+  was only found by running a real window (a throwaway form on a hidden desktop, whose
+  geometry was measured; nothing in the code reads wrong): WinForms keeps a restore size as a
+  client size and converts it back by adding the frame a window with a title bar would have,
+  so every maximise and restore, and every fullscreen page and back, made the window one
+  title bar taller (31px at 96 dpi, adding up). `MainForm.WndProc` handles
+  `WM_WINDOWPOSCHANGED` and puts the window back where the system restored it
+  (`WindowFrame.IsComingBack`, which is tracked rather than read off the form, because a
+  form told to restore already says it has), and `SetPageFullScreen` gives back the bounds
+  it took the window from. The window buttons do not `ClaimForPerson`, as the system ones
+  never did: a claimed agent window's tabs are saved as the person's session, and closing
+  one that was claimed would write the agent's tabs over theirs.
+- Page fullscreen (a video) takes the whole window, chrome included, and was a trap: Esc
+  only worked if the page had the keyboard, and a page leaving fullscreen while another tab
+  was in front was ignored, so the window stayed without its strip and toolbar. Script run
+  through the engine counts as the person's click for a fullscreen request, so one
+  agent `/click` on a player's fullscreen button turned an agent's own window borderless and
+  maximised across the whole monitor (reproduced 2026-11-02). Now: `SyncPageFullScreen`
+  works it out from the tab in front on every change; Esc and F11 leave it from anywhere
+  (`ExitPageFullScreen`); an agent's window never goes fullscreen, and neither does a page an
+  agent ran script in during the last ten seconds (`Tab.NoteAgentAction`). Those reasons are
+  judged once, when the page asks, and the answer is kept on the tab (`FullScreenVerdict`,
+  `FullScreenPolicy.Judge`) until the page leaves fullscreen: judged again on every redraw,
+  a refusal lapsed with the ten seconds and the window took the screen late, the same bug
+  delayed. A person's genuine fullscreen is refused if an agent used that tab in the ten
+  seconds before; the page then sits "fullscreen" inside the window's own area and Esc and
+  asking again later work as usual. Leaving fullscreen from a maximised window was measured
+  to return to exactly the same geometry, so it does not go through Normal first. A refusal
+  in the person's own window says so in the status line. Tested: the policy as a pure
+  function over whole histories; the MainForm wiring around it (and the restore hook) has
+  only source checks, and the window behaviour was measured on the throwaway form, not on
+  MainForm itself.
 
 Agent actions are visualized: /click and /type animate a blue cursor to the
 target, ripple, and flash the element, so the user can watch the agent work.

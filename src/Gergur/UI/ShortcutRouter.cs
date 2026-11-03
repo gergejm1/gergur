@@ -30,6 +30,12 @@ public sealed class ShortcutRouter
         // KeyDown handlers run, and some of its APIs throw if called inline here.
         switch (keyData)
         {
+            // The way out of a page that has taken the whole window. Only then, so Esc keeps
+            // meaning what it means in the address bar, the find bar and the page. Either key,
+            // and from wherever the keyboard is: with the chrome hidden there is nothing to click.
+            case Keys.Escape or Keys.F11 when _form.IsPageFullScreen:
+                Post(_form.ExitPageFullScreen);
+                return true;
             case Keys.Control | Keys.T:
                 Post(() => _form.NewTabAsync());
                 return true;

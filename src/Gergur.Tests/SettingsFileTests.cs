@@ -30,6 +30,21 @@ public sealed class SettingsFileTests : IDisposable
     private string Path_(string name) => Path.Combine(_dir, name);
 
     [Fact]
+    public void AFileStillHoldingTheRemovedSleepSettingsLoadsWithTheRest()
+    {
+        // The sleep timers and the memory pressure toggle used to be saved here. A file from
+        // before they went must keep its other values, not fall back to defaults and have
+        // them written over the pairing key.
+        string path = Path_("old-keys.json");
+        File.WriteAllText(path, "{ \"SuspendAfterMinutes\": 3, \"DiscardAfterMinutes\": 15, \"SleepAllWhenBackgroundedMinutes\": 1, \"InactiveMemoryPressure\": true, \"DropKey\": \"B6717A67D71A9FFBF9D2E284\", \"BlocklistEnabled\": false }");
+
+        var loaded = Settings.Load(path);
+
+        Assert.Equal("B6717A67D71A9FFBF9D2E284", loaded.DropKey);
+        Assert.False(loaded.BlocklistEnabled);
+    }
+
+    [Fact]
     public void AFirstEverLaunchCreatesItsDirectory()
     {
         // The whole point, and the case every other test here hid: they make the
@@ -162,7 +177,7 @@ public sealed class SettingsFileTests : IDisposable
             DropKey = "B6717A67D71A9FFBF9D2E284",
             VpnProfile = "Cloudflare WARP",
             BlocklistEnabled = true,
-            SuspendAfterMinutes = 3,
+            V8ScavengerMaxMb = 3,
         };
 
         original.Save(path);
@@ -171,7 +186,7 @@ public sealed class SettingsFileTests : IDisposable
         Assert.Equal("B6717A67D71A9FFBF9D2E284", back.DropKey);
         Assert.Equal("Cloudflare WARP", back.VpnProfile);
         Assert.True(back.BlocklistEnabled);
-        Assert.Equal(3, back.SuspendAfterMinutes);
+        Assert.Equal(3, back.V8ScavengerMaxMb);
     }
 
     [Fact]

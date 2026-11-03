@@ -34,13 +34,29 @@ public sealed class TabManager
     {
         var tab = new Tab(this);
         RegisterTab(tab);
+        string urlAtStart = tab.Url;
         if (activate)
             await ActivateAsync(tab);
-        if (!string.IsNullOrEmpty(url))
+        // Decided here, after the build, on the UI thread: a navigation asked for during it is
+        // either already applied (Url moved) or still held (DeferredNavigation), and either way
+        // it is the person's and the home page must not follow it. This relies on that being
+        // true at this point, which it is while both continuations run on the UI thread.
+        if (!string.IsNullOrEmpty(url) && ShouldOpenInitialUrl(urlAtStart, tab.Url, tab.DeferredNavigation))
             await tab.NavigateAsync(url);
         RaiseChanged();
         return tab;
     }
+
+    /// <summary>
+    /// Whether a new tab is still to be sent where it was made for. Not when the person typed
+    /// somewhere while its view was being built: its address bar takes the keyboard at once now,
+    /// and the home page navigation that followed the build then overwrote what they had asked for.
+    /// </summary>
+    /// <param name="urlAtStart">The tab's address when it was made.</param>
+    /// <param name="urlNow">Its address after the wait.</param>
+    /// <param name="pendingNavigation">A navigation asked for during the build and not yet applied.</param>
+    internal static bool ShouldOpenInitialUrl(string urlAtStart, string urlNow, string? pendingNavigation)
+        => pendingNavigation is null && urlNow == urlAtStart;
 
     /// <summary>Restored session tab: stays a Discarded snapshot (zero processes) until clicked.</summary>
     public Tab AddSnapshotTab(TabSnapshot snapshot)
@@ -151,6 +167,11 @@ public sealed class TabManager
         var previous = ActiveTab;
         ActiveTab = tab;
         Diagnostics.Breadcrumbs.Note($"switching from {previous?.Id ?? "none"} to {tab.Id}");
+        // Said now, not when the tab has been built. The strip and the address bar follow the
+        // active tab, and a new tab or a discarded one takes seconds to get a view on a busy
+        // machine: until then the address bar kept showing the tab before, and the new tab
+        // looked like it had inherited its address.
+        RaiseChanged();
         await tab.ActivateAsync(); // show new first, then hide old: no blank flash
         if (ActiveTab == tab)
         {

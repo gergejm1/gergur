@@ -47,15 +47,15 @@ public sealed class SettingsPatchTests
     [Fact]
     public void AppliedValuesLandOnTheSettings()
     {
-        var settings = new Settings { BlocklistEnabled = true, SuspendAfterMinutes = 3 };
+        var settings = new Settings { BlocklistEnabled = true, V8ScavengerMaxMb = 3 };
 
-        var result = Apply(settings, """{ "BlocklistEnabled": false, "SuspendAfterMinutes": 9 }""");
+        var result = Apply(settings, """{ "BlocklistEnabled": false, "V8ScavengerMaxMb": 9 }""");
 
         Assert.Null(result.Error);
         Assert.False(settings.BlocklistEnabled);
-        Assert.Equal(9, settings.SuspendAfterMinutes);
+        Assert.Equal(9, settings.V8ScavengerMaxMb);
         Assert.Contains(nameof(Settings.BlocklistEnabled), result.Applied);
-        Assert.Contains(nameof(Settings.SuspendAfterMinutes), result.Applied);
+        Assert.Contains(nameof(Settings.V8ScavengerMaxMb), result.Applied);
     }
 
     [Fact]
@@ -70,6 +70,19 @@ public sealed class SettingsPatchTests
 
         Assert.Contains(nameof(Settings.ProcessPerSite), result.Restart);
         Assert.DoesNotContain(nameof(Settings.BlocklistEnabled), result.Restart);
+    }
+
+    [Fact]
+    public void ARemovedSleepSettingIsReportedUnknownNotRefused()
+    {
+        var settings = new Settings();
+
+        var result = Apply(settings, """{ "SuspendAfterMinutes": 5, "InactiveMemoryPressure": false }""");
+
+        Assert.Null(result.Error);
+        Assert.Contains("SuspendAfterMinutes", result.Unknown);
+        Assert.Contains("InactiveMemoryPressure", result.Unknown);
+        Assert.Empty(result.Applied);
     }
 
     [Fact]
@@ -89,21 +102,21 @@ public sealed class SettingsPatchTests
     {
         // Half a settings change is harder to reason about than none, so the caller gets
         // the request back rather than a browser in a state neither side expected.
-        var settings = new Settings { BlocklistEnabled = true, SuspendAfterMinutes = 3 };
+        var settings = new Settings { BlocklistEnabled = true, V8ScavengerMaxMb = 3 };
 
-        var result = Apply(settings, """{ "BlocklistEnabled": false, "SuspendAfterMinutes": "soon" }""");
+        var result = Apply(settings, """{ "BlocklistEnabled": false, "V8ScavengerMaxMb": "soon" }""");
 
         Assert.NotNull(result.Error);
-        Assert.Contains("SuspendAfterMinutes", result.Error);
+        Assert.Contains("V8ScavengerMaxMb", result.Error);
         Assert.True(settings.BlocklistEnabled);
-        Assert.Equal(3, settings.SuspendAfterMinutes);
+        Assert.Equal(3, settings.V8ScavengerMaxMb);
         Assert.Empty(result.Applied);
     }
 
     [Theory]
     [InlineData("""{ "BlocklistEnabled": "yes" }""")]
     [InlineData("""{ "BlocklistEnabled": 1 }""")]
-    [InlineData("""{ "SuspendAfterMinutes": 1.5 }""")]
+    [InlineData("""{ "V8ScavengerMaxMb": 1.5 }""")]
     [InlineData("""{ "SearchUrlTemplate": 3 }""")]
     public void EachTypeIsCheckedRatherThanCoerced(string json)
     {
@@ -127,12 +140,12 @@ public sealed class SettingsPatchTests
         bool existed = File.Exists(path);
         string? before = existed ? File.ReadAllText(path) : null;
 
-        var settings = new Settings { BlocklistEnabled = true, SuspendAfterMinutes = 3 };
-        var result = Apply(settings, """{ "BlocklistEnabled": false, "SuspendAfterMinutes": 9 }""");
+        var settings = new Settings { BlocklistEnabled = true, V8ScavengerMaxMb = 3 };
+        var result = Apply(settings, """{ "BlocklistEnabled": false, "V8ScavengerMaxMb": 9 }""");
 
         Assert.Null(result.Error);
         Assert.False(settings.BlocklistEnabled);          // applied, in memory
-        Assert.Equal(9, settings.SuspendAfterMinutes);
+        Assert.Equal(9, settings.V8ScavengerMaxMb);
 
         Assert.Equal(existed, File.Exists(path));
         if (existed)
@@ -247,7 +260,6 @@ public sealed class SettingsPatchTests
     }
 
     [Theory]
-    [InlineData("""{ "SuspendAfterMinutes": -5 }""")]
     [InlineData("""{ "V8ScavengerMaxMb": -1 }""")]
     public void ANumberOutsideItsRangeIsRefused(string json)
     {
@@ -273,7 +285,7 @@ public sealed class SettingsPatchTests
     [Theory]
     [InlineData("""{ "TrackingPrevention": "Balanced" }""")]
     [InlineData("""{ "PageTheme": "Dark" }""")]
-    [InlineData("""{ "SuspendAfterMinutes": 1 }""")]
+    [InlineData("""{ "V8ScavengerMaxMb": 1 }""")]
     public void AValueInsideItsRangeStillApplies(string json)
     {
         // The refusals must not be so eager that the ordinary case stops working.
@@ -312,88 +324,6 @@ public sealed class SettingsPatchTests
                     $"{name} looks like a credential but GET /settings would hand it out");
             }
         }
-    }
-
-    [Fact]
-    public void ATabCannotBeSetToDiscardBeforeItSleeps()
-    {
-        // Each value is fine on its own, which is why a per-field check cannot catch it.
-        // Together they skip the cheap half of the memory policy entirely, and nothing
-        // downstream would report it as anything but tabs behaving oddly.
-        var settings = new Settings { SuspendAfterMinutes = 3, DiscardAfterMinutes = 15 };
-
-        var result = Apply(settings, """{ "DiscardAfterMinutes": 2 }""");
-
-        Assert.NotNull(result.Error);
-        Assert.Contains(nameof(Settings.DiscardAfterMinutes), result.Error);
-        Assert.Equal(15, settings.DiscardAfterMinutes);
-    }
-
-    [Fact]
-    public void RaisingTheSleepTimerPastTheDiscardTimerIsRefusedToo()
-    {
-        // The same pair from the other side.
-        var settings = new Settings { SuspendAfterMinutes = 3, DiscardAfterMinutes = 15 };
-
-        var result = Apply(settings, """{ "SuspendAfterMinutes": 20 }""");
-
-        Assert.NotNull(result.Error);
-        Assert.Equal(3, settings.SuspendAfterMinutes);
-    }
-
-    [Fact]
-    public void EqualTimersAreRefusedToo()
-    {
-        // The boundary the message names ("has to be more than"). With < instead of <=
-        // this passes and a tab is discarded on the same tick it is suspended.
-        var settings = new Settings { SuspendAfterMinutes = 3, DiscardAfterMinutes = 15 };
-
-        var result = Apply(settings, """{ "SuspendAfterMinutes": 5, "DiscardAfterMinutes": 5 }""");
-
-        Assert.NotNull(result.Error);
-        Assert.Equal(3, settings.SuspendAfterMinutes);
-    }
-
-    [Fact]
-    public void APatchAboutSomethingElseIsNotRefusedForAPairItDoesNotTouch()
-    {
-        // A settings file can already hold a bad pair, because the settings window does
-        // not check it. Judging the pair on the whole resulting state made every unrelated
-        // patch fail on it: turning the blocklist off came back as a complaint about
-        // DiscardAfterMinutes.
-        var settings = new Settings { SuspendAfterMinutes = 20, DiscardAfterMinutes = 5 };
-
-        var result = Apply(settings, """{ "BlocklistEnabled": false }""");
-
-        Assert.Null(result.Error);
-        Assert.False(settings.BlocklistEnabled);
-    }
-
-    [Fact]
-    public void AnUnknownNameIsStillReportedWhenTheTimersAreAlreadyWrong()
-    {
-        // The same state used to turn "that name means nothing" into a complaint about a
-        // pair the caller never mentioned.
-        var settings = new Settings { SuspendAfterMinutes = 20, DiscardAfterMinutes = 5 };
-
-        var result = Apply(settings, """{ "NoSuchSetting": 1 }""");
-
-        Assert.Null(result.Error);
-        Assert.Contains("NoSuchSetting", result.Unknown);
-    }
-
-    [Fact]
-    public void MovingBothTogetherIsFine()
-    {
-        // The pair has to be judged on what the patch would leave behind, not on what is
-        // there now, or changing both at once would be refused for a state that never exists.
-        var settings = new Settings { SuspendAfterMinutes = 3, DiscardAfterMinutes = 15 };
-
-        var result = Apply(settings, """{ "SuspendAfterMinutes": 20, "DiscardAfterMinutes": 60 }""");
-
-        Assert.Null(result.Error);
-        Assert.Equal(20, settings.SuspendAfterMinutes);
-        Assert.Equal(60, settings.DiscardAfterMinutes);
     }
 
     [Fact]

@@ -123,7 +123,7 @@ public sealed class TabLoadStateTests
 }
 
 /// <summary>
-/// Whether the lifecycle policy is allowed to freeze this tab. A read in flight must not
+/// Whether this tab may be frozen. A read in flight must not
 /// be, or a script that was about to settle simply never settles, intermittently, and
 /// reads as a broken page. But a read that can never finish must not pin a renderer awake
 /// for the life of the process either, in a browser whose whole point is frugality.
@@ -225,7 +225,7 @@ public sealed class TabReadCounterTests
     [Fact]
     public void AReadMarksTheTabAsRecentlyUsed()
     {
-        // Otherwise the lifecycle tick sees a tab whose last activity is however long ago
+        // Otherwise a tab is seen whose last activity is however long ago
         // it was parked and freezes it again underneath the request that just woke it.
         var tab = Bare();
         var before = tab.LastActiveUtc;

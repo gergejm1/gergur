@@ -89,13 +89,10 @@ internal static class SettingsPatch
     /// <summary>
     /// What a number setting may be. A type check alone lets through a port of 0, which
     /// persists and locks this API out of itself until somebody hand-edits the json, and
-    /// a sleep timer of -5, which is not a state any part of this was written for.
+    /// a scavenger size of -5, which is not a state any part of this was written for.
     /// </summary>
     private static readonly Dictionary<string, (int Low, int High)> Range = new(StringComparer.Ordinal)
     {
-        [nameof(Settings.SuspendAfterMinutes)] = (1, 1440),
-        [nameof(Settings.DiscardAfterMinutes)] = (2, 1440),
-        [nameof(Settings.SleepAllWhenBackgroundedMinutes)] = (0, 1440),
         [nameof(Settings.V8ScavengerMaxMb)] = (0, 4096),
     };
 
@@ -174,16 +171,6 @@ internal static class SettingsPatch
         foreach (var (property, value) in pending)
             property.SetValue(proposed, value);
 
-        // Only when this patch actually moves one of them. Judging the pair on the whole
-        // resulting state meant a settings file that already held a bad pair, which the
-        // settings window can still produce, made every unrelated patch fail: turning the
-        // blocklist off came back as a complaint about DiscardAfterMinutes, and an unknown
-        // name came back as that instead of being reported as unknown.
-        bool touchesTimers = pending.Any(p =>
-            p.Property.Name is nameof(Settings.SuspendAfterMinutes) or nameof(Settings.DiscardAfterMinutes));
-        if (touchesTimers && RefuseTogether(proposed) is { } together)
-            return together;
-
         foreach (var (property, value) in pending)
         {
             property.SetValue(settings, value);
@@ -208,20 +195,6 @@ internal static class SettingsPatch
 
         return null;
     }
-
-    /// <summary>
-    /// Refusals that need more than one value to judge.
-    ///
-    /// Each setting is checked on its own above, which cannot catch a pair that is fine
-    /// apart and nonsense together: discarding a tab before it has ever been suspended
-    /// skips the cheap half of the memory policy entirely, and nothing downstream would
-    /// report it as anything other than tabs behaving oddly.
-    /// </summary>
-    private static string? RefuseTogether(Settings settings)
-        => settings.DiscardAfterMinutes <= settings.SuspendAfterMinutes
-            ? $"{nameof(Settings.DiscardAfterMinutes)} has to be more than "
-                + $"{nameof(Settings.SuspendAfterMinutes)}, or a tab is discarded before it ever sleeps"
-            : null;
 
     private static object? Read(JsonElement value, Type type)
     {

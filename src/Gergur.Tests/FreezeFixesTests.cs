@@ -275,7 +275,7 @@ public sealed class FreezeFixesTests
         Assert.True(built >= 0 && guard > built && shown > guard,
             "the check that this is still the active tab must come after the wait and before the view is shown");
         Assert.Matches(@"manager\.ActiveTab != this\)\s*\{[\s\S]*?return;\s*\}", activate);
-        // Built just now, so not due to sleep on the timestamp it had before it was discarded.
+        // Built just now, so its activity time is not the one it had before it was discarded.
         Assert.Matches(@"manager\.ActiveTab != this\)\s*\{[\s\S]*?LastActiveUtc = DateTime\.UtcNow;[\s\S]*?return;", activate);
     }
 

@@ -44,6 +44,30 @@ public sealed class TabStripControl : Control
     /// <summary>Raised when any drag ends, so stale drop indicators can be cleared.</summary>
     public event EventHandler? TabDragEnded;
 
+    /// <summary>The window's own buttons, which this strip draws now that the system title bar is gone.</summary>
+    public event EventHandler? MinimizeClicked;
+    public event EventHandler? MaximizeClicked;
+    public event EventHandler? CloseWindowClicked;
+
+    private WindowButton _captionHover;
+    private WindowButton _captionPressed;
+    private bool _windowMaximized;
+
+    /// <summary>Whether the window is maximised, which decides if the middle button reads "maximise" or "restore".</summary>
+    [System.ComponentModel.Browsable(false)]
+    [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
+    public bool WindowMaximized
+    {
+        get => _windowMaximized;
+        set
+        {
+            if (_windowMaximized == value)
+                return;
+            _windowMaximized = value;
+            Invalidate();
+        }
+    }
+
     /// <summary>
     /// Asked, with a screen point, whether that point is over another window's tab strip.
     ///
@@ -117,7 +141,8 @@ public sealed class TabStripControl : Control
         int tabHeight = Height - y;
 
         int count = tabs?.Count ?? 0;
-        int available = Width - newTabSize - margin * 3;
+        // Stops short of the window buttons, and leaves a gap before them to take hold of.
+        int available = Width - newTabSize - margin * 3 - CaptionReserved();
         int tabWidth = count == 0 ? 0 : Math.Clamp(available / count, S(MinTabWidth), S(MaxTabWidth));
 
         int x = margin;
@@ -165,6 +190,117 @@ public sealed class TabStripControl : Control
             using var pen = new Pen(Theme.Accent, S(3));
             g.DrawLine(pen, barX, y, barX, y + tabHeight);
         }
+
+        DrawCaptionButtons(g);
+    }
+
+    private int CaptionReserved()
+        => CaptionButtons.Reserved(S(CaptionButtons.WidthAt96), S(CaptionButtons.GrabGapAt96));
+
+    private Rectangle[] CaptionLayout()
+        => CaptionButtons.Layout(Width, S(CaptionButtons.WidthAt96), S(CaptionButtons.HeightAt96));
+
+    private WindowButton CaptionAt(Point location) => CaptionButtons.HitTest(CaptionLayout(), location);
+
+    /// <summary>The close button's fill under the pointer: the red Windows uses for it, which is what a person expects there.</summary>
+    internal static readonly Color CaptionCloseHover = Color.FromArgb(232, 17, 35);
+    internal static readonly Color CaptionClosePressed = Color.FromArgb(241, 112, 122);
+
+    private void DrawCaptionButtons(Graphics g)
+    {
+        var rects = CaptionLayout();
+        WindowButton[] kinds = [WindowButton.Minimize, WindowButton.Maximize, WindowButton.Close];
+        var smoothing = g.SmoothingMode;
+        // Straight lines of one pixel: antialiased they land between pixels and go grey.
+        g.SmoothingMode = SmoothingMode.None;
+        for (int i = 0; i < kinds.Length; i++)
+        {
+            bool hover = _captionHover == kinds[i];
+            bool pressed = hover && _captionPressed == kinds[i];
+            if (hover)
+            {
+                Color fill = kinds[i] == WindowButton.Close
+                    ? (pressed ? CaptionClosePressed : CaptionCloseHover)
+                    : (pressed ? Theme.TabActive : Theme.TabHover);
+                using var brush = new SolidBrush(fill);
+                g.FillRectangle(brush, rects[i]);
+            }
+            DrawCaptionGlyph(g, kinds[i], rects[i], hover && kinds[i] == WindowButton.Close ? Color.White : Theme.Text);
+        }
+        g.SmoothingMode = smoothing;
+    }
+
+    private void DrawCaptionGlyph(Graphics g, WindowButton kind, Rectangle rect, Color color)
+    {
+        using var pen = new Pen(color, Math.Max(1f, S(1)));
+        int size = S(10);
+        int half = size / 2;
+        int cx = rect.Left + rect.Width / 2;
+        int cy = rect.Top + rect.Height / 2;
+        switch (kind)
+        {
+            case WindowButton.Minimize:
+                g.DrawLine(pen, cx - half, cy, cx + half, cy);
+                break;
+            case WindowButton.Maximize when !_windowMaximized:
+                g.DrawRectangle(pen, cx - half, cy - half, size, size);
+                break;
+            case WindowButton.Maximize:
+            {
+                // Two squares, the front one lower and to the left, with the back one showing
+                // only the two edges that stick out past it.
+                int side = size - S(2);
+                int lift = S(2);
+                var front = new Rectangle(cx - half, cy - half + lift, side, side);
+                var back = new Rectangle(front.Left + lift, front.Top - lift, side, side);
+                g.DrawRectangle(pen, front);
+                g.DrawLine(pen, back.Left, back.Top, back.Right, back.Top);
+                g.DrawLine(pen, back.Left, back.Top, back.Left, front.Top);
+                g.DrawLine(pen, back.Right, back.Top, back.Right, back.Bottom);
+                g.DrawLine(pen, front.Right, back.Bottom, back.Right, back.Bottom);
+                break;
+            }
+            case WindowButton.Close:
+                g.DrawLine(pen, cx - half, cy - half, cx + half, cy + half);
+                g.DrawLine(pen, cx + half, cy - half, cx - half, cy + half);
+                break;
+        }
+    }
+
+    /// <summary>
+    /// Whether this point is bare strip: not a tab, not the "+", not a window button.
+    /// Dragging it moves the window and double clicking it maximises, as the title bar did,
+    /// which is why the window asks. Anything that is clickable has to answer false, or the
+    /// click would start a window drag instead.
+    /// </summary>
+    internal bool IsCaptionArea(Point location)
+    {
+        if (!ClientRectangle.Contains(location))
+            return false;
+        if (_newTabRect.Contains(location))
+            return false;
+        if (HitTestTab(location) >= 0)
+            return false;
+        return CaptionAt(location) == WindowButton.None;
+    }
+
+    /// <summary>
+    /// Lets the window answer where the pointer is over the top edge or bare strip, which is
+    /// what makes them resize and drag. A child's own hit test would otherwise say "client"
+    /// for all of it and the window would never be asked.
+    /// </summary>
+    protected override void WndProc(ref Message m)
+    {
+        if (m.Msg == WindowFrame.WM_NCHITTEST && FindForm() is MainForm form)
+        {
+            var inForm = form.PointToClient(WindowFrame.PointFrom(m.LParam));
+            if (form.FrameHit(WindowFrame.HTCLIENT, inForm) != WindowFrame.HTCLIENT)
+            {
+                m.Result = (IntPtr)WindowFrame.HTTRANSPARENT;
+                return;
+            }
+        }
+        base.WndProc(ref m);
     }
 
     /// <summary>
@@ -348,6 +484,13 @@ public sealed class TabStripControl : Control
             }
         }
 
+        var caption = CaptionAt(e.Location);
+        if (caption != _captionHover)
+        {
+            _captionHover = caption;
+            Invalidate();
+        }
+
         int newHover = HitTestTab(e.Location);
         bool newHoverClose = newHover >= 0 && newHover < _closeRects.Count && _closeRects[newHover].Contains(e.Location);
         bool newHoverNewTab = _newTabRect.Contains(e.Location);
@@ -366,12 +509,22 @@ public sealed class TabStripControl : Control
         base.OnMouseLeave(e);
         _hoverIndex = -1;
         _hoverClose = _hoverNewTab = false;
+        _captionHover = WindowButton.None;
         Invalidate();
     }
 
     protected override void OnMouseDown(MouseEventArgs e)
     {
         base.OnMouseDown(e);
+
+        // The window's buttons first, and whether or not there are tabs to bind to.
+        if (e.Button == MouseButtons.Left && CaptionAt(e.Location) is var button and not WindowButton.None)
+        {
+            _captionPressed = button;
+            Invalidate();
+            return;
+        }
+
         var tabs = _tabs?.Tabs;
         if (tabs is null)
             return;
@@ -410,6 +563,32 @@ public sealed class TabStripControl : Control
     protected override void OnMouseUp(MouseEventArgs e)
     {
         base.OnMouseUp(e);
+
+        // A button acts on release, over the one it went down on: pressing it and sliding
+        // off is how a click is taken back.
+        if (e.Button == MouseButtons.Left && _captionPressed != WindowButton.None)
+        {
+            var pressed = _captionPressed;
+            _captionPressed = WindowButton.None;
+            Invalidate();
+            if (CaptionAt(e.Location) == pressed)
+            {
+                switch (pressed)
+                {
+                    case WindowButton.Minimize:
+                        MinimizeClicked?.Invoke(this, EventArgs.Empty);
+                        break;
+                    case WindowButton.Maximize:
+                        MaximizeClicked?.Invoke(this, EventArgs.Empty);
+                        break;
+                    case WindowButton.Close:
+                        CloseWindowClicked?.Invoke(this, EventArgs.Empty);
+                        break;
+                }
+            }
+            return;
+        }
+
         var tabs = _tabs?.Tabs;
         try
         {

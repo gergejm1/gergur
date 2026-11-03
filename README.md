@@ -1,43 +1,29 @@
-﻿# Gergur
+# Gergur
 
-A personal, memory-frugal browser for Windows 11. A tiny WinForms shell over
-WebView2 (the Edge engine already installed with Windows - nothing bundled),
-with an aggressive tab-lifecycle policy that mainstream browsers won't ship:
+A personal browser for Windows 11. A tiny WinForms shell over
+WebView2 (the Edge engine already installed with Windows - nothing bundled):
 
 ![Gergur home page](docs/home.png)
 
-## Benchmark
+## Memory
 
-Same six tabs (Wikipedia, GitHub, Hacker News, Stack Overflow, The Verge,
-example.com), clean profiles for all three browsers, measured as the sum of
-private bytes across each browser's entire process tree:
-
-| | Chrome | Edge | Firefox | Gergur |
-|---|---|---|---|---|
-| All six tabs freshly loaded | 2,835 MB | 1,039 MB | 1,925 MB | 988 MB |
-| A few minutes later | 1,875 MB | 1,031 MB | 1,891 MB | **374 MB** |
-
-Chrome, Edge, and Firefox all keep every renderer alive indefinitely. Gergur
-converges to a single live renderer: background tabs first freeze, then park to
-zero-process snapshots that reload on click. Firefox (Gecko engine) settles the
-heaviest of the mainstream three; Gergur uses roughly 5x less than all of them.
+Tabs are never put to sleep or thrown away on a timer. They used to be (frozen after
+3 minutes idle, discarded after 15, everything frozen after a minute minimized) and
+that cost more than it saved: pages such as Gmail lagged when you came back to them.
+The benchmark that was here measured that policy and no longer describes this
+browser. A tab is discarded now only when its page has stopped answering, and tabs restored at startup come back unloaded until you click them.
 
 ## How
 
-- **Active** → the one visible tab, fully alive.
-- **Hidden** → background tab, still live.
-- **Suspended** (after 3 min idle) → page frozen via `TrySuspendAsync`, renderer
-  memory trimmed. Tabs playing audio are exempt (they get low-memory mode instead).
-- **Discarded** (after 15 min idle) → the WebView is destroyed entirely; the tab
-  keeps only its URL/title/favicon and holds **zero** engine processes until clicked.
-  The selected tab is never discarded, so its exact state always survives.
+- **Active** -> the one visible tab, fully alive.
+- **Hidden** -> background tab, still live.
+- **Discarded** -> only a page that stopped responding: its WebView is rebuilt
+  and the tab keeps its URL, title and favicon.
 
-When the window is minimized or the PC is locked for a minute, everything sleeps,
-active tab included; restoring the window wakes it instantly. The engine also runs
-with the spare-renderer process disabled and memory pressure simulated on hidden
-views (`DisableSpareRenderer` / `InactiveMemoryPressure` toggles in settings).
+The engine runs with the spare-renderer process disabled (DisableSpareRenderer toggle
+in settings).
 
-Sleeping tabs show a ☾ in the tab strip. The status bar shows live engine memory,
+A discarded tab shows a ☾ in the tab strip. The status bar shows live engine memory,
 renderer count, tabs asleep, and blocked-request count. New tabs open the Gërgur
 home page (`src/Gergur/Assets/`, generated from the logo, along with the G app icon). Session restore brings
 background tabs back as discarded snapshots, so startup cost is one renderer no
@@ -85,8 +71,7 @@ Merging a window's last tab away closes that window.
 The tab does not reload. Its live WebView is reparented rather than recreated, so
 scroll position, script state and half-typed forms survive the move. Every window
 shares one engine environment, one blocklist, one history and bookmark store, and
-one tunnel, so a second window costs a shell, not a browser: the memory policy
-still sees a single process group. Session restore brings every window back.
+one tunnel, so a second window costs a shell, not a browser: there is still one engine. Session restore brings every window back.
 
 ## Browser-only VPN
 
@@ -140,13 +125,12 @@ dotnet test                              # unit tests (policy engine, blocklist,
 
 ## Data & settings
 
-Everything lives in `%LOCALAPPDATA%\Gergur`: `settings.json` (suspend/discard
-timers, search engine, browser flags), `blocklist.txt`, `bookmarks.json`,
+Everything lives in `%LOCALAPPDATA%\Gergur`: `settings.json` (search engine, browser flags), `blocklist.txt`, `bookmarks.json`,
 `history.jsonl`, `session.json`, and the WebView2 profile. Also `agent-token.txt`,
 which since the MCP work is a long-lived credential rather than a per-launch one: it
 grants scripted access to every session this browser is logged into, so treat it as a
 password and never commit a client config containing it. The ≡ menu has
-"Sleep background tabs now", History, the browser task manager, and a memory-CSV
+History, the browser task manager, and a memory-CSV
 dump for A/B-testing flags. Set `GERGUR_DEBUG=1` for a trace log.
 
 Downloads (Ctrl+J) lists every download across every window, with progress drawn behind

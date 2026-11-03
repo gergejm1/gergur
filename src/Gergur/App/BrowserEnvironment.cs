@@ -56,7 +56,6 @@ public sealed class BrowserEnvironment
     internal static string BuildBrowserArguments(Settings settings)
     {
         var flags = new List<string>();
-        var enableFeatures = new List<string>();
         var disableFeatures = new List<string>();
         if (settings.ProcessPerSite)
             flags.Add("--process-per-site");
@@ -66,8 +65,6 @@ public sealed class BrowserEnvironment
             disableFeatures.Add("SpareRendererForSitePerProcess");
         if (settings.DisableFedCm)
             disableFeatures.Add("FedCm");
-        if (settings.InactiveMemoryPressure)
-            enableFeatures.Add("msWebView2SimulateMemoryPressureWhenInactive");
         if (settings.V8ScavengerMaxMb > 0)
             flags.Add($"--js-flags=--scavenger_max_new_space_capacity_mb={settings.V8ScavengerMaxMb}");
         if (settings.StartWithProxy)
@@ -114,8 +111,6 @@ public sealed class BrowserEnvironment
             flags.Add($"--host-resolver-rules=\"{string.Join(" , ", resolver)}\"");
         }
         // Chromium honors only one instance of each feature switch, so join lists.
-        if (enableFeatures.Count > 0)
-            flags.Add("--enable-features=" + string.Join(',', enableFeatures));
         if (disableFeatures.Count > 0)
             flags.Add("--disable-features=" + string.Join(',', disableFeatures));
         if (!string.IsNullOrWhiteSpace(settings.ExtraBrowserArguments))
@@ -144,6 +139,8 @@ public sealed class BrowserEnvironment
             _ = webView.Handle; // force HWND creation; init needs it even while the control is hidden
             await webView.EnsureCoreWebView2Async(Core);
             ApplyViewSettings(webView.CoreWebView2, Settings);
+            // Before the first page is asked for, once per run, and bounded: see SiteWorkarounds.
+            await SiteWorkarounds.ResetServiceWorkersOnceAsync(webView.CoreWebView2);
             return webView;
         }
         catch

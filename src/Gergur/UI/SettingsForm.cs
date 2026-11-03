@@ -166,10 +166,6 @@ public sealed class SettingsForm : Form
     /// string.Format throws on one that names an argument it was not given, the address
     /// bar calls it straight from the Enter key with nothing catching it, and a typo used
     /// to mean a crash dialog on every search that survived restarts.
-    ///
-    /// And the sleep timers, because this window is the one place a person types them
-    /// freely and was therefore the one place that could produce the pair the agent API
-    /// refuses outright.
     /// </summary>
     private string? Refusal()
     {
@@ -178,14 +174,6 @@ public sealed class SettingsForm : Form
                 + "search terms go, for example:"
                 + Environment.NewLine + Environment.NewLine
                 + UrlHeuristics.DefaultSearchUrlTemplate;
-
-        // The same pair rule the agent API enforces. Without it here, the one place a
-        // person can type these freely was the one place that could create the state the
-        // API calls impossible, and the timers apply to the live window now: the tab
-        // suspends and the very next tick discards it, losing the page.
-        if (_working.DiscardAfterMinutes <= _working.SuspendAfterMinutes)
-            return "Discard after has to be longer than Suspend after, or a tab is thrown "
-                + "away before it has ever been put to sleep.";
 
         return null;
     }

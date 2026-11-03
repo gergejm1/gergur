@@ -12,13 +12,13 @@ public sealed class SettingsTests
     [Fact]
     public void CloneIsDetachedFromTheOriginal()
     {
-        var live = new Settings { SuspendAfterMinutes = 3, SearchUrlTemplate = "https://a/{0}" };
+        var live = new Settings { V8ScavengerMaxMb = 3, SearchUrlTemplate = "https://a/{0}" };
         var working = live.Clone();
 
-        working.SuspendAfterMinutes = 99;
+        working.V8ScavengerMaxMb = 99;
         working.SearchUrlTemplate = "https://b/{0}";
 
-        Assert.Equal(3, live.SuspendAfterMinutes);
+        Assert.Equal(3, live.V8ScavengerMaxMb);
         Assert.Equal("https://a/{0}", live.SearchUrlTemplate);
     }
 
@@ -27,13 +27,13 @@ public sealed class SettingsTests
     {
         var live = new Settings();
         var working = live.Clone();
-        working.SuspendAfterMinutes = 42;
+        working.V8ScavengerMaxMb = 42;
         working.BlocklistEnabled = !live.BlocklistEnabled;
         working.VpnProfile = "Windscribe US";
 
         live.CopyFrom(working);
 
-        Assert.Equal(42, live.SuspendAfterMinutes);
+        Assert.Equal(42, live.V8ScavengerMaxMb);
         Assert.Equal(working.BlocklistEnabled, live.BlocklistEnabled);
         Assert.Equal("Windscribe US", live.VpnProfile);
     }
@@ -43,11 +43,11 @@ public sealed class SettingsTests
     {
         var live = new Settings();
         var working = live.Clone();
-        working.DiscardAfterMinutes = 30;
+        working.V8ScavengerMaxMb = 30;
 
         var changed = live.DifferencesFrom(working).ToList();
 
-        Assert.Equal([nameof(Settings.DiscardAfterMinutes)], changed);
+        Assert.Equal([nameof(Settings.V8ScavengerMaxMb)], changed);
     }
 
     [Fact]
@@ -63,7 +63,7 @@ public sealed class SettingsTests
         => Assert.Contains(name, Settings.RestartRequired);
 
     [Theory]
-    [InlineData(nameof(Settings.SuspendAfterMinutes))]
+    [InlineData(nameof(Settings.TrackingPrevention))]
     [InlineData(nameof(Settings.BlocklistEnabled))]
     [InlineData(nameof(Settings.SearchUrlTemplate))]
     public void SettingsThatApplyWithoutARestartAreNot(string name)

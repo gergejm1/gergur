@@ -8,25 +8,12 @@ namespace Gergur.App;
 public sealed class Settings
 {
     // Categories are ordered by the leading digit, which the settings window strips.
-    private const string Memory = "1 Memory policy";
     private const string Engine = "2 Engine (restart required)";
     private const string Browsing = "3 Browsing";
     private const string Privacy = "4 Privacy and blocking";
     private const string Vpn = "5 VPN";
     private const string Agent = "6 Agent API";
     private const string Phone = "7 Phone drop";
-
-    [Category(Memory), DisplayName("Suspend after (minutes)")]
-    [Description("Idle minutes before a background tab is frozen and its renderer memory trimmed. Tabs playing audio are exempt.")]
-    public int SuspendAfterMinutes { get; set; } = 3;
-
-    [Category(Memory), DisplayName("Discard after (minutes)")]
-    [Description("Idle minutes before a background tab's WebView is destroyed entirely. It keeps its url, title and favicon and holds zero engine processes until clicked. The selected tab is never discarded.")]
-    public int DiscardAfterMinutes { get; set; } = 15;
-
-    [Category(Memory), DisplayName("Sleep everything after (minutes backgrounded)")]
-    [Description("Minutes the window sits minimized, or the PC locked, before every tab sleeps including the active one.")]
-    public int SleepAllWhenBackgroundedMinutes { get; set; } = 1;
 
     // Browser-process flags. Undocumented for WebView2, so each one is a toggle;
     // changes apply only after the app (and the engine processes) fully exit.
@@ -41,10 +28,6 @@ public sealed class Settings
     [Category(Engine), DisplayName("Disable spare renderer")]
     [Description("Stops the engine keeping a warm standby renderer process around.")]
     public bool DisableSpareRenderer { get; set; } = true;
-
-    [Category(Engine), DisplayName("Inactive memory pressure")]
-    [Description("Makes hidden views behave as though the system were low on memory, so they release more.")]
-    public bool InactiveMemoryPressure { get; set; } = true;
 
     // Leave false. Google made FedCM mandatory for Sign in with Google in Aug 2025,
     // and WebView2 does render the FedCM account chooser correctly (verified), so
@@ -166,18 +149,13 @@ public sealed class Settings
     public static readonly IReadOnlySet<string> RestartRequired = new HashSet<string>
     {
         nameof(ProcessPerSite), nameof(DisableSiteIsolation), nameof(DisableSpareRenderer),
-        nameof(InactiveMemoryPressure), nameof(DisableFedCm), nameof(V8ScavengerMaxMb),
+        nameof(DisableFedCm), nameof(V8ScavengerMaxMb),
         nameof(ExtraBrowserArguments), nameof(VpnEnabled), nameof(VpnLocalPort),
         nameof(VpnBypassHosts), nameof(AgentServerEnabled), nameof(AgentServerPort),
         // DropPort only. The phone drop itself is turned on and off from the menu, which
         // starts and stops the listener there and then, so listing it here would tell you
         // to restart for something that already took effect.
         nameof(DropPort),
-        // The sleep timers are deliberately absent, and for a while they should have been
-        // here instead: a window read them once when it opened, so changing one did
-        // nothing until the next window. They are pushed into the live lifecycle manager
-        // now (MainForm.ApplyLiveSettings), which is what the dialog always implied by
-        // not listing them.
     };
 
     private static readonly JsonSerializerOptions JsonOptions = new()

@@ -22,7 +22,6 @@ public sealed class MainForm : Form
     private readonly TaskCompletionSource _ready = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     private AppSession? _session;
-    private TabLifecycleManager? _lifecycle;
     // Coalesces live updates to the browser's own pages. A download reports progress many
     // times a second, and each report would otherwise post the whole list to every
     // Downloads tab.
@@ -32,13 +31,13 @@ public sealed class MainForm : Form
     private DropForm? _dropWindow;
     private NotifyIcon? _tray;
     private bool _closing;
-    private bool _lifecycleTickRunning;
-    private bool _isMinimized;
-    private bool _isLocked;
-    private DateTime? _backgroundSinceUtc;
     private bool _isPageFullScreen;
     private FormWindowState _preFullScreenState;
     private FormBorderStyle _preFullScreenBorder;
+    private Rectangle _preFullScreenBounds;
+
+    /// <summary>Whether a page has the window to itself, chrome hidden.</summary>
+    internal bool IsPageFullScreen => _isPageFullScreen;
 
     public TabManager? Tabs { get; private set; }
 
@@ -78,7 +77,6 @@ public sealed class MainForm : Form
     private ToolStripStatusLabel _sleepLabel = null!;
     private ToolStripStatusLabel _blockedLabel = null!;
     private ContextMenuStrip _menu = null!;
-    private System.Windows.Forms.Timer _lifecycleTimer = null!;
     private System.Windows.Forms.Timer _statusTimer = null!;
 
     /// <summary>The first window: loads settings, brings up the shared services, restores the session.</summary>
@@ -215,6 +213,19 @@ public sealed class MainForm : Form
         _tabStrip.TabDragMoved += (_, screen) => UpdateDropIndicators(screen);
         _tabStrip.TabDragEnded += (_, _) => ClearDropIndicators();
         _tabStrip.IsOverAnotherStrip = screen => DropTargetAt(screen) is not null;
+        // The strip is the title bar now: it draws the window's buttons, and answers for
+        // dragging and double clicking the window through FrameHit.
+        //
+        // None of these claim the window for the person, because the system buttons never did
+        // and claiming is not harmless: a claimed window's tabs are saved as their session.
+        // Close an agent's window after claiming it, with no window of the person's left, and
+        // the agent's tabs would be written over theirs, the loss AppSession.SessionOf exists
+        // to prevent. Closed afterwards from a posted call, not from inside the strip's own
+        // mouse handler, which is about to be disposed with the window.
+        _tabStrip.MinimizeClicked += (_, _) => WindowState = FormWindowState.Minimized;
+        _tabStrip.MaximizeClicked += (_, _) =>
+            WindowState = WindowState == FormWindowState.Maximized ? FormWindowState.Normal : FormWindowState.Maximized;
+        _tabStrip.CloseWindowClicked += (_, _) => BeginInvoke(new Action(Close));
 
         _toolbar = new Panel { Dock = DockStyle.Top, Height = 46, BackColor = Theme.ToolbarBg };
         _backButton = MakeToolButton(Glyphs.Back, 8);
@@ -325,14 +336,6 @@ public sealed class MainForm : Form
         BuildMenu();
         LayoutToolbar();
 
-        _lifecycleTimer = new System.Windows.Forms.Timer { Interval = 30_000 };
-        _lifecycleTimer.Tick += async (_, _) =>
-        {
-            // Minimized/locked long enough: force-sleep everything, active tab included.
-            bool sleepAll = _backgroundSinceUtc is { } since
-                && DateTime.UtcNow - since >= TimeSpan.FromMinutes(Math.Max(1, _settings.SleepAllWhenBackgroundedMinutes));
-            await RunLifecycleTickAsync(forceSuspend: sleepAll);
-        };
         _statusTimer = new System.Windows.Forms.Timer { Interval = 5_000 };
         _statusTimer.Tick += (_, _) => UpdateStatus();
     }
@@ -480,6 +483,88 @@ public sealed class MainForm : Form
         LayoutToolbar();
     }
 
+    // ------------------------------------------------------------------ the frame
+
+    /// <summary>
+    /// Whether the system title bar has been taken away, which is every window with the
+    /// ordinary frame. A page going fullscreen swaps the frame for none at all, and then
+    /// there is nothing here to adjust.
+    /// </summary>
+    private bool HasCustomTitleBar => FormBorderStyle == FormBorderStyle.Sizable;
+
+    // Whether the window was maximised or minimised at its last position change: see
+    // WindowFrame.IsComingBack.
+    private bool _wasMaximizedOrMinimized;
+
+    protected override void WndProc(ref Message m)
+    {
+        if (m.Msg == WindowFrame.WM_NCCALCSIZE && m.WParam != IntPtr.Zero && HasCustomTitleBar)
+        {
+            // lParam points at the window rectangle the system proposes and gets the client
+            // area back, and the second int of it is the top edge. The system works out all
+            // four sides, title bar included. The top it works out is thrown away and the
+            // client area runs from the edge instead, so the tab strip is the first thing in
+            // the window and takes the title bar's place.
+            int proposedTop = System.Runtime.InteropServices.Marshal.ReadInt32(m.LParam, 4);
+            base.WndProc(ref m);
+            System.Runtime.InteropServices.Marshal.WriteInt32(m.LParam, 4,
+                WindowFrame.ClientTop(proposedTop, WindowFrame.IsZoomed(Handle), WindowFrame.FrameThickness(DeviceDpi)));
+            return;
+        }
+        if (m.Msg == WindowFrame.WM_NCHITTEST && HasCustomTitleBar)
+        {
+            base.WndProc(ref m);
+            m.Result = (IntPtr)FrameHit((int)m.Result, PointToClient(WindowFrame.PointFrom(m.LParam)));
+            return;
+        }
+        if (m.Msg == WindowFrame.WM_WINDOWPOSCHANGED)
+        {
+            // Whatever the border style: the system's own restore is right, and the form's
+            // arithmetic after it is not once the title bar has gone. See IsComingBack.
+            bool zoomed = WindowFrame.IsZoomed(Handle), iconic = WindowFrame.IsIconic(Handle);
+            bool comingBack = WindowFrame.IsComingBack(_wasMaximizedOrMinimized, zoomed, iconic);
+            var placed = comingBack ? WindowFrame.WindowRect(Handle) : Rectangle.Empty;
+            _wasMaximizedOrMinimized = zoomed || iconic;
+            base.WndProc(ref m);
+            if (comingBack && WindowState == FormWindowState.Normal && Bounds != placed)
+                Bounds = placed;
+            return;
+        }
+        base.WndProc(ref m);
+    }
+
+    /// <summary>
+    /// What a point in this window answers to a hit test, given what the system said.
+    ///
+    /// The top few pixels grab the window's edge for resizing, and bare strip grabs the
+    /// window itself: the two things the system title bar used to answer for. The strip
+    /// asks this too, because a child's own answer of "client" would stop the window ever
+    /// being asked.
+    /// </summary>
+    internal int FrameHit(int defaultHit, Point client)
+    {
+        if (!HasCustomTitleBar)
+            return defaultHit;
+
+        int edge = WindowFrame.TopEdgeHit(defaultHit, client, ClientSize.Width,
+            border: Scaled(5), corner: Scaled(16), canResize: WindowState != FormWindowState.Maximized);
+        if (edge != defaultHit)
+            return edge;
+
+        if (defaultHit == WindowFrame.HTCLIENT && _tabStrip.Visible && _tabStrip.Bounds.Contains(client)
+            && _tabStrip.IsCaptionArea(new Point(client.X - _tabStrip.Left, client.Y - _tabStrip.Top)))
+            return WindowFrame.HTCAPTION;
+        return defaultHit;
+    }
+
+    protected override void OnSizeChanged(EventArgs e)
+    {
+        base.OnSizeChanged(e);
+        // Null while the window is still being built, which resizes it before the strip exists.
+        if (_tabStrip is not null)
+            _tabStrip.WindowMaximized = WindowState == FormWindowState.Maximized;
+    }
+
     /// <summary>Scales a design-time pixel count to this window's dpi.</summary>
     private int Scaled(int atNinetySix) => (int)Math.Round(atNinetySix * DeviceDpi / 96.0);
 
@@ -587,13 +672,6 @@ public sealed class MainForm : Form
         _menu.Items.Add(new ToolStripMenuItem("Save as PDF…", null, async (_, _) => await SaveAsPdfAsync()));
         _menu.Items.Add(new ToolStripSeparator());
 
-        _menu.Items.Add(new ToolStripMenuItem("Sleep background tabs now", null, async (_, _) =>
-        {
-            await RunLifecycleTickAsync(forceSuspend: true);
-            UpdateStatus();
-            ShowMessage("Background tabs put to sleep.");
-        }));
-
         var blocker = _session?.Blocker;
         // "no host list" rather than a count, because the built-in path rules mean the
         // count is never zero now, and "5 rules" would read like a list had loaded.
@@ -675,12 +753,6 @@ public sealed class MainForm : Form
             Tabs.LastTabClosed += (_, _) => Close();
             _tabStrip.Bind(Tabs);
 
-            _lifecycle = new TabLifecycleManager(
-                TimeSpan.FromMinutes(Math.Max(1, _settings.SuspendAfterMinutes)),
-                TimeSpan.FromMinutes(Math.Max(2, _settings.DiscardAfterMinutes)));
-
-            Microsoft.Win32.SystemEvents.SessionSwitch += OnSessionSwitch;
-            _lifecycleTimer.Start();
             _statusTimer.Start();
             // Once for the app. A freeze leaves nothing in the log by itself; this writes what
             // the browser had last been doing when the window stops answering.
@@ -999,11 +1071,9 @@ public sealed class MainForm : Form
     protected override void OnFormClosing(FormClosingEventArgs e)
     {
         _closing = true;
-        Microsoft.Win32.SystemEvents.SessionSwitch -= OnSessionSwitch;
         // Saved before this window drops out of the list, so closing the last one
         // still records what it was holding.
         _session?.SaveSession();
-        _lifecycleTimer.Stop();
         _statusTimer.Stop();
         if (_tray is not null)
         {
@@ -1286,6 +1356,33 @@ public sealed class MainForm : Form
                 ShowMessage(Tab.CouldNotStartMessage(tab.NextBuildAttemptUtc, DateTime.UtcNow));
         };
         tab.PageLoaded += (_, _) => _session?.History.Append(tab.Url, tab.Title);
+        tab.DiscardedAfterHang += (_, _) =>
+        {
+            // Only for the page being looked at. Replaces the waiting message, which then has
+            // nothing of its own left to take down.
+            if (!_closing && Tabs?.ActiveTab == tab)
+                ShowMessage("The page stopped responding and was reloaded.");
+        };
+        // Only when it is the page being looked at: a background tab hanging is not news.
+        tab.NotRespondingChanged += (_, notResponding) =>
+        {
+            if (_closing)
+                return;
+            if (notResponding)
+            {
+                if (Tabs?.ActiveTab != tab)
+                    return;
+                _notRespondingTab = tab;
+                ShowMessage(NotRespondingText);
+            }
+            else
+            {
+                // Wherever the person has gone since: it is only ever our own words that are taken down.
+                if (_notRespondingTab == tab)
+                    _notRespondingTab = null;
+                ClearNotResponding();
+            }
+        };
         // A sign-in popup closing itself is the normal end of an OAuth handshake.
         // It still goes on the reopen stack, so a surprise close is one Ctrl+Shift+T away.
         tab.CloseRequested += (_, _) => _ = CloseTabAsync(tab);
@@ -1326,11 +1423,16 @@ public sealed class MainForm : Form
             if (tab.IsCurrent)
                 _findBar.SetStatus(tab.FindActiveMatch, tab.FindMatchCount);
         };
-        // A video going fullscreen has to take the whole window, chrome included.
-        tab.FullScreenChanged += (_, on) =>
+        // A video going fullscreen has to take the whole window, chrome included. The verdict
+        // is taken here, when this tab's page asks, whichever tab is in front; what the window
+        // then does is worked out from the tab in front rather than from this one event. A
+        // page that left fullscreen while another tab was in front used to be ignored, and the
+        // window stayed without its tab strip and toolbar with nothing on screen to click to
+        // get out.
+        tab.FullScreenChanged += (_, _) =>
         {
-            if (tab.IsCurrent)
-                SetPageFullScreen(on);
+            JudgeFullScreen(tab);
+            SyncPageFullScreen();
         };
     }
 
@@ -1412,6 +1514,61 @@ public sealed class MainForm : Form
     }
 
     /// <summary>
+    /// Takes the verdict on a page's fullscreen, if it has not got one. Whether the window
+    /// is the one in use, and whether an agent has just acted in the page, are looked at
+    /// here, at the moment the page asks, and never again for the same request: see
+    /// <see cref="FullScreenPolicy"/>.
+    /// </summary>
+    private void JudgeFullScreen(Tab tab)
+    {
+        var before = tab.FullScreenVerdict;
+        bool agentActed = tab.AgentActedWithin(FullScreenPolicy.AgentQuiet);
+        tab.FullScreenVerdict = FullScreenPolicy.Judge(
+            before, tab.IsFullScreen, OpenedByAgent, agentActed, ReferenceEquals(ActiveForm, this));
+        // Said out loud in the person's own window: a refusal is otherwise a video button
+        // that silently does nothing. Not in an agent's window, which nobody is watching.
+        if (FullScreenPolicy.ShouldSayRefused(before, tab.FullScreenVerdict, OpenedByAgent) && tab.IsCurrent)
+            ShowMessage(agentActed
+                ? "Fullscreen held back: an agent is using this tab. Press the button again in a few seconds."
+                : "Fullscreen held back because this window was not in use. Press the button again.");
+    }
+
+    /// <summary>
+    /// Puts the window into or out of fullscreen to match the page in front. Called whenever
+    /// anything that could change the answer has: a page entering or leaving fullscreen, the
+    /// tab in front changing, a tab closing. Only for the page in front: another tab going
+    /// fullscreen behind it, or the tab in front being changed to one that is not, ends it.
+    /// </summary>
+    private void SyncPageFullScreen()
+    {
+        if (_closing)
+            return;
+        var tab = Tabs?.ActiveTab;
+        if (tab is not null)
+            JudgeFullScreen(tab);
+        SetPageFullScreen(tab is not null && FullScreenPolicy.Fills(tab.FullScreenVerdict, tab.IsFullScreen));
+    }
+
+    /// <summary>
+    /// Esc or F11 while a page has the window: the chrome comes back at once, and the page is
+    /// asked to leave its own fullscreen as well. The window does not wait for the page, which
+    /// is the point: the way out used to be the page's own, and a page that does not have the
+    /// keyboard, or does not answer, left nothing to click.
+    /// </summary>
+    internal void ExitPageFullScreen()
+    {
+        if (Tabs?.ActiveTab is { } tab)
+        {
+            // Held until the page has really left, so a page that ignores the request does
+            // not get the window back.
+            tab.FullScreenVerdict = FullScreenVerdict.Dismissed;
+            tab.ExitFullScreen();
+        }
+        // Dismissed above, so this brings the window back whatever the page says next.
+        SyncPageFullScreen();
+    }
+
+    /// <summary>
     /// Page-driven fullscreen (a video, almost always). The WebView only fills the host
     /// panel, so without stripping the chrome and the window border a "fullscreen" video
     /// would still sit inside the tab strip and toolbar.
@@ -1425,6 +1582,7 @@ public sealed class MainForm : Form
         {
             _preFullScreenState = WindowState;
             _preFullScreenBorder = FormBorderStyle;
+            _preFullScreenBounds = Bounds;
             _tabStrip.Visible = _toolbar.Visible = _statusStrip.Visible = _bookmarksBar.Visible = false;
             _findBar.Visible = false;
             FormBorderStyle = FormBorderStyle.None;
@@ -1436,6 +1594,15 @@ public sealed class MainForm : Form
         {
             FormBorderStyle = _preFullScreenBorder;
             WindowState = _preFullScreenState;
+            // Changing the border style makes the form keep its client area's size, which for a
+            // window that was not maximised changed the window itself, and the system then
+            // remembered that size as the one to come back to. Measured: with the title bar
+            // gone from the client area it is a different size each way round. Where a
+            // maximised window goes when it is un-maximised is the system's, and is right
+            // (see WM_WINDOWPOSCHANGED in WndProc). Going back to maximised needs no detour
+            // through Normal: measured, its client area returns to exactly the work area.
+            if (_preFullScreenState == FormWindowState.Normal)
+                Bounds = _preFullScreenBounds;
             _tabStrip.Visible = _toolbar.Visible = _statusStrip.Visible = true;
             _bookmarksBar.Visible = _settings.ShowBookmarksBar;
         }
@@ -1449,6 +1616,24 @@ public sealed class MainForm : Form
         tab.FocusPage();
     }
 
+    internal const string NotRespondingText = "This page is not responding. Gergur will reload it if it does not come back.";
+
+    // The tab the not-responding text was put up for, so it comes down when the person goes elsewhere.
+    private Tab? _notRespondingTab;
+
+    /// <summary>
+    /// What the status line becomes when a not-responding message is to come down: empty when it
+    /// still holds that message, and null (leave it) when anything else is there, a download or a
+    /// saved bookmark that arrived since, which is not ours to wipe.
+    /// </summary>
+    internal static string? StatusAfterNotResponding(string? current)
+        => current == NotRespondingText ? "" : null;
+
+    private void ClearNotResponding()
+    {
+        if (StatusAfterNotResponding(_messageLabel.Text) is { } cleared)
+            ShowMessage(cleared);
+    }
     // The tab whose address the address bar was last given, and the text it was given, so
     // typing can be told from focus: it is only kept for that tab, and only once changed.
     private Tab? _addressShownFor;
@@ -1481,6 +1666,18 @@ public sealed class MainForm : Form
     private void UpdateChrome(bool forceAddressBar = false)
     {
         var active = Tabs?.ActiveTab;
+        if (_notRespondingTab is not null && _notRespondingTab != active)
+        {
+            _notRespondingTab = null;
+            ClearNotResponding();
+        }
+        // A page still being waited on, newly in front: switched back to, or torn off into this
+        // window while it was. The event that said so went to the window it was in then.
+        if (_notRespondingTab is null && active is { IsWaitingOnPage: true } waiting)
+        {
+            _notRespondingTab = waiting;
+            ShowMessage(NotRespondingText);
+        }
         // Skip the URL refresh only when the user is actively editing the address bar for
         // this tab, never when a tab close incidentally parked focus here (forceAddressBar).
         if (ShouldRefreshAddress(forceAddressBar, _addressBar.Focused,
@@ -1501,6 +1698,8 @@ public sealed class MainForm : Form
         _errorLabel.ToolTipText = errors == 0 ? "" : string.Join("\n", active!.RecentErrors.TakeLast(6)) + "\n\nClick to open DevTools";
 
         UpdateSleepLabel();
+        // The tab in front may have changed, or closed, and with it whether a page owns the window.
+        SyncPageFullScreen();
     }
 
     // ------------------------------------------------------------------ actions (shortcut router targets)
@@ -1509,9 +1708,13 @@ public sealed class MainForm : Form
     {
         if (Tabs is null)
             return;
-        await Tabs.CreateTabAsync(url ?? HomePage.Url);
+        var creating = Tabs.CreateTabAsync(url ?? HomePage.Url);
+        // The new tab is the active one as soon as it exists, and its address bar is empty. Taking
+        // focus only once its view had been built (seconds, on a cold engine) sent the first
+        // keystrokes of a new tab nowhere.
         if (url is null)
             FocusAddressBar();
+        await creating;
     }
 
     public async Task CloseActiveTabAsync()
@@ -1642,11 +1845,6 @@ public sealed class MainForm : Form
             window._addressBar.SearchUrlTemplate = session.Settings.SearchUrlTemplate;
             if (!window._isPageFullScreen)
                 window._bookmarksBar.Visible = session.Settings.ShowBookmarksBar;
-            if (window._lifecycle is { } lifecycle)
-            {
-                lifecycle.SuspendAfter = TimeSpan.FromMinutes(Math.Max(1, session.Settings.SuspendAfterMinutes));
-                lifecycle.DiscardAfter = TimeSpan.FromMinutes(Math.Max(2, session.Settings.DiscardAfterMinutes));
-            }
             // The page settings reach tabs already open, not only the next view built.
             // Each one catches its own failure, so nothing escapes the discard.
             foreach (var tab in window.Tabs?.Tabs ?? [])
@@ -1892,68 +2090,6 @@ public sealed class MainForm : Form
 
     protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
         => _shortcuts.Handle(keyData) || base.ProcessCmdKey(ref msg, keyData);
-
-    // ------------------------------------------------------------------ minimize / lock
-
-    protected override void OnResize(EventArgs e)
-    {
-        base.OnResize(e);
-        bool minimized = WindowState == FormWindowState.Minimized;
-        if (minimized != _isMinimized)
-        {
-            _isMinimized = minimized;
-            UpdateBackgroundState();
-        }
-    }
-
-    private void OnSessionSwitch(object? sender, Microsoft.Win32.SessionSwitchEventArgs e)
-    {
-        if (e.Reason is Microsoft.Win32.SessionSwitchReason.SessionLock)
-            BeginInvoke(() => { _isLocked = true; UpdateBackgroundState(); });
-        else if (e.Reason is Microsoft.Win32.SessionSwitchReason.SessionUnlock)
-            BeginInvoke(() => { _isLocked = false; UpdateBackgroundState(); });
-    }
-
-    private void UpdateBackgroundState()
-    {
-        if (_closing || Tabs is null)
-            return;
-        bool backgrounded = _isMinimized || _isLocked;
-        if (backgrounded && _backgroundSinceUtc is null)
-        {
-            _backgroundSinceUtc = DateTime.UtcNow;
-            // Hide the active tab so the policy may freeze it too; audio keeps playing
-            // (audible tabs are exempt from suspension).
-            Tabs.ActiveTab?.Deactivate();
-        }
-        else if (!backgrounded && _backgroundSinceUtc is not null)
-        {
-            _backgroundSinceUtc = null;
-            if (Tabs.ActiveTab is { } active)
-                _ = ActivateTabAsync(active); // resumes a frozen page instantly
-        }
-    }
-
-    // ------------------------------------------------------------------ policy + status
-
-    private async Task RunLifecycleTickAsync(bool forceSuspend)
-    {
-        if (_lifecycle is null || Tabs is null || _lifecycleTickRunning || _closing)
-            return;
-        _lifecycleTickRunning = true;
-        try
-        {
-            await _lifecycle.TickAsync(Tabs.Tabs.Cast<ITabHandle>().ToList(), forceSuspend);
-        }
-        catch
-        {
-            // A failed pass is fine; the next timer tick tries again.
-        }
-        finally
-        {
-            _lifecycleTickRunning = false;
-        }
-    }
 
     private void UpdateStatus()
     {

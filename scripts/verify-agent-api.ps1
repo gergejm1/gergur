@@ -205,8 +205,6 @@ try {
         $r = Status { Post '/settings' @{ $name = $value } }
         Check ("$name is refused") ($r.code -eq 400 -and $r.body.error -like "*$name*") ("" + $r.code + " " + (Show $r.body))
     }
-    $r = Status { Post '/settings' @{ DiscardAfterMinutes = $s.settings.SuspendAfterMinutes } }
-    Check 'discarding before sleeping is refused' ($r.code -eq 400) ("" + $r.code)
     $after = Get_ '/settings'
     Check 'none of those moved anything' (($after.settings | ConvertTo-Json -Compress) -eq ($s.settings | ConvertTo-Json -Compress)) 'a refused patch still changed something'
 

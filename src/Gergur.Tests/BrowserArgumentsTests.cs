@@ -6,11 +6,11 @@ namespace Gergur.Tests;
 public sealed class BrowserArgumentsTests
 {
     [Fact]
-    public void DefaultsIncludeProcessPerSiteAndMemoryFeatures()
+    public void DefaultsIncludeProcessPerSiteAndNoMemoryPressure()
     {
         var args = BrowserEnvironment.BuildBrowserArguments(new Settings());
         Assert.Contains("--process-per-site", args);
-        Assert.Contains("--enable-features=msWebView2SimulateMemoryPressureWhenInactive", args);
+        // Hidden views are not told the system is low on memory: that made them drop what\r\n        // they held, and pages such as Gmail lagged when switched back to.\r\n        Assert.DoesNotContain("msWebView2SimulateMemoryPressureWhenInactive", args);
         Assert.Contains("SpareRendererForSitePerProcess", args);
         // FedCM must stay enabled: Google requires it for Sign in with Google, and
         // disabling it removes the API with no fallback.
@@ -22,7 +22,7 @@ public sealed class BrowserArgumentsTests
     public void EachFeatureSwitchAppearsAtMostOnce()
     {
         var args = BrowserEnvironment.BuildBrowserArguments(new Settings());
-        Assert.Single(args.Split("--enable-features=")[1..]);
+        Assert.Empty(args.Split("--enable-features=")[1..]);
         Assert.Single(args.Split("--disable-features=")[1..]);
     }
 
@@ -116,7 +116,6 @@ public sealed class BrowserArgumentsTests
         {
             ProcessPerSite = false,
             DisableSpareRenderer = false,
-            InactiveMemoryPressure = false,
         };
         var args = BrowserEnvironment.BuildBrowserArguments(settings);
         Assert.Equal("", args);
