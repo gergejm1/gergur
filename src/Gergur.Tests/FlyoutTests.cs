@@ -826,6 +826,6 @@ public sealed class FlyoutTests
         string manager = Code("Gergur", "Tabs", "TabManager.cs");
         Assert.Matches(@"if \(muted\)\s*tab\.IsMuted = true;\s*bool kept", manager.Replace("\r", ""));
         string tab = Code("Gergur", "Tabs", "Tab.cs");
-        Assert.Matches(@"var core = webView\.CoreWebView2;\s*if \(_muted\)\s*core\.IsMuted = true;", tab);
+        Assert.Matches(@"var core = webView\.CoreWebView2;\s*_silencedByWindow = _owner\.IsHiddenWindow\(\);\s*if \(EngineIsToldMuted\)\s*core\.IsMuted = true;", tab);
     }
 }

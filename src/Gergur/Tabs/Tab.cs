@@ -359,8 +359,10 @@ public sealed class Tab : ITabHandle, IDisposable
 
         _webView = webView;
         var core = webView.CoreWebView2;
-        // Before anything is navigated, so a muted tab never makes a sound.
-        if (_muted)
+        // Before anything is navigated, so a muted tab, or one in a hidden agent window, never
+        // makes a sound.
+        _silencedByWindow = _owner.IsHiddenWindow();
+        if (EngineIsToldMuted)
             core.IsMuted = true;
 
         core.DocumentTitleChanged += OnDocumentTitleChanged;
@@ -670,24 +672,65 @@ public sealed class Tab : ITabHandle, IDisposable
     /// builds. A mute used to live only in the engine, so a tab with no view yet could not
     /// be muted at all, and a rebuilt view came back audible. That first case is the one an
     /// agent needs: a tab it opens muted has to be silent from its first frame, not from
-    /// the moment after the page has already started playing.</summary>
+    /// the moment after the page has already started playing.
+    ///
+    /// This is the choice (the person's Ctrl+M, an agent's muted tab). The engine is also
+    /// told to be silent while the tab is in a hidden agent window (<see cref="SilencedByWindow"/>),
+    /// which is not a choice and is not reported here: shown again, the tab plays as chosen.</summary>
     public bool IsMuted
     {
-        get { try { return Core?.IsMuted ?? _muted; } catch { return _muted; } }
+        get => _muted;
         set
         {
             _muted = value;
-            try
-            {
-                if (Core is { } core)
-                    core.IsMuted = value;
-            }
-            catch { }
+            ApplyMute();
             RaiseUpdated(); // the strip marks muted tabs
         }
     }
 
     private bool _muted;
+
+    // Read from the window on the UI thread; a plain field so other threads can report it.
+    private volatile bool _silencedByWindow;
+
+    /// <summary>
+    /// Whether the window this tab is in keeps it silent: an agent's window the person cannot
+    /// see. The person asked never to hear an agent's hidden work, a video it plays to check
+    /// something included; its page still plays, only the sound is off. Showing the window
+    /// gives the sound back, hiding it takes it away (<see cref="RefreshSound"/>).
+    /// </summary>
+    internal bool SilencedByWindow => _silencedByWindow;
+
+    /// <summary>What the engine is told: silent when muted by choice, or by a hidden window.</summary>
+    internal static bool EngineMuted(bool muted, bool silencedByWindow) => muted || silencedByWindow;
+
+    /// <summary>What this tab tells the engine, every time it tells it anything about sound.</summary>
+    internal bool EngineIsToldMuted => EngineMuted(_muted, _silencedByWindow);
+
+    /// <summary>
+    /// Asks the window again whether it is a hidden agent window and sets the sound to match.
+    /// Called when a view is built, when the tab moves to another window, and by the window
+    /// when it is hidden or shown. It does not raise Updated: the tab's own choice, which is
+    /// what the strip shows, has not changed.
+    /// </summary>
+    internal void RefreshSound()
+    {
+        _silencedByWindow = _owner.IsHiddenWindow();
+        ApplyMute();
+    }
+
+    private void ApplyMute()
+    {
+        try
+        {
+            if (Core is { } core)
+                core.IsMuted = EngineIsToldMuted;
+        }
+        catch (Exception ex) when (ex is System.Runtime.InteropServices.COMException or InvalidOperationException or ObjectDisposedException)
+        {
+            DebugLog.Write($"the sound setting could not be changed: {ex.Message}");
+        }
+    }
 
     /// <summary>
     /// The page called window.close(). Chromium only honours that for windows opened by
@@ -1118,6 +1161,7 @@ public sealed class Tab : ITabHandle, IDisposable
         if (_webView is not null)
             newOwner.Host.Controls.Add(_webView);
         RefreshDialogMode();
+        RefreshSound();
     }
 
     /// <summary>

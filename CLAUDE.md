@@ -97,6 +97,21 @@ Nothing here takes the screen unless it is asked to:
     hidden window (it switches the tab and leaves the window hidden). Hide, X, Alt+F4 and
     the taskbar's Close hide it again (`SendBackToAgent`); the person taking the window
     over (`ClaimForPerson`) shows it for good.
+  - A hidden window is silent: the person asked never to hear a video an agent plays
+    there, even one it needs to play, until they show it. The engine is told
+    `Tab.EngineMuted(IsMuted, SilencedByWindow)`, so the page still plays and its media
+    still runs, only nothing reaches the speakers. `IsMuted` stays the tab's own choice
+    (`muted: true`, Ctrl+M) and is what the strip shows; shown, a tab plays as it was
+    chosen to. `MainForm.HiddenForAgent` is the one place the window's hiddenness is
+    written, and its setter tells every tab (`Tab.RefreshSound`); a view built in a
+    hidden window starts silent before anything is navigated, and a tab moved between
+    windows follows its new one (`TransferTo`). Tabs set aside for a download follow it
+    too (`TabManager.RefreshSound`). Measured 2026-11-03 with a Windows audio peak meter
+    on the engine's sessions, a local page playing a tone at gain 0.003 after a trusted
+    click, in a hidden agent window: the build before this change opened an active session
+    at peak 0.003; this one opened none while the page's audio clock ran for 19 s. Not
+    measured: the sound coming back when the person shows the window (that would play at
+    them); it rests on `ATabFollowsItsWindowAndKeepsItsOwnChoice`.
   - If the system will not cloak it (the attribute is undocumented), it opens as it used
     to, behind and on the taskbar, and does not count as hidden: a window left on screen
     with no taskbar button would be one nobody can find.

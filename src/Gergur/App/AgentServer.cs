@@ -2083,7 +2083,7 @@ public sealed class AgentServer
             },
             []),
         Tool("gergur_open_window",
-            "Open another browser window on the same session. Leave focus false to work in it without taking the screen from whoever is using the browser.",
+            "Open another browser window on the same session. Leave focus false to work in it without taking the screen from whoever is using the browser: it stays hidden, and silent (pages still play, the person just does not hear them) until the person shows it.",
             new
             {
                 url = Text("Optional url to open in the new window's first tab."),

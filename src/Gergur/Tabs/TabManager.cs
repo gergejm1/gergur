@@ -23,6 +23,9 @@ public sealed class TabManager
     /// on the person's screen. Set by the window.
     /// </summary>
     public Func<bool> IsAgentWindow { get; set; } = () => false;
+
+    /// <summary>Whether this window is an agent's the person cannot see, so its tabs make no sound. See Tab.SilencedByWindow.</summary>
+    public Func<bool> IsHiddenWindow { get; set; } = () => false;
     public Tab? ActiveTab { get; private set; }
 
     /// <summary>Anything the chrome shows changed: list, order, active tab, or a tab's title/state.</summary>
@@ -158,6 +161,27 @@ public sealed class TabManager
 
     /// <summary>How many tabs are out of the strip but not yet closed. For tests.</summary>
     internal int SetAsideCount => _setAside.Count;
+
+    /// <summary>
+    /// The window was hidden or shown: every tab it holds sets its sound to match, the ones
+    /// set aside for a download included, since their pages are still live and can still play.
+    /// One tab failing does not stop the rest, nor the window being shown: this runs inside
+    /// ShowToPerson and SendBackToAgent.
+    /// </summary>
+    internal void RefreshSound()
+    {
+        foreach (var tab in _tabs.Concat(_setAside.Keys))
+        {
+            try
+            {
+                tab.RefreshSound();
+            }
+            catch (Exception ex)
+            {
+                DebugLog.Write($"a tab's sound could not follow its window: {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+    }
 
     private void RegisterTab(Tab tab)
     {

@@ -82,7 +82,19 @@ public sealed class MainForm : Form
     /// taskbar, until they show it from the agents panel. It keeps working: its page still
     /// draws, clicks and captures. Every agent window starts this way unless asked to focus.
     /// </summary>
-    internal bool HiddenForAgent { get; private set; }
+    internal bool HiddenForAgent
+    {
+        get => _hiddenForAgent;
+        private set
+        {
+            _hiddenForAgent = value;
+            // Nothing from a window the person cannot see is heard; shown, its tabs play as
+            // they were set to. See Tab.SilencedByWindow.
+            Tabs?.RefreshSound();
+        }
+    }
+
+    private bool _hiddenForAgent;
 
     /// <summary>
     /// The person has used this window, so it is theirs from now on and its tabs are their
@@ -1655,6 +1667,7 @@ public sealed class MainForm : Form
             Tabs = new TabManager(session.Env, _hostPanel, session.Blocker);
             // Read as each view is built, by then the window knows whose it is.
             Tabs.IsAgentWindow = () => _openedByAgent;
+            Tabs.IsHiddenWindow = () => _hiddenForAgent;
             Tabs.Changed += (_, _) => UpdateChrome();
             Tabs.TabCreated += (_, tab) => WireTab(tab);
             Tabs.LastTabClosed += (_, _) => Close();
