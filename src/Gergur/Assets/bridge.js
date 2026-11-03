@@ -387,6 +387,11 @@
             ],
             restartPending: [],
             notSaving: null,
+            googleAccounts: [
+                { site: "example.com", email: "person.a@example.com" },
+                { site: "shop.example.org", email: "person.b@example.com", namedBy: "Claude Code" },
+            ],
+            googleAccountsUnreadable: false,
         };
         var settingsAtStart = copy(settings);
 
@@ -619,6 +624,16 @@
                 case "settings.newPairingKey":
                 case "settings.showPairing":
                 case "settings.restart":
+                    return {};
+                case "settings.forgetGoogleAccount": {
+                    var site = text(args, "site");
+                    var before = settings.googleAccounts.length;
+                    settings.googleAccounts = settings.googleAccounts.filter(function (a) { return a.site !== site; });
+                    if (settings.googleAccounts.length === before) throw refusal("No Google account is remembered for " + site + ".");
+                    return {};
+                }
+                case "settings.forgetGoogleAccounts":
+                    settings.googleAccounts = [];
                     return {};
                 case "agents.list":
                     return { apiLine: "Agent API on 127.0.0.1:24002 \u00b7 token protected", nowUtc: iso(options.now ? options.now() : Date.now()), agents: agents };

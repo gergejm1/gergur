@@ -59,7 +59,7 @@ sent. Prefer the id: see "Naming a tab" below.
 | GET or POST /dialogs | {"accept": false?, "text": "..."?} | recent page dialogs, and how the next confirm/prompt are answered |
 | GET /downloads | ?wait=1&timeout=s | the caller's own downloads: file, path, state, bytes |
 | POST /ask | {"question": "..."} or {"id": "ask-1"}, "timeout": s? | ask the person; a bar in their window. See "Asking the person" |
-| POST /login | {"submit": false?, "account": "..."?} | sign in with a saved password, choosing the account and filling two-step password pages: {filled, user, submitted, via, stillAsking, url, picked}. See "Saved passwords" |
+| POST /login | {"submit": false?, "account": "..."?} | sign in with a saved password, choosing the account and filling two-step password pages; on Google's account chooser, clicks the person's Google account for the site: {filled, user, submitted, via, stillAsking, url, picked}. See "Saved passwords" |
 | GET /settings | | {settings, restartRequired, vpnInForce, tunnelRunning}; credentials read as "(hidden)" |
 | POST /settings | {"BlocklistEnabled": false, ...} | change settings, returns {applied, restartNeededFor, unknown, persisted} |
 | POST /window | {"url": "..."?, "focus": true?, "muted": true?} | open another window, returns {window, id} |
@@ -975,7 +975,106 @@ instance its own single-instance mutex and pipe (`Settings.InstanceSuffix`, a ha
 folder), so a second Gergur runs beside the person's own without touching their profile,
 vault or settings. Use it for anything that needs saved logins: seed the scratch profile,
 never the real vault. Launch it through WMI (`Win32_Process.Create`), not as a child of the
-terminal: a child of the front app may take the foreground.
+terminal: a child of the front app may take the foreground. With `GERGUR_TEST_GOOGLE_ORIGIN`
+set as well (a loopback or `*.localhost` origin only, `GoogleSignIn.OriginFrom`), a local
+stand-in takes Google's sign-in's place, so the Google account path runs without Google.
+
+#### Sign in with Google
+
+The person signs in to most sites through Google, and all that takes is clicking the right
+Google account, so that is remembered per site and clicked for agents (`App/GoogleSignIn.cs`,
+`Data/GoogleAccountStore.cs`):
+
+- Learned from the person's own sign-ins, and from an account an agent was told to use
+  (below). A script on Google's sign-in pages
+  (`GoogleSignIn.ChoiceScript`, top page of `https://accounts.google.com` only) posts the
+  address of an account entry that is clicked (or chosen with Enter or Space); the tab takes
+  it only from that origin (`e.Source`), and the window keeps it only when it is one of the
+  person's windows and no agent acted in that tab, or in the tab that opened it (a sign-in
+  popup), within 30 s, nor ran script in the page shown at all (`GoogleSignIn.IsThePersonsChoice`,
+  `AgentScriptedThisDocument`): a script can post the choice or click an entry long after it
+  ran. An agent's trusted click looks exactly like the person's to the page, so who was there
+  decides, never the event (`GoogleSignIn.ChoiceFrom` checks only where the message came from).
+- The site is read from the sign-in's own address (`GoogleSignIn.SiteOf`): `redirect_uri`,
+  `origin`, `app_domain`, followed through `continue` and `followup`, an older popup's
+  `storagerelay://`. Google's own services are not a site. One account per site, the latest.
+- An account an agent named in `account` and signed in with is remembered for the site too,
+  so the person can say "sign in with name@gmail.com" once (`RememberNamedAsync`): only once
+  the sign-in is past Google (`stillOnGoogle` false, the site known), marked with the agent's
+  name (`GoogleAccount.NamedBy`, `GoogleAccountStore.CleanName`), said in the agents log
+  ("Remembered which Google account to use on example.com") and in the answer
+  (`rememberedNow`). The settings show "Named to X, an agent". The same account named again
+  changes nothing; the person picking it themselves makes it theirs (NamedBy cleared), and
+  their pick of another replaces it. Latest wins both ways: an agent named another account
+  replaces the person's own pick for that site, as asked for ("sign in with name@gmail.com
+  and remember it"), and the settings and the agents log say which agent did.
+- Kept in `google-accounts.json` in the data folder, never in the settings, so it never
+  reaches `GET /settings`. The settings page lists it (Google accounts, the last section)
+  with Forget and Forget all (`settings.forgetGoogleAccount(s)`). A file that cannot be
+  read is never written over, as for bookmarks.
+- `gergur_login` on Google's sign-in page clicks the account named in `account`, else the
+  one remembered for the site, one trusted click on the entry Gergur marked
+  (`GoogleSignIn.MarkJs`, which answers only whether it is listed and how many are, never
+  the addresses). Nothing is clicked when no account is remembered (`NoGoogleAccountRemembered`),
+  the site cannot be told, the account is not listed, the page was scripted by an agent, or
+  it moved on between measuring the entry and the click (`GoogleMovedOn`).
+  It never clicks Google's consent screen or anything after the account: `stillOnGoogle`
+  and a note say to ask the person, and called on a consent page (`GoogleSignIn.IsConsentPage`,
+  "consent" in the path) it clicks nothing at all, an account chip there included. `submit:
+  false` only says which account it would click.
+- FedCM, in an agent's window only (`Tabs/FedCmWatch.cs`). The "Sign in with Google" button
+  and One Tap use FedCM since August 2025: the chooser is drawn by the browser, not a page
+  (see `DisableFedCm`). In a tab of an agent's window the DevTools `FedCm` domain is enabled
+  (`Tab.RefreshFedCmAsync`, on each view and each move between windows; stopped when the tab
+  moves to the person's window, and never started there), and the chooser it reports is
+  answered with `FedCm.selectAccount`. `gergur_login` with a chooser up chooses the account
+  named, else the one remembered for the page's own site (`GoogleSignIn.SiteOfPage`), only
+  when it is Google's (its config URL on Google's origin), listed, and already used with the
+  site (`loginState` "SignIn"): a first sign-in ("SignUp") shares the person's details with
+  the site and is theirs to agree to (`FedCmFirstSignIn`). Not on a page an agent scripted,
+  and only in the chooser read, still up, over the same page, still this tab's watch: all
+  looked at on the UI thread with nothing awaited before `selectAccount` (`FedCmLook`). Nothing
+  else in the chooser is ever pressed. The chooser takes the call only when it is the sign-in
+  meant (`FedCmWatch.Applies`: it offers the account named or remembered, or it is the quiet
+  return); otherwise the page is signed in to as usual, since One Tap can sit over a password
+  form, and only when the page has no password field is the chooser's answer given (no
+  account known for the site, the named one not offered). Remembered as named once the
+  chooser closed after the choice: the browser had Google's token for the site by then;
+  whether the site then accepted it is not known. The browser's own quiet return (`AutoReauthn`: one account
+  used here before, signed back in by itself, as for the person) is waited for and said
+  (`via: "browser"`), never answered or remembered; with a site that allows it, it can
+  sign in with the account used last even when an agent named another, and Gergur cannot
+  stop that: then the answer is `ok: false` with `FedCmQuietReturnOther`. The person's own FedCM choices are not learned: their windows are not watched.
+- A page of any site can send the person to a Google sign-in naming another site in its
+  `redirect_uri`, and if they pick an account there it is remembered for that site. Google
+  refuses redirects a site has not registered, so such a sign-in goes nowhere, and an agent
+  can name any account anyway; worth knowing, not worth more.
+
+Google's real pages were never tried: the entries are recognised by `data-identifier` (the
+account chooser) and `data-email`, as far as is known. If Google names them otherwise,
+nothing is remembered and agents are told the account is not listed; nothing is clicked by
+guess. Verified on 2026-11-03 against a stand-in (`scratchpad/livetest/google-live.ps1`, 15
+checks, test instance, made-up accounts): the person's own choice remembered for the site,
+an agent's click in the person's window not remembered, nor a click an agent's script
+scheduled for after the 30 s, the remembered account clicked in a
+hidden agent window and the site signed in with it, a named account clicked instead (then
+remembered, as below), nothing clicked with no account remembered, an account not listed or a chooser
+not naming its site, the consent screen left alone (its Continue never pressed, nothing
+clicked when called on it), the window
+hidden throughout. The scripts run in the test suite against a stand-in page
+(`GoogleScripts.harness.js`); the settings section was looked at in headless Edge in demo mode.
+Agent-named accounts, verified the same day in the same test (now 17 checks): a named account
+remembered for the site with the agent's name, named again changing nothing, the person's own
+pick in their window replacing it. FedCM, verified the same day against a stand-in identity
+provider (`scratchpad/livetest/fedcm-live.ps1`, 14 checks, test instance): the chooser seen in
+a hidden agent window, a chooser over a password form leaving the call to the form (and taken
+when its account was named), nothing chosen with no account remembered, for an account new to the
+site, or one not offered, a named account chosen and the site signed in with it, remembered
+as named by the agent, only that one account ever asserted, the remembered one chosen next
+time unnamed, nothing on a scripted page, and no window of the test instance on screen at any
+point (every visible, uncloaked, unminimised window of it and its engine processes polled
+every 50 ms). Not seen live: the quiet return's answer (the browser finished it within
+milliseconds, before a call could arrive), nor any of it against Google.
 
 ### Saying what you are doing
 

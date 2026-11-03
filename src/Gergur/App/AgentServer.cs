@@ -478,11 +478,25 @@ public sealed class AgentServer
             if (AccountNotText(body) || BodyString("account") is { } rawAccount && (asked = CleanAccount(rawAccount)) is null)
                 return (400, "application/json", Json(new { error = "account is the saved username to sign in as: one printable line of at most 200 characters" }));
             Acting(tab);
+            // Google's chooser drawn by the browser over the page (FedCM), in an agent's window,
+            // when it is the sign-in meant: One Tap can sit over a password form, and then the
+            // password is what is wanted.
+            if (tab.FedCm is { } fedCm && fedCm.Current is { } shown
+                && FedCmWatch.Applies(shown, GoogleSignIn.CleanEmail(asked)
+                    ?? (GoogleSignIn.SiteOfPage(tab.CommittedSourceForOtherThreads) is { Length: > 0 } pageSite ? _session.GoogleAccounts.For(pageSite) : null), GoogleSignIn.Origin))
+                return await FedCmLoginAsync(tab, fedCm, shown, asked);
+            if (GoogleSignIn.IsGooglePage(tab.CommittedSourceForOtherThreads))
+                return await GoogleLoginAsync(tab, asked);
             string nonce = Convert.ToHexString(System.Security.Cryptography.RandomNumberGenerator.GetBytes(8)).ToLowerInvariant();
             var (raw, ready) = await OnUiAsync(() => tab.ReadScriptAsync(LoginStateJs(nonce), Tab.WakeTimeout));
             if (!ready)
                 return (503, "application/json", Json(new { error = "that tab's page did not finish loading in time" }));
             var state = ParseLoginState(raw);
+            // No password here, and Google's chooser up over the page: what it offers is said
+            // (no account known for the site, the one named not among them) rather than that
+            // there is no password field.
+            if (state is { Fields: 0, Elsewhere: false } && tab.FedCm is { } watching && watching.Current is { } up)
+                return await FedCmLoginAsync(tab, watching, up, asked);
             string? wanted = state is null ? null : WantedAccount(state, asked);
             string? chosen = null;
             bool picked = false;
@@ -575,6 +589,235 @@ public sealed class AgentServer
                 url = tab.CommittedSourceForOtherThreads,
                 dialogs = DialogsOut(tab.DialogsSince(dialogMark)),
             }));
+        }
+
+        // "Sign in with Google": clicks the person's Google account for the site the sign-in is
+        // for, the one they chose there themselves (or the one asked for), the way they would.
+        // Never Google's consent screen or anything after it: what comes next is read and said.
+        async Task<(int, string, byte[])> GoogleLoginAsync(Tab tab, string? asked)
+        {
+            string url = tab.CommittedSourceForOtherThreads;
+            string site = GoogleSignIn.SiteOf(url);
+            string? email = null;
+            if (asked is not null && (email = GoogleSignIn.CleanEmail(asked)) is null)
+                return (400, "application/json", Json(new { error = GoogleAccountNotAnAddress }));
+            bool remembered = false;
+            if (email is null && site.Length > 0 && _session.GoogleAccounts.For(site) is { } kept)
+                (email, remembered) = (kept, true);
+            string? siteOut = site.Length > 0 ? site : null;
+            if (email is null)
+                return (200, "application/json", Quiet(new { ok = false, google = true, site = siteOut, error = siteOut is null ? GoogleSiteUnknown : NoGoogleAccountRemembered }));
+            if (BoolFrom("submit") == false)
+                return (200, "application/json", Quiet(new { ok = true, google = true, site = siteOut, user = email, remembered, submitted = false }));
+            // Google's consent screen is the person's: nothing on it is clicked, an account chip
+            // that happens to carry the address included.
+            if (GoogleSignIn.IsConsentPage(url))
+                return (200, "application/json", Quiet(new { ok = false, google = true, site = siteOut, user = email, remembered, stillOnGoogle = true, error = GoogleStillAsking }));
+            if (tab.AgentScriptedThisDocument)
+                return (409, "application/json", Json(new { error = ScriptedLoginPage }));
+            string nonce = Convert.ToHexString(RandomNumberGenerator.GetBytes(8)).ToLowerInvariant();
+            var (raw, ready) = await OnUiAsync(() => tab.ReadScriptAsync(GoogleSignIn.MarkJs(nonce, email), Tab.WakeTimeout));
+            if (!ready)
+                return (503, "application/json", Json(new { error = "that tab's page did not finish loading in time" }));
+            var marked = GoogleSignIn.ParseMarked(raw);
+            if (marked is not { Found: true })
+                return (200, "application/json", Quiet(new { ok = false, google = true, site = siteOut, user = email, remembered, accounts = marked?.Accounts ?? 0, error = GoogleAccountNotListed }));
+
+            string entry = $"[data-gergur-google=\"{nonce}\"]";
+            int dialogMark = tab.DialogCount;
+            string? note = null;
+            var (first, _) = await LocateAsync(tab, entry, animate: true);
+            if (first is not null)
+                await Task.Delay(CursorGlide);
+            var (spot, _) = await LocateAsync(tab, entry, animate: false);
+            if (spot is not { CanClickAt: true })
+                return (200, "application/json", Quiet(new { ok = false, google = true, site = siteOut, user = email, remembered, error = GoogleAccountUnreachable }));
+            // Looked at again directly before acting, as for a password: a page that moved on
+            // meanwhile (to a consent screen, say) would take the click at the same point.
+            if (tab.AgentScriptedThisDocument)
+                return (409, "application/json", Json(new { error = ScriptedLoginPage }));
+            if (tab.CommittedSourceForOtherThreads != url)
+                return (200, "application/json", Quiet(new { ok = false, google = true, site = siteOut, user = email, remembered, stillOnGoogle = GoogleSignIn.IsGooglePage(tab.CommittedSourceForOtherThreads), error = GoogleMovedOn }));
+            try
+            {
+                await OnUiAsync(() => TabInput.ClickAsync(tab, spot.X, spot.Y));
+            }
+            catch (TabInput.InputFailedException failed) when (failed.MayHaveLanded)
+            {
+                note = $"{failed.Message}. The click may still have landed, so it was not tried again.";
+            }
+            catch (TabInput.InputFailedException failed)
+            {
+                return (503, "application/json", Json(new { error = failed.Message }));
+            }
+            // For Google to move on: to the site, or to a page of its own (a consent screen, a
+            // password, a check), or for a popup to close itself.
+            for (int i = 0; i < 24 && !tab.Closed && tab.CommittedSourceForOtherThreads == url; i++)
+                await Task.Delay(250);
+            string now = tab.CommittedSourceForOtherThreads;
+            bool still = !tab.Closed && GoogleSignIn.IsGooglePage(now);
+            // An account the agent was told and signed in with, past Google: remembered for the
+            // site, marked as named to this agent. Not while Google is still asking.
+            bool learned = asked is not null && !still && siteOut is not null && await RememberNamedAsync(siteOut, email);
+            return (200, "application/json", Quiet(new
+            {
+                ok = true,
+                google = true,
+                site = siteOut,
+                user = email,
+                // Chosen by the person for this site before, rather than named by the agent.
+                remembered,
+                // Named by the agent and now kept for this site, for the next sign-in.
+                rememberedNow = learned ? true : (bool?)null,
+                submitted = true,
+                via = "click",
+                closed = tab.Closed ? true : (bool?)null,
+                stillOnGoogle = still,
+                note = note ?? (still ? GoogleStillAsking : null),
+                url = tab.Closed ? null : now,
+                dialogs = DialogsOut(tab.DialogsSince(dialogMark)),
+            }));
+        }
+
+        // "Sign in with Google" by FedCM: the chooser the browser draws itself, reported and
+        // answered through the DevTools protocol (FedCmWatch), so there is nothing to click. Only
+        // Google's accounts, only the one the person uses for the site (or the one named), and
+        // only one already used with this site: a first sign-in shares their details with it,
+        // which is theirs to agree to.
+        async Task<(int, string, byte[])> FedCmLoginAsync(Tab tab, FedCmWatch watch, FedCmWatch.Dialog dialog, string? asked)
+        {
+            string url = tab.CommittedSourceForOtherThreads;
+            string site = GoogleSignIn.SiteOfPage(url);
+            string? siteOut = site.Length > 0 ? site : null;
+            string? email = null;
+            if (asked is not null && (email = GoogleSignIn.CleanEmail(asked)) is null)
+                return (400, "application/json", Json(new { error = GoogleAccountNotAnAddress }));
+            if (FedCmWatch.IsQuietReturn(dialog, GoogleSignIn.Origin))
+            {
+                // The browser is signing the person back in by itself, with the one Google
+                // account this site used last, as it would in their own window: nothing to
+                // choose. Waited for and said, never remembered.
+                for (int i = 0; i < 24 && !tab.Closed && watch.Current?.Id == dialog.Id; i++)
+                    await Task.Delay(250);
+                string? used = GoogleSignIn.CleanEmail(dialog.Accounts[0].Email);
+                bool other = email is not null && used != email;
+                return (200, "application/json", Quiet(new
+                {
+                    ok = !other,
+                    google = true,
+                    fedCm = true,
+                    site = siteOut,
+                    user = used,
+                    submitted = false,
+                    via = "browser",
+                    stillOnGoogle = !tab.Closed && watch.Current is not null,
+                    error = other ? FedCmQuietReturnOther : null,
+                    note = other ? null : FedCmQuietReturn,
+                    url = tab.Closed ? null : tab.CommittedSourceForOtherThreads,
+                }));
+            }
+            bool remembered = false;
+            if (email is null && siteOut is not null && _session.GoogleAccounts.For(siteOut) is { } kept)
+                (email, remembered) = (kept, true);
+            if (email is null)
+                return (200, "application/json", Quiet(new { ok = false, google = true, fedCm = true, site = siteOut, error = siteOut is null ? GoogleSiteUnknown : NoGoogleAccountRemembered }));
+            var (index, why) = FedCmWatch.Choose(dialog, email, GoogleSignIn.Origin);
+            if (why != FedCmWatch.Refusal.None)
+            {
+                string error = why switch
+                {
+                    FedCmWatch.Refusal.NotAChooser => FedCmNotAChooser,
+                    FedCmWatch.Refusal.NotGoogle => FedCmNotGoogle,
+                    FedCmWatch.Refusal.FirstSignIn => FedCmFirstSignIn,
+                    _ => GoogleAccountNotListed,
+                };
+                return (200, "application/json", Quiet(new { ok = false, google = true, fedCm = true, site = siteOut, user = email, remembered, accounts = dialog.Accounts.Count, error }));
+            }
+            if (BoolFrom("submit") == false)
+                return (200, "application/json", Quiet(new { ok = true, google = true, fedCm = true, site = siteOut, user = email, remembered, submitted = false }));
+            int dialogMark = tab.DialogCount;
+            FedCmLook look;
+            try
+            {
+                // Looked at again on the UI thread, directly before choosing and with nothing
+                // awaited between: still this tab's watch (not moved to the person's window),
+                // the page not scripted (a page an agent scripted could have asked for the
+                // chooser on terms of its own), the same chooser over the same page.
+                look = await OnUiAsync(async () =>
+                {
+                    if (tab.FedCm != watch)
+                        return FedCmLook.MovedOn;
+                    if (tab.AgentScriptedThisDocument)
+                        return FedCmLook.Scripted;
+                    if (watch.Current?.Id != dialog.Id || url != tab.CommittedSourceForOtherThreads)
+                        return FedCmLook.MovedOn;
+                    await watch.SelectAsync(dialog.Id, index);
+                    return FedCmLook.Chosen;
+                });
+            }
+            catch (Exception ex) when (ex is System.Runtime.InteropServices.COMException or InvalidOperationException or ArgumentException)
+            {
+                // The chooser was gone (closed by the page, or timed out) or would not take it.
+                return (200, "application/json", Quiet(new { ok = false, google = true, fedCm = true, site = siteOut, user = email, remembered, error = FedCmMovedOn, detail = ex.Message }));
+            }
+            if (look == FedCmLook.Scripted)
+                return (409, "application/json", Json(new { error = ScriptedLoginPage }));
+            if (look == FedCmLook.MovedOn)
+                return (200, "application/json", Quiet(new { ok = false, google = true, fedCm = true, site = siteOut, user = email, remembered, error = FedCmMovedOn }));
+            // For the chooser to close, then for the site to take the sign-in: a page it loads,
+            // or (at most two seconds more) the same page signed in.
+            for (int i = 0; i < 24 && !tab.Closed && watch.Current?.Id == dialog.Id; i++)
+                await Task.Delay(250);
+            for (int i = 0; i < 8 && !tab.Closed && watch.Current is null && tab.CommittedSourceForOtherThreads == url; i++)
+                await Task.Delay(250);
+            var after = watch.Current;
+            bool still = !tab.Closed && after is not null;
+            bool learned = asked is not null && !still && siteOut is not null && await RememberNamedAsync(siteOut, email);
+            return (200, "application/json", Quiet(new
+            {
+                ok = true,
+                google = true,
+                fedCm = true,
+                site = siteOut,
+                user = email,
+                remembered,
+                rememberedNow = learned ? true : (bool?)null,
+                submitted = true,
+                via = "chooser",
+                stillOnGoogle = still,
+                // Another of the browser's Google dialogs up after the choice (an error, or one
+                // asking to sign in to Google): said, never answered.
+                waiting = still ? after!.Type : null,
+                note = still ? GoogleStillAsking : null,
+                url = tab.Closed ? null : tab.CommittedSourceForOtherThreads,
+                dialogs = DialogsOut(tab.DialogsSince(dialogMark)),
+            }));
+        }
+
+        // Keeps an account the agent named and signed in with for the site, marked as named to
+        // it, says so in the person's log, and redraws any settings page. False when nothing
+        // new was kept (already the one, or the list could not be read at startup).
+        async Task<bool> RememberNamedAsync(string site, string email)
+        {
+            var caller = CurrentRequest.Value?.Caller ?? _session.Agents.Identify(null, null, viaMcp: false);
+            try
+            {
+                if (_session.GoogleAccounts.For(site) == email
+                    || !_session.GoogleAccounts.Remember(site, email, DateTime.UtcNow, caller.Name))
+                    return false;
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                DebugLog.WriteAlways($"a Google account named to an agent could not be remembered: {ex.Message}");
+                return false;
+            }
+            _session.Agents.Record(caller, $"Remembered which Google account to use on {site}", null, DateTime.UtcNow);
+            await OnUiAsync(() =>
+            {
+                _session.Windows.FirstOrDefault()?.PushSettingsChanged();
+                return Task.FromResult(true);
+            });
+            return true;
         }
 
         // Gets the wanted saved account into the sign-in form: first by adding a username field
@@ -2193,11 +2436,11 @@ public sealed class AgentServer
             },
             []),
         Tool("gergur_login",
-            "Sign in with a password the person saved in Gergur. When the person logs in to a site in their own window, Gergur asks whether to save it; a saved login then fills in by itself as that site's sign-in page loads, in your windows too. This checks that it did and presses the form's sign-in button (or Enter in the password field). The password never comes back to you. Call it on a freshly loaded sign-in page, before typing in it or running scripts there. With several saved accounts the most recent fills in; name another with account and it is chosen from the person's saved ones (in your own window; it borrows the keyboard for about a second). For a site that asks for the username on one page and the password on the next, type the username and continue yourself, then call this on the password page: it fills the password for the username that page carries. If nothing is filled, no login is saved for the site: ask the person with gergur_ask_person. Reports the account it signed in as and where the page went.",
+            "Sign in with a password the person saved in Gergur. When the person logs in to a site in their own window, Gergur asks whether to save it; a saved login then fills in by itself as that site's sign-in page loads, in your windows too. This checks that it did and presses the form's sign-in button (or Enter in the password field). The password never comes back to you. Call it on a freshly loaded sign-in page, before typing in it or running scripts there. With several saved accounts the most recent fills in; name another with account and it is chosen from the person's saved ones (in your own window; it borrows the keyboard for about a second). For a site that asks for the username on one page and the password on the next, type the username and continue yourself, then call this on the password page: it fills the password for the username that page carries. If nothing is filled, no login is saved for the site: ask the person with gergur_ask_person. Reports the account it signed in as and where the page went. On Google's account chooser (after Sign in with Google, as a page or as the browser's own chooser in your window), it chooses the Google account the person uses for that site, remembered from their own sign-ins, or the one named in account, which is then remembered for the site; it never clicks Google's consent screen or signs an account up to a site for the first time, which are the person's to decide.",
             new
             {
                 submit = new { type = "boolean", description = "Press sign in (true, the default), or only fill in and check (false)." },
-                account = Text("The saved username to sign in as, when the person has saved more than one for this site. Leave it out for the one the browser fills in."),
+                account = Text("The saved username to sign in as, when the person has saved more than one for this site. Leave it out for the one the browser fills in. On Google's account chooser, the Google address to choose; leave it out for the one the person uses for that site."),
                 id = Id(),
                 index = Index(),
             },
@@ -2538,6 +2781,47 @@ public sealed class AgentServer
     internal const string PickInterrupted =
         "the person is using another app, and choosing a saved account would have taken their keyboard from it, so it "
         + "was not done. Try again in a little while.";
+
+    internal const string GoogleAccountNotAnAddress = "account on a Google sign-in is the Google address to choose, such as name@gmail.com";
+
+    internal const string GoogleSiteUnknown =
+        "this Google sign-in does not say which site it is for, so no remembered account applies. Pass account with the Google address to choose, or ask the person with gergur_ask_person.";
+
+    internal const string NoGoogleAccountRemembered =
+        "no Google account is remembered for this site: the person has not signed in to it with Google in one of their own windows yet. Ask the person which account (gergur_ask_person) and pass it as account; nothing was clicked.";
+
+    internal const string GoogleAccountNotListed =
+        "that Google account is not among the accounts this sign-in offers (it may not be signed in to Google in this browser, or the page is not an account chooser). Nothing was clicked; read the page or ask the person.";
+
+    internal const string GoogleAccountUnreachable =
+        "that Google account is listed but could not be clicked (covered or off screen). Nothing was clicked.";
+
+    internal const string GoogleMovedOn =
+        "the Google page moved on before the account could be clicked, so nothing was clicked. Read the page; call gergur_login again if it is the account chooser.";
+
+    internal const string GoogleStillAsking =
+        "Google is still asking something after the account was chosen: a consent screen, a password or a check. Read the page; whether to share their details with a site is the person's to decide, so ask them (gergur_ask_person) rather than clicking Continue or Allow.";
+
+    /// <summary>What the last look before choosing in the browser's chooser found.</summary>
+    private enum FedCmLook { Chosen, Scripted, MovedOn }
+
+    internal const string FedCmNotAChooser =
+        "the browser's Google sign-in dialog up now is not an account chooser (it reports an error or asks to sign in to Google), so nothing was chosen. Ask the person (gergur_ask_person).";
+
+    internal const string FedCmNotGoogle =
+        "the browser's sign-in chooser up now offers no Google accounts, so nothing was chosen. Ask the person (gergur_ask_person).";
+
+    internal const string FedCmFirstSignIn =
+        "that Google account has not signed in to this site before: choosing it would share the person's name and email with the site, which is theirs to agree to. Nothing was chosen; ask the person (gergur_ask_person).";
+
+    internal const string FedCmQuietReturn =
+        "the browser signed back in to this site by itself, with the Google account it used last there, as it does for the person; nothing was chosen. Read the page to see where it went.";
+
+    internal const string FedCmQuietReturnOther =
+        "the browser signed back in to this site by itself, with the Google account it used last there, not the one asked for; nothing was chosen. Read the page; to use the other account, sign out of the site and sign in again, or ask the person.";
+
+    internal const string FedCmMovedOn =
+        "the browser's Google chooser closed or changed before an account could be chosen, so nothing was chosen. Read the page; call gergur_login again if the chooser is back.";
 
     internal const string PickTimedOut = "choosing the saved account did not finish in time; nothing was sent. Try again.";
 

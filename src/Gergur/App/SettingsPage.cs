@@ -29,6 +29,12 @@ internal interface ISettingsHost
 
     /// <summary>Restarts Gergur, tabs and all. Done after the request has been answered.</summary>
     void Restart();
+
+    /// <summary>The Google account the person signs in to each site with.</summary>
+    Data.GoogleAccountStore GoogleAccounts { get; }
+
+    /// <summary>Tells every open settings page to read everything again.</summary>
+    void Refresh();
 }
 
 /// <summary>
@@ -103,7 +109,30 @@ internal static class SettingsPage
                 .ToArray(),
             restartPending = RestartPending(host),
             notSaving = settings.NotSavingBecause,
+            googleAccounts = host.GoogleAccounts.Items.Select(a => new { site = a.Site, email = a.Email, namedBy = a.NamedBy }).ToArray(),
+            googleAccountsUnreadable = host.GoogleAccounts.Unreadable,
         };
+    }
+
+    /// <summary>
+    /// Forgets the Google account for one site, or for every site when <paramref name="site"/>
+    /// is null. An agent signing in there afterwards is told no account is remembered.
+    /// </summary>
+    internal static object ForgetGoogleAccount(ISettingsHost host, string? site)
+    {
+        try
+        {
+            if (site is null)
+                host.GoogleAccounts.ForgetAll();
+            else if (!host.GoogleAccounts.Forget(site))
+                throw new SettingsPageException($"No Google account is remembered for {site}.");
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            throw new SettingsPageException("It was not forgotten. " + ex.Message);
+        }
+        host.Refresh();
+        return new { };
     }
 
     private static object DescribeOne(ISettingsHost host, PropertyInfo property)

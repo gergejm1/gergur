@@ -742,6 +742,10 @@ public sealed class MainForm : Form
 
         public void Restart() => Later(window.RestartForNewEngineFlags);
 
+        public GoogleAccountStore GoogleAccounts => session.GoogleAccounts;
+
+        public void Refresh() => window.PushSettingsChanged();
+
         private void Later(Action action)
         {
             if (!window.IsDisposed && window.IsHandleCreated)
@@ -750,7 +754,7 @@ public sealed class MainForm : Form
     }
 
     /// <summary>Tells every open settings page, in every window, to read the settings again.</summary>
-    private void PushSettingsChanged()
+    internal void PushSettingsChanged()
     {
         foreach (var window in _session?.Windows ?? [])
         {
@@ -2347,6 +2351,26 @@ public sealed class MainForm : Form
         // A sign-in popup closing itself is the normal end of an OAuth handshake.
         // It still goes on the reopen stack, so a surprise close is one Ctrl+Shift+T away.
         tab.CloseRequested += (_, _) => _ = CloseTabAsync(tab);
+        // The person picking a Google account for a site, remembered for agents signing in there
+        // later. Never an agent's pick: not in an agent's window, nor in a tab (or the tab that
+        // opened it) an agent acted in just before.
+        tab.GoogleAccountChosen += (_, choice) =>
+        {
+            if (_session is null || !GoogleSignIn.IsThePersonsChoice(OpenedByAgent, tab))
+                return;
+            string site = GoogleSignIn.SiteOf(choice.Url);
+            if (site.Length == 0)
+                return;
+            try
+            {
+                if (_session.GoogleAccounts.Remember(site, choice.Email, DateTime.UtcNow))
+                    PushSettingsChanged();
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                DebugLog.WriteAlways($"a Google account choice could not be remembered: {ex.Message}");
+            }
+        };
         tab.PageRequest += (_, request) =>
         {
             if (PageServicesFor(tab) is { } services)

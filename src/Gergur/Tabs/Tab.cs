@@ -408,6 +408,11 @@ public sealed class Tab : ITabHandle, IDisposable
         await core.AddScriptToExecuteOnDocumentCreatedAsync(ErrorReporterScript);
         // Gmail's service worker wedges every page it controls here; see SiteWorkarounds.
         await core.AddScriptToExecuteOnDocumentCreatedAsync(SiteWorkarounds.GmailNoServiceWorkerScript);
+        // Which Google account the person picks on a sign-in; see GoogleSignIn.
+        await core.AddScriptToExecuteOnDocumentCreatedAsync(GoogleSignIn.ChoiceScript);
+        // Google's own sign-in chooser, the one the browser draws, watched in an agent's window
+        // only; before the first navigation so a page that asks at once is seen.
+        await RefreshFedCmAsync();
 
         State = TabState.Hidden;
         if (navigateToStoredUrl && Url is not ("" or "about:blank"))
@@ -477,6 +482,49 @@ public sealed class Tab : ITabHandle, IDisposable
     // The text is kept as well, because it carries the relaxed sites: a change to that list
     // swaps the registered script for one with the new list in it.
     private (CoreWebView2 Core, Task<string> Id, string Text)? _pageCleanupScript;
+
+    /// <summary>The FedCM chooser watch, in an agent's window only; see <see cref="FedCmWatch"/>.</summary>
+    private FedCmWatch? _fedCm;
+    private bool _fedCmStarting;   // UI thread only
+
+    /// <summary>The FedCM watch, for any thread; null outside an agent's window.</summary>
+    internal FedCmWatch? FedCm => Volatile.Read(ref _fedCm);
+
+    /// <summary>
+    /// Watches FedCM in an agent's window and stops in the person's. UI thread. A start still
+    /// under way when the tab moves is settled when it lands, by where the tab is then (no
+    /// await between that look and keeping or stopping it). A start the engine refuses is
+    /// written down and not tried again until the next view or move.
+    /// </summary>
+    private async Task RefreshFedCmAsync()
+    {
+        if (Core is not { } core)
+            return;
+        bool agentWindow = _owner.IsAgentWindow();
+        if (!agentWindow)
+        {
+            if (Interlocked.Exchange(ref _fedCm, null) is { } old)
+                old.Stop();
+            return;
+        }
+        if (_fedCm is not null || _fedCmStarting)
+            return;
+        _fedCmStarting = true;
+        try
+        {
+            var watch = await FedCmWatch.StartAsync(core);
+            if (watch is null)
+                return;
+            if (Core != core || !_owner.IsAgentWindow())
+                watch.Stop();
+            else
+                Volatile.Write(ref _fedCm, watch);
+        }
+        finally
+        {
+            _fedCmStarting = false;
+        }
+    }
 
     /// <summary>The cleanup script these settings want registered, or none.</summary>
     private static string? CleanupScriptFor(Settings settings)
@@ -1194,6 +1242,8 @@ public sealed class Tab : ITabHandle, IDisposable
         {
             DebugLog.Write($"the dialog setting could not be changed: {ex.Message}");
         }
+        // Google's chooser is watched in an agent's window only; see FedCmWatch.
+        _ = RefreshFedCmAsync();
     }
 
     /// <summary>
@@ -1213,6 +1263,8 @@ public sealed class Tab : ITabHandle, IDisposable
         PageRequest = null;
         NotRespondingChanged = null;
         DiscardedAfterHang = null;
+        // Whose choice it was is judged by the window the tab is in now.
+        GoogleAccountChosen = null;
     }
 
     /// <summary>
@@ -2749,6 +2801,13 @@ public sealed class Tab : ITabHandle, IDisposable
         return new InternalPages.OwnPageRefusedException(leaving: !heading);
     }
 
+    /// <summary>
+    /// An account entry was clicked on Google's sign-in page in this tab: the page's address
+    /// (which says the site it is for) and the account. Whether it was the person is the
+    /// window's to decide.
+    /// </summary>
+    internal event EventHandler<(string Url, string Email)>? GoogleAccountChosen;
+
     private void OnWebMessageReceived(object? sender, CoreWebView2WebMessageReceivedEventArgs e)
     {
         try
@@ -2772,6 +2831,9 @@ public sealed class Tab : ITabHandle, IDisposable
                 AddResourceFailure(message["GERGUR_RES:".Length..]);
             else if (message.StartsWith("GERGUR_EVAL:", StringComparison.Ordinal))
                 CompleteAwaitedScript(message["GERGUR_EVAL:".Length..]);
+            // Only from Google's own sign-in page: any page can post this text.
+            else if (GoogleSignIn.ChoiceFrom(message, e.Source) is { } email)
+                GoogleAccountChosen?.Invoke(this, (e.Source, email));
         }
         catch
         {
@@ -3023,6 +3085,8 @@ public sealed class Tab : ITabHandle, IDisposable
         // Belongs to the engine going away; holding it kept that engine's wrapper alive
         // until the next build.
         _pageCleanupScript = null;
+        // Its event receivers belong to the engine going away too.
+        Interlocked.Exchange(ref _fedCm, null)?.Dispose();
 
         // The pixels went with the view. Leaving this latched meant a tab discarded after
         // fifteen minutes still claimed to have something to photograph, so a screenshot
@@ -3040,6 +3104,9 @@ public sealed class Tab : ITabHandle, IDisposable
         }
         catch { }
     }
+
+    /// <summary>Whether the tab has been closed, for any thread: a sign-in popup closes itself once it is done.</summary>
+    internal bool Closed => Volatile.Read(ref _disposed);
 
     public void Dispose()
     {

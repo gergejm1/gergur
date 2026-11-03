@@ -269,6 +269,10 @@ public static class InternalPages
             case "settings.restart":
                 SettingsHost(s).Restart();
                 return new { };
+            case "settings.forgetGoogleAccount":
+                return SettingsPage.ForgetGoogleAccount(SettingsHost(s), Text(args, "site"));
+            case "settings.forgetGoogleAccounts":
+                return SettingsPage.ForgetGoogleAccount(SettingsHost(s), null);
 
             case "agents.list":
                 return AgentsPage.Describe(AgentsHost(s), DateTime.UtcNow);

@@ -60,6 +60,7 @@
                 if (row) update(row, item);
             });
         });
+        renderGoogle(model);
         showRestart(model.restartPending);
         notSaving.hidden = !model.notSaving;
         notSaving.textContent = model.notSaving
@@ -97,6 +98,84 @@
             box.appendChild(list);
             sectionsHost.appendChild(box);
         });
+        buildGoogle();
+    }
+
+    // Google accounts: not settings but what the browser has learned, so a list of its own
+    // with Forget beside each, and found by search on what it shows.
+    var googleList = null;
+
+    function buildGoogle() {
+        var id = "s-google-accounts";
+        var link = d.el("a", "nav-link", "Google accounts");
+        link.href = "#" + id;
+        link.dataset.section = id;
+        link.addEventListener("click", function (e) {
+            e.preventDefault();
+            var target = document.getElementById(id);
+            if (target) target.scrollIntoView({ behavior: "smooth", block: "start" });
+        });
+        nav.appendChild(link);
+        var box = d.el("section", "settings-section");
+        box.id = id;
+        box.dataset.searchText = "1";
+        box.appendChild(d.el("h2", "section-title", "Google accounts"));
+        box.appendChild(d.el("p", "setting-desc", "The Google account you sign in to each site with, so an agent signing in to that site for you picks the same one. Remembered when you choose it on Google's sign-in in one of your own windows, or when an agent you named it to signs in with it. Your own choice replaces an agent's."));
+        googleList = d.el("div", "list setting-list");
+        box.appendChild(googleList);
+        sectionsHost.appendChild(box);
+    }
+
+    function forget(button, op, args) {
+        button.disabled = true;
+        g.call(op, args).then(refresh, function (err) {
+            button.disabled = false;
+            d.toast(g.describeError(err));
+        });
+    }
+
+    function renderGoogle(model) {
+        if (!googleList) return;
+        d.clear(googleList);
+        var accounts = model.googleAccounts || [];
+        if (model.googleAccountsUnreadable) {
+            googleList.appendChild(d.el("p", "setting-note", "The list could not be read when Gergur started, so nothing is remembered until it can be. It is google-accounts.json in Gergur's data folder."));
+            return;
+        }
+        if (!accounts.length) {
+            googleList.appendChild(d.el("p", "setting-desc", "None yet. Sign in to a site with Google in one of your windows and it is remembered here."));
+            return;
+        }
+        accounts.forEach(function (account) {
+            var el = d.el("div", "setting");
+            var text = d.el("div", "setting-text");
+            var head = d.el("div", "setting-head");
+            head.appendChild(d.el("span", "setting-label", account.site));
+            text.appendChild(head);
+            text.appendChild(d.el("p", "setting-desc", account.email));
+            // One an agent was told, rather than one you picked: said, so a wrong one is seen.
+            if (account.namedBy) text.appendChild(d.el("p", "setting-desc", "Named to " + account.namedBy + ", an agent, when it signed in for you"));
+            var control = d.el("div", "setting-control");
+            var button = d.el("button", "btn btn-sm", "Forget");
+            button.type = "button";
+            button.setAttribute("aria-label", "Forget the Google account for " + account.site);
+            button.addEventListener("click", function () { forget(button, "settings.forgetGoogleAccount", { site: account.site }); });
+            control.appendChild(button);
+            el.appendChild(text);
+            el.appendChild(control);
+            googleList.appendChild(el);
+        });
+        if (accounts.length > 1) {
+            var all = d.el("button", "btn btn-sm", "Forget all");
+            all.type = "button";
+            all.addEventListener("click", function () { forget(all, "settings.forgetGoogleAccounts", {}); });
+            var row = d.el("div", "setting");
+            row.appendChild(d.el("div", "setting-text"));
+            var control2 = d.el("div", "setting-control");
+            control2.appendChild(all);
+            row.appendChild(control2);
+            googleList.appendChild(row);
+        }
     }
 
     function buildRow(item) {
@@ -294,6 +373,14 @@
         var words = q ? q.split(/\s+/) : [];
         Array.prototype.forEach.call(sectionsHost.children, function (section) {
             var any = false;
+            if (section.dataset.searchText) {
+                var shown = section.textContent.toLowerCase();
+                any = words.every(function (w) { return shown.indexOf(w) !== -1; });
+                section.hidden = !any;
+                var own = nav.querySelector('[data-section="' + section.id + '"]');
+                if (own) own.hidden = !any;
+                return;
+            }
             section.querySelectorAll(".setting").forEach(function (el) {
                 var row = rows.get(el.dataset.name);
                 var hit = !row || words.every(function (w) { return row.search.indexOf(w) !== -1; });
@@ -309,6 +396,7 @@
     function refresh() {
         g.call("settings.list", {}).then(render, function (err) {
             built = false;
+            googleList = null;
             rows.clear();
             d.clear(nav);
             d.showError(sectionsHost, "Could not load your settings", err, refresh);

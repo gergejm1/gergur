@@ -36,6 +36,9 @@ public sealed class AppSession
     /// <summary>Questions agents are waiting on the person for, shown in a bar across their windows.</summary>
     public AgentAsks Asks { get; } = new();
     public BookmarkStore Bookmarks { get; } = new();
+
+    /// <summary>The Google account the person signs in to each site with, learned from their own sign-ins.</summary>
+    public GoogleAccountStore GoogleAccounts { get; } = new();
     public DownloadManager Downloads { get; } = new();
     public DropStore Drop { get; } = new();
 

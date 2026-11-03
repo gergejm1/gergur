@@ -44,6 +44,8 @@ public sealed class SettingsPageTests : IDisposable
         public void TogglePhone() => Did.Add("phone");
         public void ShowPairing() => Did.Add("pairing");
         public void Restart() => Did.Add("restart");
+        public GoogleAccountStore GoogleAccounts { get; set; } = new(Path.Combine(Path.GetTempPath(), "gergur-tests", "google-accounts-" + Guid.NewGuid().ToString("N") + ".json"));
+        public void Refresh() => Did.Add("refresh");
     }
 
     private InternalPages.Services Services(ISettingsHost? host)
@@ -61,6 +63,69 @@ public sealed class SettingsPageTests : IDisposable
         => listed.GetProperty("result").GetProperty("sections").EnumerateArray()
             .SelectMany(s => s.GetProperty("items").EnumerateArray())
             .Single(i => i.GetProperty("name").GetString() == name);
+
+    [Fact]
+    public void TheGoogleAccountsAreListedAndForgottenFromThePage()
+    {
+        var host = new FakeHost { GoogleAccounts = new GoogleAccountStore(Path.Combine(_dir, "google-accounts.json")) };
+        host.GoogleAccounts.Remember("example.com", "person.a@example.com", DateTime.UtcNow);
+        host.GoogleAccounts.Remember("shop.example.org", "person.b@example.com", DateTime.UtcNow);
+
+        var listed = Ask(host, "settings.list").GetProperty("result");
+        Assert.False(listed.GetProperty("googleAccountsUnreadable").GetBoolean());
+        Assert.Equal(["example.com:person.a@example.com", "shop.example.org:person.b@example.com"],
+            listed.GetProperty("googleAccounts").EnumerateArray().Select(a => a.GetProperty("site").GetString() + ":" + a.GetProperty("email").GetString()));
+
+        Assert.True(Ask(host, "settings.forgetGoogleAccount", new { site = "example.com" }).GetProperty("ok").GetBoolean());
+        Assert.Null(new GoogleAccountStore(Path.Combine(_dir, "google-accounts.json")).For("example.com"));
+        Assert.Contains("refresh", host.Did);
+
+        var unknown = Ask(host, "settings.forgetGoogleAccount", new { site = "example.com" });
+        Assert.False(unknown.GetProperty("ok").GetBoolean());
+        Assert.Contains("No Google account is remembered for example.com", unknown.GetProperty("error").GetString());
+        Assert.Contains("site is required", Ask(host, "settings.forgetGoogleAccount").GetProperty("error").GetString());
+
+        Assert.True(Ask(host, "settings.forgetGoogleAccounts").GetProperty("ok").GetBoolean());
+        Assert.Empty(new GoogleAccountStore(Path.Combine(_dir, "google-accounts.json")).Items);
+    }
+
+    [Fact]
+    public void AnAccountAnAgentNamedSaysWhichAgent()
+    {
+        var host = new FakeHost { GoogleAccounts = new GoogleAccountStore(Path.Combine(_dir, "google-accounts.json")) };
+        host.GoogleAccounts.Remember("example.com", "person.a@example.com", DateTime.UtcNow, "Claude Code");
+        host.GoogleAccounts.Remember("shop.example.org", "person.b@example.com", DateTime.UtcNow);
+        var listed = Ask(host, "settings.list").GetProperty("result").GetProperty("googleAccounts").EnumerateArray().ToList();
+        Assert.Equal("Claude Code", listed[0].GetProperty("namedBy").GetString());
+        Assert.Equal(JsonValueKind.Null, listed[1].GetProperty("namedBy").ValueKind);
+    }
+
+    [Fact]
+    public void AnUnreadableListIsSaidAndNeverForgottenOver()
+    {
+        string path = Path.Combine(_dir, "google-accounts.json");
+        File.WriteAllText(path, "{ damaged");
+        var host = new FakeHost { GoogleAccounts = new GoogleAccountStore(path) };
+        Assert.True(Ask(host, "settings.list").GetProperty("result").GetProperty("googleAccountsUnreadable").GetBoolean());
+        var refused = Ask(host, "settings.forgetGoogleAccounts");
+        Assert.False(refused.GetProperty("ok").GetBoolean());
+        Assert.StartsWith("It was not forgotten.", refused.GetProperty("error").GetString());
+        Assert.Equal("{ damaged", File.ReadAllText(path));
+        Assert.DoesNotContain("refresh", host.Did);
+    }
+
+    [Fact]
+    public void OnlyTheSettingsPageMayForgetGoogleAccounts()
+    {
+        var host = new FakeHost { GoogleAccounts = new GoogleAccountStore(Path.Combine(_dir, "google-accounts.json")) };
+        host.GoogleAccounts.Remember("example.com", "person.a@example.com", DateTime.UtcNow);
+        foreach (var page in new[] { Page.Home, Page.History, Page.Downloads, Page.Bookmarks, Page.Agents })
+        {
+            Assert.Contains("cannot ask for", Ask(host, "settings.forgetGoogleAccounts", page: page).GetProperty("error").GetString());
+            Assert.Contains("cannot ask for", Ask(host, "settings.list", page: page).GetProperty("error").GetString());
+        }
+        Assert.Equal("person.a@example.com", host.GoogleAccounts.For("example.com"));
+    }
 
     [Fact]
     public void OnlyTheSettingsPageMayAskAndOnlyForSettings()
