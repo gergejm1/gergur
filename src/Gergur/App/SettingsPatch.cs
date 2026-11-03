@@ -17,7 +17,7 @@ namespace Gergur.App;
 /// logged-in session this browser holds, and its whole security boundary is that it
 /// listens on loopback behind a token. A handful of settings can move that boundary or
 /// give away the credential to the one listener that reaches past it, so those are read
-/// and written from the settings window and nowhere else.
+/// and written from the settings page (gergur://settings) and nowhere else.
 /// </summary>
 internal static class SettingsPatch
 {
@@ -45,7 +45,7 @@ internal static class SettingsPatch
     /// what this API can reach, and whether that outlives the agent that changed it.
     /// Every one of these is persisted and in force at the next launch, long after the
     /// session that asked is gone, and none of them shows up anywhere a person would
-    /// notice. So they are changed from the settings window, where somebody is looking
+    /// notice. So they are changed from the settings page, where somebody is looking
     /// at what they typed. Refused out loud rather than quietly dropped.
     /// </summary>
     public static readonly IReadOnlySet<string> DialogOnly = new HashSet<string>(StringComparer.Ordinal)
@@ -77,6 +77,9 @@ internal static class SettingsPatch
         // server, and it outlives the agent that set it by surviving restarts. The
         // validation stays for the crash it prevents in hand-edited files.
         nameof(Settings.SearchUrlTemplate),
+        // Sites where requests are not blocked and ads are not taken out. An agent that adds
+        // one weakens the blocker for every later launch, and nothing shows it but this list.
+        nameof(Settings.RelaxedSites),
     };
 
     /// <summary>The values a setting spelled as a string is allowed to take.</summary>
@@ -94,10 +97,21 @@ internal static class SettingsPatch
     private static readonly Dictionary<string, (int Low, int High)> Range = new(StringComparer.Ordinal)
     {
         [nameof(Settings.V8ScavengerMaxMb)] = (0, 4096),
+        // Refused over the API anyway (DialogOnly); here for the settings page, where a port
+        // of 0 or one only an administrator can listen on would stop the listener starting.
+        [nameof(Settings.VpnLocalPort)] = (1024, 65535),
+        [nameof(Settings.AgentServerPort)] = (1024, 65535),
+        [nameof(Settings.DropPort)] = (1024, 65535),
     };
 
+    /// <summary>The range a number setting must fall in, or null for any whole number.</summary>
+    internal static (int Low, int High)? RangeOf(string name) => Range.TryGetValue(name, out var range) ? range : null;
+
+    /// <summary>The values a setting spelled as a string may take, or null for any text.</summary>
+    internal static string[]? ChoicesOf(string name) => Allowed.TryGetValue(name, out var allowed) ? allowed : null;
+
     /// <summary>Every writable setting, by the name it has in the json file.</summary>
-    private static IEnumerable<PropertyInfo> Writable()
+    internal static IEnumerable<PropertyInfo> Writable()
         => typeof(Settings)
             .GetProperties(BindingFlags.Public | BindingFlags.Instance)
             .Where(p => p.CanRead && p.CanWrite && p.GetCustomAttribute<JsonIgnoreAttribute>() is null);
@@ -153,7 +167,7 @@ internal static class SettingsPatch
             }
 
             if (DialogOnly.Contains(property.Name))
-                return $"{property.Name} is changed from the settings window only";
+                return $"{property.Name} is changed from the settings page (gergur://settings) only, where a person is looking at it";
 
             object? value = Read(field.Value, property.PropertyType);
             if (value is null)
@@ -183,7 +197,7 @@ internal static class SettingsPatch
     }
 
     /// <summary>Why this value is not allowed, or null when it is.</summary>
-    private static string? Refuse(string name, object value)
+    internal static string? Refuse(string name, object value)
     {
         if (value is int number && Range.TryGetValue(name, out var range)
             && (number < range.Low || number > range.High))
@@ -196,7 +210,7 @@ internal static class SettingsPatch
         return null;
     }
 
-    private static object? Read(JsonElement value, Type type)
+    internal static object? Read(JsonElement value, Type type)
     {
         if (type == typeof(bool))
             return value.ValueKind switch
@@ -214,7 +228,7 @@ internal static class SettingsPatch
         return null;
     }
 
-    private static string Describe(Type type)
+    internal static string Describe(Type type)
         => type == typeof(bool) ? "true or false"
         : type == typeof(int) ? "a whole number"
         : type == typeof(string) ? "a string"

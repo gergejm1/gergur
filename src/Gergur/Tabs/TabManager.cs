@@ -224,10 +224,14 @@ public sealed class TabManager
     /// recorded a url and about:blank is not remembered, but that is a side effect of
     /// NavigateAsync rather than a decision, and this should not depend on it.
     /// </summary>
-    internal async Task<Tab?> OpenOrDiscardAsync(string url, bool activate)
+    internal async Task<Tab?> OpenOrDiscardAsync(string url, bool activate, bool muted = false)
     {
         var previous = ActiveTab;
         var tab = new Tab(this) { ReportsBuildFailure = false };
+        // Before the view exists, which is the only point early enough for a page that plays
+        // the moment it loads.
+        if (muted)
+            tab.IsMuted = true;
         bool kept = false;
         try
         {

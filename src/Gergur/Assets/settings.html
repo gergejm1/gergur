@@ -1,0 +1,334 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- Only the Assets folder may be reached from here; see history.html. This page changes
+     the vpn, the ports and the engine's flags, so it is held to the same rule. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src file: 'unsafe-inline'; style-src file: 'unsafe-inline'; img-src file:; base-uri 'none'; form-action 'none'">
+<title>Settings</title>
+<link rel="icon" href="favicon.png?v=235fd424">
+<link rel="stylesheet" href="pages.css">
+</head>
+<body class="settings">
+<main class="page">
+  <header class="page-head">
+    <h1>Settings</h1>
+    <div class="search head-action" role="search">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="7" cy="7" r="4.6" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M10.5 10.5L14 14" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+      <input id="search" type="search" placeholder="Search settings" aria-label="Search settings" autocomplete="off" spellcheck="false">
+    </div>
+  </header>
+
+  <div id="not-saving" class="banner banner-warn" role="alert" hidden></div>
+  <div id="restart" class="banner" role="status" hidden>
+    <p><strong>Restart to finish.</strong> <span id="restart-names"></span></p>
+    <button id="restart-now" class="btn btn-solid" type="button">Restart now</button>
+  </div>
+
+  <div class="settings-body">
+    <nav id="nav" class="settings-nav" aria-label="Sections"></nav>
+    <div id="sections" class="settings-sections"></div>
+  </div>
+</main>
+
+<script src="bridge.js"></script>
+<script>
+(function () {
+    "use strict";
+    var g = window.gergur;
+    var d = g.dom;
+
+    var sectionsHost = document.getElementById("sections");
+    var nav = document.getElementById("nav");
+    var search = document.getElementById("search");
+    var restartBox = document.getElementById("restart");
+    var restartNames = document.getElementById("restart-names");
+    var restartNow = document.getElementById("restart-now");
+    var notSaving = document.getElementById("not-saving");
+
+    var rows = new Map();      // setting name -> row parts, kept so a refresh updates in place
+    var built = false;
+
+    function slug(title) { return "s-" + title.toLowerCase().replace(/[^a-z0-9]+/g, "-"); }
+
+    function render(model) {
+        if (!built) build(model);
+        model.sections.forEach(function (section) {
+            section.items.forEach(function (item) {
+                var row = rows.get(item.name);
+                if (row) update(row, item);
+            });
+        });
+        showRestart(model.restartPending);
+        notSaving.hidden = !model.notSaving;
+        notSaving.textContent = model.notSaving
+            ? "Changes here are not being saved: " + model.notSaving + ". They last until Gergur closes."
+            : "";
+        filter();
+    }
+
+    function build(model) {
+        built = true;
+        d.clear(sectionsHost);
+        d.clear(nav);
+        rows.clear();
+        model.sections.forEach(function (section) {
+            var id = slug(section.title);
+            var link = d.el("a", "nav-link", section.title);
+            link.href = "#" + id;
+            link.dataset.section = id;
+            link.addEventListener("click", function (e) {
+                e.preventDefault();
+                var target = document.getElementById(id);
+                if (target) target.scrollIntoView({ behavior: "smooth", block: "start" });
+            });
+            nav.appendChild(link);
+
+            var box = d.el("section", "settings-section");
+            box.id = id;
+            box.appendChild(d.el("h2", "section-title", section.title));
+            var list = d.el("div", "list setting-list");
+            section.items.forEach(function (item) {
+                var row = buildRow(item);
+                rows.set(item.name, row);
+                list.appendChild(row.el);
+            });
+            box.appendChild(list);
+            sectionsHost.appendChild(box);
+        });
+    }
+
+    function buildRow(item) {
+        var el = d.el("div", "setting");
+        el.dataset.name = item.name;
+        var text = d.el("div", "setting-text");
+        var head = d.el("div", "setting-head");
+        var label = d.el("span", "setting-label", item.label);
+        label.id = "label-" + item.name;
+        head.appendChild(label);
+        if (item.restart) head.appendChild(chip("Restart", "Takes effect when Gergur restarts"));
+        if (item.caution) head.appendChild(chip("Careful", "This weakens the browser or can stop it starting", true));
+        text.appendChild(head);
+        if (item.description) text.appendChild(d.el("p", "setting-desc", item.description));
+        var note = d.el("p", "setting-note");
+        note.setAttribute("aria-live", "polite");
+        text.appendChild(note);
+        var control = d.el("div", "setting-control");
+        el.appendChild(text);
+        el.appendChild(control);
+
+        var row = { el: el, item: item, control: control, note: note, input: null, search: (item.label + " " + item.description + " " + item.name).toLowerCase() };
+        switch (item.kind) {
+            case "bool": row.input = toggle(row, function (on) { save(row, on); }); break;
+            case "phone": row.input = toggle(row, function () { togglePhone(row); }); break;
+            case "int": row.input = field(row, "number"); break;
+            case "text": row.input = field(row, "text"); break;
+            case "choice": row.input = select(row); break;
+            case "key": keyButtons(row); break;
+        }
+        return row;
+    }
+
+    function chip(text, title, warn) {
+        var c = d.el("span", warn ? "chip chip-warn" : "chip", text);
+        c.title = title;
+        return c;
+    }
+
+    function toggle(row, onChange) {
+        var input = d.el("input", "switch");
+        input.type = "checkbox";
+        input.setAttribute("role", "switch");
+        input.setAttribute("aria-labelledby", "label-" + row.item.name);
+        input.addEventListener("change", function () { onChange(input.checked); });
+        row.control.appendChild(input);
+        return input;
+    }
+
+    function field(row, type) {
+        var input = d.el("input", "field" + (type === "number" ? " field-number" : ""));
+        input.type = type;
+        input.spellcheck = false;
+        input.autocomplete = "off";
+        input.setAttribute("aria-labelledby", "label-" + row.item.name);
+        if (type === "number") {
+            if (row.item.min !== null) input.min = String(row.item.min);
+            if (row.item.max !== null) input.max = String(row.item.max);
+            input.step = "1";
+        }
+        // Saved when it is left or Enter is pressed; Esc puts back what is saved.
+        input.addEventListener("change", function () {
+            if (type === "number") {
+                var n = Number(input.value);
+                if (input.value.trim() === "" || !Number.isInteger(n)) {
+                    fail(row, "Enter a whole number.");
+                    return;
+                }
+                save(row, n);
+            } else {
+                save(row, input.value);
+            }
+        });
+        input.addEventListener("keydown", function (e) {
+            if (e.key === "Enter") input.blur();
+            if (e.key === "Escape") { show(row, row.item.value); setNote(row, ""); input.blur(); }
+        });
+        row.control.appendChild(input);
+        return input;
+    }
+
+    function select(row) {
+        var input = d.el("select", "field field-select");
+        input.setAttribute("aria-labelledby", "label-" + row.item.name);
+        fillChoices(input, row.item);
+        input.addEventListener("change", function () { save(row, input.value); });
+        row.control.appendChild(input);
+        return input;
+    }
+
+    function fillChoices(input, item) {
+        d.clear(input);
+        (item.choices || []).forEach(function (choice) {
+            var option = d.el("option", null, choice === "" ? "First available" : choice);
+            option.value = choice;
+            input.appendChild(option);
+        });
+    }
+
+    function keyButtons(row) {
+        var pair = d.el("button", "btn btn-sm", "Show pairing link");
+        pair.type = "button";
+        pair.addEventListener("click", function () {
+            g.call("settings.showPairing", {}).catch(function (err) { d.toast(g.describeError(err)); });
+        });
+        var renew = d.el("button", "btn btn-sm btn-danger", "New key");
+        renew.type = "button";
+        var armed = false;
+        var disarm = null;
+        renew.addEventListener("click", function () {
+            if (!armed) {
+                // Asked in place rather than in a dialog: a second press within a few seconds.
+                armed = true;
+                renew.textContent = "Press again to revoke phones";
+                disarm = window.setTimeout(function () { armed = false; renew.textContent = "New key"; }, 4000);
+                return;
+            }
+            window.clearTimeout(disarm);
+            armed = false;
+            renew.textContent = "New key";
+            g.call("settings.newPairingKey", {}).then(function () {
+                setNote(row, "New key made. Phones paired before need the new link.", true);
+                refresh();
+            }, function (err) { fail(row, g.describeError(err)); });
+        });
+        row.control.appendChild(pair);
+        row.control.appendChild(renew);
+        row.pairButton = pair;
+    }
+
+    function show(row, value) {
+        var input = row.input;
+        if (!input) return;
+        if (input.type === "checkbox") input.checked = !!value;
+        else if (input !== document.activeElement) input.value = value === null || value === undefined ? "" : String(value);
+    }
+
+    function update(row, item) {
+        var choicesChanged = JSON.stringify(row.item.choices) !== JSON.stringify(item.choices);
+        row.item = item;
+        if (item.kind === "choice" && choicesChanged) fillChoices(row.input, item);
+        if (item.kind === "key") {
+            row.pairButton.disabled = !item.value;
+        }
+        if (!row.busy) show(row, item.value);
+    }
+
+    function setNote(row, text, good) {
+        row.note.textContent = text;
+        row.note.classList.toggle("is-good", !!good);
+        row.note.classList.toggle("is-bad", !!text && !good);
+        row.el.classList.toggle("is-invalid", !!text && !good);
+        if (good && text) {
+            var shown = text;
+            window.setTimeout(function () { if (row.note.textContent === shown) setNote(row, ""); }, 2500);
+        }
+    }
+
+    function fail(row, message) { setNote(row, message, false); }
+
+    function save(row, value) {
+        row.busy = true;
+        g.call("settings.set", { name: row.item.name, value: value }).then(function (answer) {
+            row.busy = false;
+            row.item.value = answer.value;
+            show(row, answer.value);
+            if (answer.problem) {
+                fail(row, answer.problem);
+            } else {
+                setNote(row, row.item.restart ? "Saved. Restart to apply." : "Saved.", true);
+            }
+            showRestart(answer.restartPending);
+        }, function (err) {
+            row.busy = false;
+            fail(row, g.describeError(err));
+            // A switch that was refused goes back to what is in force; a typed value stays to be fixed.
+            if (row.input && row.input.type === "checkbox") show(row, row.item.value);
+        });
+    }
+
+    function togglePhone(row) {
+        // The browser asks before turning it on, so the switch shows what is, not what was asked.
+        show(row, row.item.value);
+        g.call("settings.togglePhone", {}).catch(function (err) { fail(row, g.describeError(err)); });
+    }
+
+    function showRestart(names) {
+        names = Array.isArray(names) ? names : [];
+        restartBox.hidden = names.length === 0;
+        restartNames.textContent = names.length ? "Waiting for a restart: " + names.join(", ") + "." : "";
+    }
+
+    function filter() {
+        var q = search.value.trim().toLowerCase();
+        var words = q ? q.split(/\s+/) : [];
+        Array.prototype.forEach.call(sectionsHost.children, function (section) {
+            var any = false;
+            section.querySelectorAll(".setting").forEach(function (el) {
+                var row = rows.get(el.dataset.name);
+                var hit = !row || words.every(function (w) { return row.search.indexOf(w) !== -1; });
+                el.hidden = !hit;
+                if (hit) any = true;
+            });
+            section.hidden = !any;
+            var link = nav.querySelector('[data-section="' + section.id + '"]');
+            if (link) link.hidden = !any;
+        });
+    }
+
+    function refresh() {
+        g.call("settings.list", {}).then(render, function (err) {
+            built = false;
+            rows.clear();
+            d.clear(nav);
+            d.showError(sectionsHost, "Could not load your settings", err, refresh);
+        });
+    }
+
+    search.addEventListener("input", filter);
+    restartNow.addEventListener("click", function () {
+        restartNow.disabled = true;
+        g.call("settings.restart", {}).catch(function (err) {
+            restartNow.disabled = false;
+            d.toast("Could not restart. " + g.describeError(err));
+        });
+    });
+    // Changed from the menu or another window: the browser says so, or the page asks again when shown.
+    g.on("settings", refresh);
+    document.addEventListener("visibilitychange", function () { if (!document.hidden) refresh(); });
+
+    refresh();
+})();
+</script>
+</body>
+</html>

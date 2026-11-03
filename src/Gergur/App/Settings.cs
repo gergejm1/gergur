@@ -7,7 +7,8 @@ namespace Gergur.App;
 
 public sealed class Settings
 {
-    // Categories are ordered by the leading digit, which the settings window strips.
+    // Categories carry a leading digit from the property grid this used to feed; the settings
+    // page strips it (SettingsPage.SectionOf) and orders the sections itself.
     private const string Engine = "2 Engine (restart required)";
     private const string Browsing = "3 Browsing";
     private const string Privacy = "4 Privacy and blocking";
@@ -63,6 +64,10 @@ public sealed class Settings
     [Category(Privacy), DisplayName("Page-level ad cleanup")]
     [Description("Cosmetic filtering and the YouTube ad neutralizer injected into every page. Applies from the next page each tab loads.")]
     public bool PageAdCleanup { get; set; } = true;
+
+    [Category(Privacy), DisplayName("Sites with blocking relaxed")]
+    [Description("Sites, separated by semicolons, where requests are not blocked and ads are not taken out of the page; a video ad that plays is still muted, sped up and skipped. For YouTube, which stops playing videos for a browser it decides blocks ads. Applies from the next page each tab loads.")]
+    public string RelaxedSites { get; set; } = "";
 
     [Category(Privacy), DisplayName("Save passwords")]
     [Description("Engine-level password autosave, DPAPI-encrypted inside the profile. Applies at once, open tabs included.")]

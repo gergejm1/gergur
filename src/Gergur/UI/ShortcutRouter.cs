@@ -39,6 +39,9 @@ public sealed class ShortcutRouter
             case Keys.Control | Keys.T:
                 Post(() => _form.NewTabAsync());
                 return true;
+            case Keys.Control | Keys.N:
+                Post(() => _form.NewWindowAsync());
+                return true;
             case Keys.Control | Keys.W:
             case Keys.Control | Keys.F4:
                 Post(() => _form.CloseActiveTabAsync());

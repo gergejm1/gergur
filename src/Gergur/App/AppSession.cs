@@ -23,12 +23,21 @@ public sealed class AppSession
     private readonly object _windowsLock = new();
 
     public Settings Settings { get; }
+
+    /// <summary>The settings this engine was started with: what a change to a restart setting is measured against.</summary>
+    public Settings StartedWith { get; }
     public BrowserEnvironment Env { get; }
     public RequestBlocker Blocker { get; }
     public HistoryStore History { get; } = new();
+
+    /// <summary>What agents have done since the browser started, for the agents panel.</summary>
+    public AgentActivity Agents { get; } = new();
     public BookmarkStore Bookmarks { get; } = new();
     public DownloadManager Downloads { get; } = new();
     public DropStore Drop { get; } = new();
+
+    /// <summary>When the phone panel was last opened in any window: what came from the phone after it is new, and dots the phone button.</summary>
+    public DateTime DropSeenUtc { get; set; } = DateTime.UtcNow;
     public DropServer? PhoneBridge { get; private set; }
     public VpnTunnel Vpn { get; }
     public AgentServer? Agent { get; private set; }
@@ -45,7 +54,29 @@ public sealed class AppSession
     /// </summary>
     public MainForm? LastActiveWindow { get; private set; }
 
-    public void NoteActive(MainForm window) => LastActiveWindow = window;
+    /// <summary>
+    /// The person's own window they were in last, never an agent's: where the screen goes
+    /// back to when they hide an agent's window they brought forward. LastActiveWindow will
+    /// not do, because bringing the agent's window forward made it that.
+    /// </summary>
+    public MainForm? LastPersonsWindow { get; private set; }
+
+    public void NoteActive(MainForm window)
+    {
+        LastActiveWindow = window;
+        if (!window.OpenedByAgent)
+            LastPersonsWindow = window;
+    }
+
+    /// <summary>
+    /// Which window to put in front when an agent's window is hidden again: the person's one
+    /// used last if it can take the front, otherwise the first that can, otherwise none (the
+    /// agent's window still goes to the back). Apart from any window, so a test can pin it.
+    /// </summary>
+    internal static T? WindowToReturnTo<T>(IReadOnlyList<T> windows, T? lastPersons, T leaving, Func<T, bool> canTakeTheFront) where T : class
+        => lastPersons is not null && !ReferenceEquals(lastPersons, leaving) && windows.Contains(lastPersons) && canTakeTheFront(lastPersons)
+            ? lastPersons
+            : windows.FirstOrDefault(w => !ReferenceEquals(w, leaving) && canTakeTheFront(w));
 
     /// <summary>
     /// The window a request that names none means: the one last brought to the front, or
@@ -59,6 +90,27 @@ public sealed class AppSession
             windows = _windows.ToArray();
         return PickWindow(windows, LastActiveWindow);
     }
+
+    /// <summary>
+    /// Where a link from another app opens: the person's own window used last, so having
+    /// just looked at an agent's window does not send their link into it (and make it
+    /// theirs). The window in use when none of theirs is left.
+    /// </summary>
+    public MainForm? WindowForPersonsLink()
+    {
+        MainForm[] windows;
+        lock (_windowsLock)
+            windows = _windows.ToArray();
+        return PickPersonsWindow(windows, LastPersonsWindow, LastActiveWindow, w => !w.OpenedByAgent);
+    }
+
+    /// <summary>
+    /// The choice for <see cref="WindowForPersonsLink"/>, apart from any window, so a test can
+    /// pin it: their last window, else any of theirs, else the window in use.
+    /// </summary>
+    internal static T? PickPersonsWindow<T>(IReadOnlyList<T> windows, T? lastPersons, T? lastActive, Func<T, bool> isTheirs) where T : class
+        => lastPersons is not null && windows.Contains(lastPersons) ? lastPersons
+            : windows.FirstOrDefault(isTheirs) ?? PickWindow(windows, lastActive);
 
     /// <summary>The choice itself, apart from any window, so a test can pin it.</summary>
     internal static T? PickWindow<T>(IReadOnlyList<T> windows, T? last) where T : class
@@ -74,6 +126,7 @@ public sealed class AppSession
     private AppSession(Settings settings, BrowserEnvironment env, RequestBlocker blocker, VpnTunnel vpn)
     {
         Settings = settings;
+        StartedWith = settings.Clone();
         Env = env;
         Blocker = blocker;
         Vpn = vpn;
@@ -82,7 +135,7 @@ public sealed class AppSession
     /// <summary>The tunnel must already be listening: the engine reads its proxy flag at startup.</summary>
     public static async Task<AppSession> CreateAsync(Settings settings, VpnTunnel vpn)
     {
-        var blocker = new RequestBlocker(settings.BlocklistEnabled);
+        var blocker = new RequestBlocker(settings.BlocklistEnabled) { Relaxed = RelaxedSites.Parse(settings.RelaxedSites) };
         var env = await BrowserEnvironment.CreateAsync(settings);
         return Current = new AppSession(settings, env, blocker, vpn);
     }
@@ -175,6 +228,8 @@ public sealed class AppSession
             _windows.Remove(window);
         if (LastActiveWindow == window)
             LastActiveWindow = null;
+        if (LastPersonsWindow == window)
+            LastPersonsWindow = null;
         if (_windows.Count > 0)
             return;
         Agent?.Stop();

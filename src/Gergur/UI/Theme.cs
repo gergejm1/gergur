@@ -32,6 +32,8 @@ public static class Theme
     /// those is back above where the blue was.
     /// </summary>
     public static readonly Color Accent = Color.FromArgb(250, 61, 77);
+    /// <summary>"Working right now", for an agent: green, because the crimson accent beside it reads as a warning.</summary>
+    public static readonly Color Live = Color.FromArgb(87, 204, 140);
     public static readonly Color InputBg = Color.FromArgb(48, 20, 28);
     public static readonly Color Border = Color.FromArgb(92, 42, 56);
 
@@ -69,6 +71,9 @@ public static class Theme
     }
 
     public static Font IconFont(float size) => new(IconFontFamily, size);
+
+    /// <summary>The family <see cref="IconFont"/> uses: Segoe Fluent Icons, or MDL2 Assets where that is missing.</summary>
+    public static string IconFontName => IconFontFamily;
 }
 
 /// <summary>

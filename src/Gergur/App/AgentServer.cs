@@ -26,6 +26,20 @@ public sealed class AgentServer
     public static readonly string TokenPath = Path.Combine(Settings.DataDir, "agent-token.txt");
 
     private readonly AppSession _session;
+
+    /// <summary>
+    /// The request being answered on this flow: who sent it, and an MCP session id to hand
+    /// back when the request was an initialize. An object rather than values, because the
+    /// session is started deep inside the JSON-RPC handler and an AsyncLocal set there would
+    /// not flow back out to the code that writes the response.
+    /// </summary>
+    private sealed class RequestContext
+    {
+        public required AgentCaller Caller;
+        public string? SessionToSend;
+    }
+
+    private static readonly AsyncLocal<RequestContext?> CurrentRequest = new();
     private readonly int _port;
     private TcpListener? _listener;
     private CancellationTokenSource? _cts;
@@ -249,8 +263,13 @@ public sealed class AgentServer
                 return;
             }
 
+            headers.TryGetValue("mcp-session-id", out var sessionId);
+            headers.TryGetValue("x-gergur-agent", out var agentName);
+            var context = new RequestContext { Caller = _session.Agents.Identify(sessionId, agentName, viaMcp: path == "/mcp") };
+            CurrentRequest.Value = context;
+
             var (status, contentType, payload) = await RouteAsync(method, path, query, body);
-            await WriteAsync(stream, status, contentType, payload);
+            await WriteAsync(stream, status, contentType, payload, context.SessionToSend);
         }
         catch (Exception ex)
         {
@@ -294,11 +313,59 @@ public sealed class AgentServer
         // it. Refused the same as when it was there from the start, for http and MCP alike.
         try
         {
-            return await RouteRequestAsync(method, path, query, body);
+            var result = await RouteRequestAsync(method, path, query, body);
+            NoteForAgentsPanel(method, path, query, body, result);
+            return result;
         }
         catch (InternalPages.OwnPageRefusedException refused)
         {
             return Refusal(refused);
+        }
+    }
+
+    /// <summary>
+    /// Records a request that did something in the agents panel's log. /mcp itself is not
+    /// an action: each tool call inside it comes back through here as the route it maps to.
+    /// Only what was done and to which tab: never what was typed, run or read.
+    /// </summary>
+    private void NoteForAgentsPanel(string method, string path, Dictionary<string, string> query, JsonDocument? body, (int, string, byte[]) result)
+    {
+        try
+        {
+            var (status, _, payload) = result;
+            if (path == "/mcp" || status is < 200 or >= 300)
+                return;
+            var caller = CurrentRequest.Value?.Caller ?? _session.Agents.Identify(null, null, viaMcp: false);
+            string? tabId = StringValue(query, body, "id");
+            if (path is "/open" or "/window")
+                tabId = IdIn(payload) ?? tabId;
+            // The caller's own text otherwise, shown in the person's panel: only a tab id goes in.
+            if (!AgentActivity.IsTabId(tabId))
+                tabId = null;
+            string text = AgentActivity.Describe(method, path, tabId, StringValue(query, body, "url"));
+            _session.Agents.Record(caller, text, tabId, DateTime.UtcNow);
+        }
+        catch (Exception ex)
+        {
+            // The log is a convenience; the request it describes has already succeeded.
+            DebugLog.Write($"agents panel note failed: {ex.Message}");
+        }
+    }
+
+    /// <summary>The "id" a response carries, for the tab an /open or /window just made.</summary>
+    internal static string? IdIn(byte[] payload)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(payload);
+            return doc.RootElement.ValueKind == JsonValueKind.Object
+                && doc.RootElement.TryGetProperty("id", out var id) && id.ValueKind == JsonValueKind.String
+                ? id.GetString()
+                : null;
+        }
+        catch (JsonException)
+        {
+            return null;
         }
     }
 
@@ -479,6 +546,7 @@ public sealed class AgentServer
                 if (_session.Windows.Count == 0)
                     return (503, "application/json", Json(new { error = "no window is ready" }));
                 bool focus = BoolFrom("focus") ?? false;
+                bool muted = BoolFrom("muted") ?? false;
                 var opened = await OnUiAsync(() => MainForm.OpenWindowAsync(_session, focus));
                 if (opened.Tabs is not { } manager)
                 {
@@ -495,7 +563,7 @@ public sealed class AgentServer
                 // the one this exists to stay out of.
                 string url = BodyString("url") ?? HomePage.Url;
                 var first = await OnUiAsync(() => manager.OpenOrDiscardAsync(
-                    UrlHeuristics.ToNavigableUrl(url, _session.Settings.SearchUrlTemplate), activate: true));
+                    UrlHeuristics.ToNavigableUrl(url, _session.Settings.SearchUrlTemplate), activate: true, muted));
                 if (first is null)
                 {
                     // Taken away again rather than left behind. Every retry otherwise made
@@ -550,6 +618,7 @@ public sealed class AgentServer
                 // default. An agent working while someone else uses the browser wants the
                 // opposite, and taking the screen away mid-sentence is how that goes wrong.
                 bool background = BoolFrom("background") ?? false;
+                bool mutedTab = BoolFrom("muted") ?? false;
 
                 // Which window. Without this, a tab always landed in the focused one, so
                 // the window /window opens to keep out of the user's way could never be
@@ -575,7 +644,7 @@ public sealed class AgentServer
                 // another blank tab, with a clean record.
                 var tab = await OnUiAsync(() => manager.OpenOrDiscardAsync(
                     UrlHeuristics.ToNavigableUrl(url, _session.Settings.SearchUrlTemplate),
-                    activate: !background));
+                    activate: !background, muted: mutedTab));
                 if (tab is null)
                     return PageCouldNotStart(null, DateTime.UtcNow);
                 return (200, "application/json", Json(new
@@ -939,6 +1008,8 @@ public sealed class AgentServer
     /// </summary>
     private static object Id() => new { type = "string", description = "Tab id from gergur_list_tabs. Stable for the life of the tab; prefer this to index." };
 
+    private static object Muted() => new { type = "boolean", description = "Open the tab muted, silent from its first frame. Use it for anything that plays sound, so testing a video does not play it at whoever is sitting at the computer." };
+
     private static object Index() => new { type = "integer", description = "Tab index from gergur_list_tabs. Omit for the active tab of the focused window." };
     /// <summary>For the tools where the index is required, so the schema and the prose agree.</summary>
     private static object NamedIndex() => new { type = "integer", description = "Tab index from gergur_list_tabs." };
@@ -1206,6 +1277,7 @@ public sealed class AgentServer
             {
                 url = Text("The url or search terms to open."),
                 background = new { type = "boolean", description = "Open without switching to it. Defaults to false." },
+                muted = Muted(),
                 window = new
                 {
                     type = "integer",
@@ -1253,6 +1325,7 @@ public sealed class AgentServer
             {
                 url = Text("Optional url to open in the new window's first tab."),
                 focus = new { type = "boolean", description = "Bring the new window to the front. Defaults to false." },
+                muted = Muted(),
             },
             []),
         Tool("gergur_read_settings",
@@ -1275,14 +1348,20 @@ public sealed class AgentServer
     ];
 
     private Task<(int, string, byte[])> HandleMcpAsync(JsonDocument? body)
-        => HandleJsonRpcAsync(body, CallToolAsync);
+        => HandleJsonRpcAsync(body, CallToolAsync, clientName =>
+        {
+            // The client named itself; give it a session to carry that name on every call.
+            string session = _session.Agents.BeginSession(clientName);
+            if (CurrentRequest.Value is { } context)
+                context.SessionToSend = session;
+        });
 
     /// <summary>
     /// The JSON-RPC envelope, split from the browser so it can be tested without an
     /// engine: every malformed-input path below is reachable with no session at all.
     /// </summary>
     internal static async Task<(int, string, byte[])> HandleJsonRpcAsync(
-        JsonDocument? body, Func<JsonElement, Task<object>> callTool)
+        JsonDocument? body, Func<JsonElement, Task<object>> callTool, Action<string?>? initialized = null)
     {
         byte[] Json(object o) => JsonSerializer.SerializeToUtf8Bytes(o);
         (int, string, byte[]) Invalid(string message) => (200, "application/json",
@@ -1321,6 +1400,7 @@ public sealed class AgentServer
         switch (method)
         {
             case "initialize":
+                initialized?.Invoke(ClientNameIn(root));
                 return (200, "application/json", Json(new
                 {
                     jsonrpc = "2.0",
@@ -1706,7 +1786,15 @@ public sealed class AgentServer
         return buf[i - 4] == '\r' && buf[i - 3] == '\n' && buf[i - 2] == '\r' && buf[i - 1] == '\n';
     }
 
-    private static async Task WriteAsync(NetworkStream stream, int status, string contentType, byte[] body)
+    /// <summary>params.clientInfo.name of an initialize, if it has one.</summary>
+    internal static string? ClientNameIn(JsonElement request)
+        => request.TryGetProperty("params", out var p) && p.ValueKind == JsonValueKind.Object
+            && p.TryGetProperty("clientInfo", out var info) && info.ValueKind == JsonValueKind.Object
+            && info.TryGetProperty("name", out var name) && name.ValueKind == JsonValueKind.String
+            ? name.GetString()
+            : null;
+
+    private static async Task WriteAsync(NetworkStream stream, int status, string contentType, byte[] body, string? mcpSessionId = null)
     {
         string reason = status switch
         {
@@ -1721,7 +1809,10 @@ public sealed class AgentServer
             _ => "Error",
         };
         var head = Encoding.ASCII.GetBytes(
-            $"HTTP/1.1 {status} {reason}\r\nContent-Type: {contentType}\r\nContent-Length: {body.Length}\r\nConnection: close\r\n\r\n");
+            $"HTTP/1.1 {status} {reason}\r\nContent-Type: {contentType}\r\nContent-Length: {body.Length}\r\n"
+            // A hex guid this server made, so nothing in it can end the header early.
+            + (mcpSessionId is null ? "" : $"Mcp-Session-Id: {mcpSessionId}\r\n")
+            + "Connection: close\r\n\r\n");
         await stream.WriteAsync(head);
         await stream.WriteAsync(body);
         await stream.FlushAsync();

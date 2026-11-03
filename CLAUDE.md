@@ -39,7 +39,7 @@ sent. Prefer the id: see "Naming a tab" below.
 | Endpoint | Body / query | Does |
 |---|---|---|
 | GET /tabs | | list tabs: id, index, window, url, title, state, active, errors |
-| POST /open | {"url": "...", "background": true?, "window": n?} | open tab, returns {id, index} |
+| POST /open | {"url": "...", "background": true?, "window": n?, "muted": true?} | open tab, returns {id, index} |
 | POST /activate | {"id": "t3"} or {"index": n} | switch to tab |
 | POST /close | {"id": "t3"} or {"index": n} | close tab |
 | POST /navigate | {"url": "...", "wait": true?, "timeout": s?} | navigate; wait returns {ok, loaded} |
@@ -52,7 +52,12 @@ sent. Prefer the id: see "Naming a tab" below.
 | POST /type | {"selector": "...", "text": "..."} | fill input (React-safe); 503 if the page is not loaded |
 | GET /settings | | {settings, restartRequired, vpnInForce, tunnelRunning}; credentials read as "(hidden)" |
 | POST /settings | {"BlocklistEnabled": false, ...} | change settings, returns {applied, restartNeededFor, unknown, persisted} |
-| POST /window | {"url": "..."?, "focus": true?} | open another window, returns {window, id} |
+| POST /window | {"url": "..."?, "focus": true?, "muted": true?} | open another window, returns {window, id} |
+
+`muted` opens the tab silent from its first frame: the mute is set on the tab before its
+view exists, and every view the tab builds afterwards starts muted. Use it for anything that
+plays sound (testing a video, a playlist): without it the only way to test YouTube was to
+play it at whoever was sitting at the computer.
 | POST /mcp | JSON-RPC 2.0 | the same surface as MCP tools; see below |
 
 ### Naming a tab
@@ -129,8 +134,10 @@ would look:
 - `SearchUrlTemplate` - where every search the person types goes. Validating it was tried
   first and was not enough: a template can be perfectly well formed and still point at
   somebody else's server.
+- `RelaxedSites` - sites where requests are not blocked and ads are not taken out. An agent
+  adding one would weaken the blocker at every later launch with nothing to show for it.
 
-Those are changed from the settings window, where somebody is looking at what they typed.
+Those are changed from the settings page (`gergur://settings`), where somebody is looking at what they typed.
 The refusal names the setting rather than dropping it quietly. It refuses in both
 directions on purpose: an agent cannot turn the phone drop or the vpn *off* either, even
 though that narrows the reach, because a coarse rule you can state in one sentence is
@@ -334,8 +341,8 @@ wakes it. The user's browsing is personal: read what the task requires, nothing 
   its tab strip, any keyboard shortcut in it, a link from another app landing in it, or a
   tab dragged in from their own window. Otherwise dragging all their tabs into an agent
   window emptied their own, which saved as nothing while the tabs lived on unsaved.
-- History, Downloads and Bookmarks are pages in a tab (`Assets/history.html`,
-  `downloads.html`, `bookmarks.html`, and the new tab page `home.html`), shown in the
+- History, Downloads, Bookmarks and Settings are pages in a tab (`Assets/history.html`,
+  `downloads.html`, `bookmarks.html`, `settings.html`, and the new tab page `home.html`), shown in the
   address bar as `gergur://history` and so on, which can also be typed, and saved in the
   session by those names rather than a path into the install. They were separate
   windows. They reach the browser only by posting web messages, and any page can post
@@ -349,7 +356,7 @@ wakes it. The user's browsing is personal: read what the task requires, nothing 
   come from the sites themselves. `OwnPagesHardeningTests` checks that every op a page
   calls is one the host answers: the bookmark Undo once called an op only the demo mode had.
 - The agent API refuses `/page`, `/html`, `/screenshot`, `/console`, `/eval`, `/click` and
-  `/type` on those pages (403). Through them it could read the whole history and bookmark
+  `/type` on those pages (403), the settings page included. Through them it could read the whole history and bookmark
   list, launch any downloaded file, or clear history without the page's own confirm,
   which is the kind of reach the `/settings` refusals exist to stop. Opening them is fine.
   Checked twice: on entry against both the address a navigation is heading to and the
@@ -473,6 +480,50 @@ wakes it. The user's browsing is personal: read what the task requires, nothing 
   cleanup switched off so an ad did render, an emulation of the skip path (mute, press
   skip, seek the ad to its end) cleared the ad in about a second and then the film never
   started, three of three: the seek to the end wedges the player on these loads.
+- So the skip no longer seeks at all (2026-11-02). An ad that has the player
+  (`ad-interrupting`, and a length an ad could be) is muted and played at 16x, and the
+  element's own speed is given back the moment the class goes. The seek was also what the
+  user reported as "playlists skip like four songs": where YouTube stitches the ad into
+  the same stream as the song, the element holds both, its length is a song's, and its end
+  is the song's end, so seeking there ended the song, the playlist moved on, and the next
+  break did the same. A wrong guess about speed costs a moment of song played fast and is
+  undone by itself; a wrong seek cost the song. `adblock.test.js` pins both ("a song with
+  an ad stitched into it is never ended").
+- The "Ad blockers are not allowed on YouTube" box is the server's
+  `bkaEnforcementMessageViewModel` (and `enforcementMessageViewModel`) under
+  `auxiliaryUi.messageRenderers` of a flagged player response. Both are pruned with the ad
+  keys at the same safe moment, and if the box renders anyway (music.youtube.com loads its
+  responses by fetch, which nothing may touch) the tick presses its close button and plays
+  the video it paused. Only if the box is still shown two ticks (about 600 ms) later does
+  it remove the dialog and the backdrops marked `opened`, once per box: a paper dialog
+  pulled out from under its overlay manager leaves that manager thinking it is open, and
+  the site's next dialog can then come up behind a backdrop nobody can close. A closed
+  paper dialog stays in the page hidden, so "shown" is read from `opened` and
+  `display`, not from the box being found. Both of these were
+  written from the report and unit tested against stub pages; the 16x run-out has still
+  not met a real stitched break (no ad ran in the live test below).
+- Playlist songs being "skipped" is YouTube refusing to play, not the ad code, measured
+  2026-11-02 on the signed-in profile with the VPN off (`yt-playlist-test.ps1` in a muted
+  agent window, then `getPlayerResponse()` on the tab): every song's
+  `playabilityStatus.status` was `ERROR` with `errorScreen.enforcementMessageViewModel`
+  ("Ad blockers violate YouTube's Terms of Service", primary button "Allow YouTube Ads"),
+  although `streamingData` was present. The video never loads (`readyState` 0, no
+  `currentSrc`), the mix treats it as unplayable and moves on about every 6 s, and no ad is
+  ever shown. Songs after the first come by fetch, which nothing here touches, and they
+  were `ERROR` too, so this is the server's verdict on the session, not something in the
+  page. The message renders inline in the player, not in a paper dialog. Pressing or
+  removing it was not tried, and is expected to change nothing, because the player has
+  no media to play. Nothing on the page
+  side can undo a server `ERROR`. What might lift it is the browser looking like it shows
+  ads on YouTube (ad requests let through, the ads muted and run out at 16x by the tick
+  that already exists), which needs a per-site exemption from the blocklist and the
+  pruning that does not exist yet; untested, and how long the flag takes to clear is not
+  known.
+- `adblock.js` is read again when its file changes (`PageCleanup.Read`, by stamp and
+  length), so trying a change no longer costs a restart: edit the copy under
+  `bin\Release\net10.0-windows\Assets\` and open a fresh tab or window (an agent window,
+  `muted: true`). Pages already open keep the script they were given. A file that cannot
+  be read keeps the last good script.
 - The ~12 second wait before a YouTube video starts is YouTube's server, not this
   browser, measured 2026-09-24. The session is flagged as blocking ads (every page carries
   `bkaEnforcementMessageViewModel`), and on loads where an ad was scheduled the player's
@@ -513,6 +564,89 @@ wakes it. The user's browsing is personal: read what the task requires, nothing 
   Nothing here captures chrome either: `Tab.CaptureScreenshotAsync` goes through the
   engine's own `CapturePreviewAsync` and gets the page alone, so the shot itself is a
   Win32 `PrintWindow` call from outside the app.
+- The menu button and the downloads button drop panels drawn by hand (`FlyoutPanel`,
+  `MainMenuFlyout`, `DownloadsFlyout`), not ContextMenuStrips, so the menu can hold tiles
+  for history, downloads and bookmarks, a zoom stepper that stays open between steps, and
+  switches that show their state. The vpn, phone drop, bookmarks and "More" lists still
+  open to the side as the ToolStripMenuItems `BuildVpnMenu` and friends have always built,
+  so what they do is unchanged; `FlyoutTests.EveryCommandTheOldMenuHadIsStillOnTheNewOne`
+  holds every call the old list made. The menu takes the keyboard (arrows, Tab, Enter, Esc;
+  Right, Enter or Space on a side-list line opens it on its first usable line). Once a side
+  list is open the menu does not drive it: WinForms' own menu filter (`ToolStripManager`)
+  sends keystrokes to the open list, which moves, skips greyed lines, picks, and closes on
+  Left or Esc by itself. A handler in the panel for those keys was written, never reached
+  in a real message loop, and taken out. The downloads panel never does: it opens by itself when a
+  download starts in the window the person is using (not an agent's, not a minimised or
+  background one, not over a fullscreen film), goes again after six seconds unless the
+  pointer is on it, and is `WS_EX_NOACTIVATE`, so it cannot take keystrokes from someone
+  typing. A window that is never active is never deactivated either, so it closes on a
+  click outside it by watching the mouse buttons globally (`GetAsyncKeyState`; the page is
+  another process's window, so this thread's own key state never sees that click). Its rows
+  open the file on click, with Show in folder and Cancel beside them, and its last line
+  opens the downloads page; Ctrl+J still goes straight to the page. A panel also goes when
+  its button moves on screen (the window moved, resized or snapped), and keeps a press
+  across the relayouts a running download makes, so Cancel can be clicked mid-download.
+  Lengths go through `S()` and fonts are made in pixels per DPI (`MakeFonts`), with the
+  handle created on the button's monitor before anything is measured. What was checked:
+  the panels rendered to images off screen from the real source; hit testing, layout and
+  focus order unit tested; and the real panels driven as real windows on a hidden desktop
+  (a scratch exe compiling the real files, the same method as the title bar work): placement
+  under the button, the click that spans two relayouts, the menu going when its window
+  moves, and the side-list keyboard (that run is what showed the filter above). All at
+  96 dpi only; a second monitor at another scale has not been tried. The downloads panel's
+  foreground-window check cannot be run on a hidden desktop (the foreground window is on
+  the real one) and is only exercised in the browser.
+- More panels hang from the toolbar, all `FlyoutPanel`s like the menu:
+  - A panel opens on its button's own monitor. A panel's window is created at the button
+    before it is measured, and `MenuPlacement` places it within that monitor's working
+    area. Before, a panel could open on the neighbouring monitor (three side by side here,
+    one at X=-1920). A side list (`ToolStripDropDown`) that still belongs to its item ignores the
+    point it is shown at and came up at 0,0; `OpenSubmenu` sets `OwnerItem = null` first.
+  - The menu's History tile opens `HistoryFlyout`: the last eight places, deduplicated,
+    with "Show all history" (Ctrl+H) through to the page. Its Downloads tile opens the
+    downloads panel rather than the page.
+  - Agents (`AgentsFlyout`, the robot button beside the menu, shown while the agent API is
+    on): every agent since start, active (green dot, 30 s after its last request) or not,
+    what it did last in a few words, and up to three of its live tabs, any of which is
+    brought forward with its window on click. MCP clients are named by `clientInfo.name`
+    from initialize, carried as the `Mcp-Session-Id` header the server now issues; REST
+    callers may send `X-Gergur-Agent: name`, otherwise they are "Script". `AgentActivity`
+    records the route, the tab and the url's site, never typed text, scripts or page
+    contents (a source check holds that).
+  - Phone drop (`PhoneFlyout`, the phone button): off, it offers Turn on (the menu's
+    `TogglePhoneBridge`, which asks first). On: Send page, Send file, Pair phone; a
+    message box where Enter sends (a file or a picture on the clipboard is sent as it is
+    by Ctrl+V); files dropped on the panel or on the button are sent; the last four items
+    open (a link in a new tab), copy, or show in folder. A program from the phone is never
+    run, as in the drop window. Files are copied into the drop, never moved
+    (`AddFileFromPath` moves its source), off the UI thread, 1 GB each at most. The
+    button gets a dot for things from the phone since the panel was last opened in any
+    window (`AppSession.DropSeenUtc`) and is dim while the drop is off.
+  - Verified: renders of every panel, unit tests, and the hidden-desktop harness (46
+    checks: placement on all three monitors, the phone panel's keyboard: letters and Space
+    go into its box, Enter sends and lists it, Tab out and typing back, Esc). That run
+    found the Recent list only refreshing through the window's listener; the panel now
+    relays itself out after a send. Not run in the real browser yet as of writing, and
+    dragging a file from Explorer onto the button has not been tried at all.
+- Per-site relax (`Settings.RelaxedSites`, the menu's "Relax blocking on {site}"):
+  requests made from a page on a relaxed site are not blocked (`RequestBlocker.Relaxed`,
+  judged by the request's own host for a document and by the page otherwise), and
+  `adblock.js` skips pruning, cosmetic css and its forced reloads there, but its ad tick
+  still mutes, runs at 16x and skips. Made for YouTube's server-side flag (see the
+  playlist note above); whether relaxing YouTube lifts it, and how fast, is not known.
+- Settings are a page now (`gergur://settings`, `SettingsPage` behind it, the menu's
+  Settings): every setting described from the attributes on `Settings`, in sections with
+  the engine last, each change saved as it is made (`ISettingsHost.Commit`: save, then
+  `ApplyLiveSettings`), refusals said under the field (ranges including ports 1024 to
+  65535, ports that clash, the search template, a vpn profile that does not exist), and a
+  banner naming what waits for a restart, measured against `AppSession.StartedWith`, with
+  Restart now. The modal `SettingsForm` is gone. This page is where the API's refused
+  settings (`SettingsPatch.DialogOnly`) are changed. The phone drop switch goes through
+  `TogglePhoneBridge`, and the pairing key never reaches the page: New key replaces it
+  (put back if it cannot be saved) and Show pairing link opens the browser's own window.
+  Verified: SettingsPageTests against a fake host, and the page driven in headless Edge
+  in demo mode (`settings.html?demo=1`, bridge.js answers the settings ops from sample
+  data). Not yet opened inside the browser itself as of writing.
 - YouTube stops starting playback through the WARP exit once it has seen enough
   traffic from it, and it looks exactly like a broken ad blocker: permanent buffering,
   no error. Turn the VPN off before suspecting anything else.

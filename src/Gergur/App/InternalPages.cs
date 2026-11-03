@@ -5,7 +5,7 @@ using Microsoft.Web.WebView2.Core;
 namespace Gergur.App;
 
 /// <summary>
-/// The browser's own pages: the new tab page, History, Downloads and Bookmarks. They are
+/// The browser's own pages: the new tab page, History, Downloads, Bookmarks and Settings. They are
 /// files in Assets shown in a tab like any page, and they reach the browser only through
 /// web messages, which this answers.
 ///
@@ -16,7 +16,7 @@ namespace Gergur.App;
 /// </summary>
 public static class InternalPages
 {
-    public enum Page { Home, History, Downloads, Bookmarks }
+    public enum Page { Home, History, Downloads, Bookmarks, Settings }
 
     private static readonly string AssetsDir = Path.Combine(AppContext.BaseDirectory, "Assets");
 
@@ -27,6 +27,7 @@ public static class InternalPages
         Page.Home => "home.html",
         Page.History => "history.html",
         Page.Downloads => "downloads.html",
+        Page.Settings => "settings.html",
         _ => "bookmarks.html",
     });
 
@@ -90,6 +91,7 @@ public static class InternalPages
             Page.History => op.StartsWith("history.", StringComparison.Ordinal),
             Page.Downloads => op.StartsWith("downloads.", StringComparison.Ordinal),
             Page.Bookmarks => op.StartsWith("bookmarks.", StringComparison.Ordinal),
+            Page.Settings => op.StartsWith("settings.", StringComparison.Ordinal),
             _ => false,
         };
     }
@@ -108,7 +110,8 @@ public static class InternalPages
         HistoryStore History,
         BookmarkStore Bookmarks,
         DownloadManager Downloads,
-        Action<string, bool> Open);
+        Action<string, bool> Open,
+        ISettingsHost? Settings = null);
 
     /// <summary>
     /// Answers one request from one of these pages, as the json posted back to it:
@@ -134,6 +137,10 @@ public static class InternalPages
             return Reply(id, result: Run(op, args, services));
         }
         catch (PageRequestException refused)
+        {
+            return Reply(id, error: refused.Message);
+        }
+        catch (SettingsPage.SettingsPageException refused)
         {
             return Reply(id, error: refused.Message);
         }
@@ -241,10 +248,32 @@ public static class InternalPages
                 s.Downloads.ClearFinished();
                 return new { };
 
+            case "settings.list":
+                return SettingsPage.Describe(SettingsHost(s));
+            case "settings.set":
+                return SettingsPage.Change(SettingsHost(s), Text(args, "name"),
+                    args.ValueKind == JsonValueKind.Object && args.TryGetProperty("value", out var value)
+                        ? value
+                        : throw new PageRequestException("value is required"));
+            case "settings.newPairingKey":
+                return SettingsPage.NewPairingKey(SettingsHost(s));
+            case "settings.togglePhone":
+                SettingsHost(s).TogglePhone();
+                return new { };
+            case "settings.showPairing":
+                SettingsHost(s).ShowPairing();
+                return new { };
+            case "settings.restart":
+                SettingsHost(s).Restart();
+                return new { };
+
             default:
                 throw new PageRequestException($"there is no {op}");
         }
     }
+
+    private static ISettingsHost SettingsHost(Services s)
+        => s.Settings ?? throw new PageRequestException("settings cannot be changed from this window yet");
 
     /// <summary>One download as the page shows it. Also what a "downloads" push carries.</summary>
     internal static object Describe(DownloadItem item) => new
@@ -299,7 +328,7 @@ public static class InternalPages
     /// and saying "cannot be read" there sent an agent away from a site it could read.</param>
     public sealed class OwnPageRefusedException(bool leaving = false) : Exception(leaving ? LeavingText : Text)
     {
-        public const string Text = "the browser's own pages (history, downloads, bookmarks, the new tab page) cannot be read or scripted through this API";
+        public const string Text = "the browser's own pages (history, downloads, bookmarks, settings, the new tab page) cannot be read or scripted through this API";
         public const string LeavingText = "that tab is still leaving one of the browser's own pages, which cannot be read or scripted through this API; "
             + "navigate with wait: true, or try again once the new page has loaded. "
             + "If that navigation does not produce a page (a download, say), navigate the tab somewhere else";

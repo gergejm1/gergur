@@ -45,6 +45,28 @@ test("a preroll break is removed from the player response", () => {
     assert.deepStrictEqual(response.streamingData.formats, [{ itag: 18 }], "the video was damaged");
 });
 
+test("the ad blocker warning is removed from the player response", () => {
+    // "Ad blockers are not allowed on YouTube": a message the server attaches to a
+    // flagged response, which the player shows, pauses for, and in its harder form stops
+    // playing after a few videos. The shape is the one a real flagged watch page carries.
+    const response = {
+        streamingData: { formats: [{ itag: 18 }] },
+        auxiliaryUi: { messageRenderers: {
+            bkaEnforcementMessageViewModel: { isVisible: true },
+            enforcementMessageViewModel: { title: {} },
+            somethingElse: { keep: true },
+        } },
+    };
+
+    prune(response);
+
+    const messages = response.auxiliaryUi.messageRenderers;
+    assert.ok(!("bkaEnforcementMessageViewModel" in messages), "the warning survived");
+    assert.ok(!("enforcementMessageViewModel" in messages), "the newer warning survived");
+    assert.deepStrictEqual(messages.somethingElse, { keep: true }, "another message was removed");
+    assert.deepStrictEqual(response.streamingData.formats, [{ itag: 18 }], "the video was damaged");
+});
+
 test("server-stitched ad config is removed", () => {
     // The case host blocking cannot touch at all: the ad is spliced into the same
     // media stream as the video, and the only defence is the player never asking.
@@ -483,6 +505,8 @@ function loadInBrowser(options) {
         pushed: [],          // what reached the real history API
         storage: (options && options.storageMap) || new Map(),
         replaced: [],   // the ones that asked to replace rather than push
+        elements: {},   // exact selector -> the one element it finds, for things that are not players
+        lists: {},      // exact selector -> what querySelectorAll finds
     };
     // Match the way a browser does: every class in the selector has to be on the
     // element. Checking one at a time would let the shipped file drop the
@@ -504,9 +528,10 @@ function loadInBrowser(options) {
         addEventListener: (type, fn, capture) => {
             if (type === "click" && capture) page.clicks.push(fn);
         },
-        querySelectorAll: () => [],
+        querySelectorAll: (selector) => page.lists[selector] || [],
         querySelector(selector) {
             page.lookups.push(selector);
+            if (Object.prototype.hasOwnProperty.call(page.elements, selector)) return page.elements[selector];
             // Only the two whole-player selectors resolve here. A selector scoped to a
             // player belongs to that player, and finding one at the document would mean
             // the shipped file had stopped scoping it.
@@ -541,13 +566,22 @@ function loadInBrowser(options) {
         setInterval: (fn, delay) => { page.ticks.push(fn); page.delays.push(delay); return 1; },
         WeakSet, JSON, Object, Array, RegExp, Math, performance: { now: () => 0 },
     };
+    // Only when a test hands one in: the rest run as a page where the tick is all there is.
+    if (options && options.MutationObserver) context.MutationObserver = options.MutationObserver;
     context.window = context;
     context.window.top = on.topFrame ? context : {};
     // window.name survives a same-tab navigation, so the harness carries it the way a
     // tab does when one is handed in.
     context.name = on.windowName || "";
     vm.createContext(context);
-    vm.runInContext(fs.readFileSync(path.join(__dirname, "adblock.js"), "utf8"), context);
+    let source = fs.readFileSync(path.join(__dirname, "adblock.js"), "utf8");
+    // The relaxed sites go in the way PageCleanup.Compose writes them: over the placeholder.
+    if (options && options.relaxed) {
+        const placeholder = "var RELAXED_SITES = [];";
+        if (source.indexOf(placeholder) < 0) throw new Error("the relaxed-sites placeholder is gone from adblock.js");
+        source = source.replace(placeholder, "var RELAXED_SITES = " + JSON.stringify(options.relaxed) + ";");
+    }
+    vm.runInContext(source, context);
 
     if (page.ticks.length !== 1) throw new Error("expected one timer, got " + page.ticks.length);
     page.tick = () => { page.lookups.length = 0; page.ticks[0](); };
@@ -582,7 +616,8 @@ test("the break is muted and run out, and the mute is lifted when it ends", () =
 
     page.tick();
     assert.strictEqual(media.muted, true, "the ad was left audible");
-    assert.strictEqual(media.currentTime, 30, "the ad was not run out");
+    assert.strictEqual(media.playbackRate, 16, "the ad was not run out fast");
+    assert.strictEqual(media.currentTime, 0, "the ad was seeked, which is what ended songs");
 
     // The break ends into an overlay ad: ad-showing stays, the element goes back to
     // holding the film. This is where the mute used to be stranded.
@@ -592,6 +627,7 @@ test("the break is muted and run out, and the mute is lifted when it ends", () =
 
     page.tick();
     assert.strictEqual(media.muted, false, "the film was left playing silently");
+    assert.strictEqual(media.playbackRate, 1, "the film was left playing fast");
     assert.strictEqual(media.currentTime, 3, "the film was seeked to its end");
 });
 
@@ -637,6 +673,7 @@ test("a skip button is pressed in preference to seeking", () => {
 
     assert.strictEqual(clicks, 1, "the skip button was not pressed");
     assert.strictEqual(media.currentTime, 0, "it seeked as well as skipping");
+    assert.strictEqual(media.playbackRate, undefined, "it sped up as well as skipping");
 });
 
 test("an ad showing over the film gets its button pressed, and the film left alone", () => {
@@ -683,13 +720,14 @@ test("a skip button that does nothing is given up on", () => {
     // Silenced on the first tick, before any of the pressing. Muting only once the
     // pressing gave up left the ad audible for a second and a half every time.
     assert.strictEqual(media.muted, true, "the ad was audible while the button was tried");
-    assert.strictEqual(media.currentTime, 0, "it seeked before trying the button");
+    assert.strictEqual(media.playbackRate, undefined, "it sped up before trying the button");
 
     for (let i = 0; i < 11; i++) page.tick();
 
     assert.strictEqual(counter.clicks, GIVE_UP_ON_SKIP_AFTER,
         "pressed " + counter.clicks + " times, expected to stop at " + GIVE_UP_ON_SKIP_AFTER);
-    assert.strictEqual(media.currentTime, 30, "the ad was never run out");
+    assert.strictEqual(media.playbackRate, 16, "the ad was never run out");
+    assert.strictEqual(media.currentTime, 0, "the ad was seeked");
 });
 
 test("giving up on one ad does not give up on the next", () => {
@@ -777,6 +815,159 @@ test("a break longer than any real ad is not seeked", () => {
 
     assert.strictEqual(film.currentTime, 120, "an hour-long video was ended as if it were an ad");
     assert.strictEqual(film.muted, false);
+    assert.strictEqual(film.playbackRate, undefined, "an hour-long video was sped up as if it were an ad");
+});
+
+test("a song with an ad stitched into it is never ended", () => {
+    // The playlist report. Where YouTube stitches the ad into the same stream as the
+    // song, the element holds both, its length is a song's, and ad-interrupting is on
+    // for the ad's part of it. Seeking to the end there ended the song and the playlist
+    // moved on to the next, which did the same. The speed-up has to leave the position
+    // alone and hand back the person's own speed the moment the ad's part is over.
+    const song = { duration: 214, currentTime: 0, muted: false, playbackRate: 1.25 };
+    const player = fakePlayer("html5-video-player ad-showing ad-interrupting", song);
+    const page = loadInBrowser();
+    page.players = [player];
+
+    page.tick();
+    song.currentTime = 15;   // the ad's part has played out, fast
+    page.tick();
+    assert.strictEqual(song.playbackRate, 16);
+
+    player.className = "html5-video-player playing-mode";
+    page.tick();
+
+    assert.strictEqual(song.currentTime, 15, "the song was moved");
+    assert.strictEqual(song.playbackRate, 1.25, "the person's own speed was not given back");
+    assert.strictEqual(song.muted, false, "the song was left muted");
+});
+
+test("the speed comes back the moment the break ends, not on the next tick", () => {
+    // A playlist plays in a background tab, where the timer runs about once a second, and
+    // a second at 16x is sixteen seconds of the song. The player dropping the class is
+    // what ends it, through an observer, with no tick in between.
+    const observers = [];
+    class FakeObserver {
+        constructor(callback) { this.callback = callback; this.target = null; observers.push(this); }
+        observe(target, options) { this.target = target; this.options = options; }
+        disconnect() { this.target = null; }
+    }
+    const song = { duration: 214, currentTime: 0, muted: false, playbackRate: 1 };
+    const player = fakePlayer("html5-video-player ad-showing ad-interrupting", song);
+    const page = loadInBrowser({ MutationObserver: FakeObserver });
+    page.players = [player];
+
+    page.tick();
+    assert.strictEqual(song.playbackRate, 16);
+    const watcher = observers.find(o => o.target === player);
+    assert.ok(watcher, "nothing watched the player for the end of the break");
+    // Made inside the page realm, so compared as text rather than as an array from this one.
+    assert.strictEqual(JSON.stringify(watcher.options.attributeFilter), JSON.stringify(["class"]));
+
+    // A change that is still the break changes nothing.
+    watcher.callback([]);
+    assert.strictEqual(song.playbackRate, 16);
+
+    player.className = "html5-video-player playing-mode";
+    watcher.callback([]);   // the class changed; no tick runs
+
+    assert.strictEqual(song.playbackRate, 1, "the song played on fast until the next tick");
+    assert.strictEqual(song.muted, false, "the song played on silent until the next tick");
+    assert.strictEqual(watcher.target, null, "the watcher was left running after the break");
+});
+
+test("a speed the person changes after the break is not fought over", () => {
+    // Restored once, when the break ends, and then left alone: a tick that went on
+    // writing a remembered speed would undo the person choosing another one.
+    const media = { duration: 30, currentTime: 0, muted: false, playbackRate: 1 };
+    const player = fakePlayer("html5-video-player ad-showing ad-interrupting", media);
+    const page = loadInBrowser();
+    page.players = [player];
+
+    page.tick();
+    player.className = "html5-video-player playing-mode";
+    page.tick();
+    media.playbackRate = 2;   // chosen from the player's own menu
+    page.tick();
+    page.tick();
+
+    assert.strictEqual(media.playbackRate, 2);
+});
+
+/// The enforcement box as the tick finds it: a close button, the paper dialog it sits in
+/// (which a working close hides, as Polymer's does, leaving it in the page), and two
+/// backdrops, one showing and one left over from a dialog closed earlier.
+function enforcementPage(options) {
+    const page = loadInBrowser();
+    const state = { closed: 0, removed: [], played: 0 };
+    const remover = { removeChild: (n) => state.removed.push(n) };
+    const dialog = {
+        opened: true, style: { display: "" }, parentNode: remover,
+        hasAttribute: (name) => name === "opened" && dialog.opened,
+    };
+    const close = {
+        click: () => {
+            state.closed++;
+            if (options.closeWorks) { dialog.opened = false; dialog.style.display = "none"; }
+        },
+    };
+    const box = {
+        parentNode: remover,
+        querySelector: () => (options.withClose ? close : null),
+        closest: (selector) => (selector === "tp-yt-paper-dialog" ? dialog : null),
+    };
+    const backdrop = { parentNode: remover };
+    const oldBackdrop = { parentNode: remover };
+    const film = { paused: options.paused, play: () => { state.played++; film.paused = false; return Promise.resolve(); } };
+    page.elements["ytd-enforcement-message-view-model"] = box;
+    page.elements["#movie_player video, .html5-video-player video"] = film;
+    page.lists["tp-yt-iron-overlay-backdrop[opened], tp-yt-iron-overlay-backdrop.opened"] = [backdrop];
+    page.lists["tp-yt-iron-overlay-backdrop"] = [backdrop, oldBackdrop];
+    return { page, state, box, dialog, backdrop, oldBackdrop, film };
+}
+
+test("the ad blocker warning is closed by its own button and the video it paused plays again", () => {
+    const { page, state } = enforcementPage({ withClose: true, closeWorks: true, paused: true });
+
+    page.tick();
+    assert.strictEqual(state.closed, 1, "its own close button was not pressed");
+    assert.strictEqual(state.played, 1, "the paused video was not resumed");
+
+    // Closed properly, so nothing is pulled out of the page, then or later.
+    page.tick();
+    page.tick();
+    assert.strictEqual(state.removed.length, 0, "a dialog its own button closed was torn out as well");
+    assert.strictEqual(state.closed, 1, "the close button was pressed again on a closed dialog");
+});
+
+test("a warning its button does not close is taken out two ticks later, with only its own backdrop", () => {
+    const { page, state, dialog, backdrop, oldBackdrop } = enforcementPage({ withClose: true, closeWorks: false, paused: true });
+
+    page.tick();
+    assert.strictEqual(state.closed, 1, "its own close button was not tried first");
+    assert.strictEqual(state.removed.length, 0, "the dialog was torn out before its own button had a chance");
+    page.tick();
+    assert.strictEqual(state.removed.length, 0, "a close still animating was given only one tick");
+
+    page.tick();
+    assert.ok(state.removed.includes(dialog), "the dialog was left on screen");
+    assert.ok(state.removed.includes(backdrop), "the page was left dimmed");
+    assert.ok(!state.removed.includes(oldBackdrop), "a backdrop of some other, closed dialog was removed");
+});
+
+test("the warning is handled once, so a video the person pauses stays paused", () => {
+    const { page, state, film } = enforcementPage({ withClose: false, paused: true });
+
+    page.tick();
+    page.tick();
+    page.tick();             // no button: taken out here
+    const played = state.played;
+    film.paused = true;      // the person pauses it themselves
+    page.tick();
+    page.tick();
+
+    assert.ok(played >= 1, "the paused video was never resumed");
+    assert.strictEqual(state.played, played, "a pause the person made was undone");
 });
 
 test("an ordinary video is not touched", () => {
@@ -810,6 +1001,39 @@ test("nothing the player lays out is hidden", () => {
     }
     // And it is still doing its job on the page furniture, which is not the player's.
     assert.ok(css.indexOf("ytd-ad-slot-renderer") >= 0);
+});
+
+test("on a relaxed site the ads are left in, nothing is hidden and nothing reloads", () => {
+    const page = loadInBrowser({ relaxed: ["youtube.com"] });
+    vm.runInContext(`var ytInitialPlayerResponse = {
+        adPlacements: [{ adPlacementRenderer: {} }],
+        videoDetails: { videoId: "abc" },
+    };`, page.context);
+    assert.ok("adPlacements" in page.context.ytInitialPlayerResponse, "the ads were taken out on a relaxed site");
+    assert.strictEqual(page.styles.length, 0, "the cosmetic rules were injected on a relaxed site");
+    assert.strictEqual(page.clicks.length, 0, "video clicks were turned into reloads on a relaxed site");
+});
+
+test("on a relaxed site an ad that plays is still muted and run out fast", () => {
+    // What makes relaxing worth it: YouTube sees its ad shown, the person barely does.
+    const page = loadInBrowser({ relaxed: ["youtube.com"] });
+    const ad = { duration: 15, currentTime: 0, muted: false, playbackRate: 1 };
+    page.players = [fakePlayer("html5-video-player ad-showing ad-interrupting", ad)];
+    page.tick();
+    assert.strictEqual(ad.playbackRate, 16, "the ad played at normal speed");
+    assert.strictEqual(ad.muted, true, "the ad played with its sound");
+});
+
+test("relaxing one site leaves every other site blocked, look-alike names included", () => {
+    for (const relaxed of [["example.com"], ["notyoutube.com"], ["tube.com"]]) {
+        const page = loadInBrowser({ relaxed });
+        vm.runInContext(`var ytInitialPlayerResponse = { adPlacements: [{}], videoDetails: { videoId: "abc" } };`, page.context);
+        assert.ok(!("adPlacements" in page.context.ytInitialPlayerResponse), "relaxing " + relaxed + " relaxed YouTube");
+        assert.strictEqual(page.styles.length, 1);
+    }
+    // And a relaxed parent covers its subdomains: music and the mobile site are YouTube too.
+    const music = loadInBrowser({ relaxed: ["youtube.com"], hostname: "music.youtube.com", href: "https://music.youtube.com/" });
+    assert.strictEqual(music.styles.length, 0, "music.youtube.com was not covered by youtube.com");
 });
 
 test("assigning the player response prunes it on the way in", () => {

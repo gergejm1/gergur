@@ -66,14 +66,6 @@ public sealed class WindowLayoutTests
     }
 
     [Fact]
-    public void SettingsFooterButtonsAreNeverClipped() => OnSta(() =>
-    {
-        using var form = new SettingsForm(new Settings());
-        _ = form.Handle; // realise the handle so DeviceDpi and docking are meaningful
-        AssertFooterFits(form, form.FooterControls, form.LayoutFooter);
-    });
-
-    [Fact]
     public void DropFooterButtonsAreNeverClipped() => OnSta(() =>
     {
         string root = Path.Combine(Path.GetTempPath(), $"gergur-drop-layout-{Guid.NewGuid():N}");

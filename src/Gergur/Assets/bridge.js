@@ -355,6 +355,57 @@
         ];
         downloads.forEach(describe);
 
+        // A few of each kind the settings page draws, in the shape the browser describes them.
+        function setting(name, label, description, kind, value, extra) {
+            return Object.assign({ name: name, label: label, description: description, kind: kind, value: value,
+                choices: null, min: null, max: null, restart: false, caution: false }, extra || {});
+        }
+        var settings = {
+            sections: [
+                { title: "Browsing", items: [
+                    setting("SearchUrlTemplate", "Search URL template", "Where a non-url address-bar entry goes. {0} is replaced with the query.", "text", "https://www.google.com/search?q={0}"),
+                    setting("ShowBookmarksBar", "Show bookmarks bar", "The strip of bookmarks under the address bar. Ctrl+Shift+B shows or hides it.", "bool", true),
+                ] },
+                { title: "Privacy and blocking", items: [
+                    setting("TrackingPrevention", "Tracking prevention", "Engine-level tracking prevention. Applies at once, open tabs included.", "choice", "Strict", { choices: ["None", "Basic", "Balanced", "Strict"] }),
+                    setting("BlocklistEnabled", "Ad and tracker blocking", "The hosts-file blocklist enforced on the request hot path. Applies immediately.", "bool", true),
+                    setting("RelaxedSites", "Sites with blocking relaxed", "Sites, separated by semicolons, where requests are not blocked.", "text", "youtube.com"),
+                ] },
+                { title: "VPN", items: [
+                    setting("VpnEnabled", "VPN enabled", "Routes engine traffic and DNS through the local tunnel.", "bool", false, { restart: true }),
+                    setting("VpnProfile", "Profile", "Which WireGuard profile the tunnel uses.", "choice", "", { choices: ["", "Cloudflare WARP", "Sweden"] }),
+                ] },
+                { title: "Phone drop", items: [
+                    setting("DropEnabled", "Phone drop enabled", "Serves a small page on your local network so a paired phone can send and receive links, messages and files.", "phone", false),
+                    setting("DropPort", "Phone drop port", "", "int", 24003, { restart: true, min: 1024, max: 65535 }),
+                    setting("DropKey", "Pairing key", "Every phone request must carry this. Change it to revoke a phone that has the link.", "key", true),
+                ] },
+                { title: "Engine", items: [
+                    setting("DisableSiteIsolation", "Disable site isolation", "Trades process isolation for fewer processes.", "bool", false, { restart: true, caution: true }),
+                    setting("V8ScavengerMaxMb", "V8 scavenger max new space (MB)", "0 leaves the engine default.", "int", 0, { restart: true, min: 0, max: 4096 }),
+                ] },
+            ],
+            restartPending: [],
+            notSaving: null,
+        };
+        var settingsAtStart = copy(settings);
+
+        function settingNamed(name) {
+            var found = null;
+            settings.sections.forEach(function (sec) { sec.items.forEach(function (i) { if (i.name === name) found = i; }); });
+            return found;
+        }
+
+        function pendingRestart() {
+            var names = [];
+            settings.sections.forEach(function (sec, a) {
+                sec.items.forEach(function (i, b) {
+                    if (i.restart && JSON.stringify(i.value) !== JSON.stringify(settingsAtStart.sections[a].items[b].value)) names.push(i.label);
+                });
+            });
+            return names;
+        }
+
         var ticker = null;
 
         function describe(d) {
@@ -485,6 +536,37 @@
                 case "downloads.clearFinished":
                     downloads = downloads.filter(function (d) { return d.state === "inProgress"; });
                     changed("downloads");
+                    return {};
+                case "settings.list":
+                    settings.restartPending = pendingRestart();
+                    return settings;
+                case "settings.set": {
+                    var item = settingNamed(text(args, "name"));
+                    if (!item) throw refusal("there is no setting called " + args.name);
+                    if (item.kind === "phone" || item.kind === "key") throw refusal(item.name + " is changed with its own button");
+                    var v = args.value;
+                    var ok = item.kind === "bool" ? typeof v === "boolean"
+                        : item.kind === "int" ? typeof v === "number" && Math.floor(v) === v
+                        : typeof v === "string";
+                    if (!ok) throw refusal(item.name + " expects " + (item.kind === "bool" ? "true or false" : item.kind === "int" ? "a whole number" : "a string"));
+                    if (item.kind === "int" && item.min !== null && (v < item.min || v > item.max))
+                        throw refusal(item.name + " expects a whole number from " + item.min + " to " + item.max);
+                    if (item.kind === "choice" && item.choices.indexOf(v) === -1)
+                        throw refusal(item.name + " expects one of " + item.choices.join(", "));
+                    if (item.name === "SearchUrlTemplate" && (v.indexOf("{0}") === -1 || !/^https?:\/\//.test(v)))
+                        throw refusal("The search url needs to be an http or https address with {0} where the search terms go");
+                    item.value = typeof v === "string" ? v.trim() : v;
+                    return { value: item.value, saved: true, problem: null, restartPending: pendingRestart() };
+                }
+                case "settings.togglePhone": {
+                    var phone = settingNamed("DropEnabled");
+                    phone.value = !phone.value;
+                    changed("settings");
+                    return {};
+                }
+                case "settings.newPairingKey":
+                case "settings.showPairing":
+                case "settings.restart":
                     return {};
                 default:
                     throw refusal("there is no " + op);

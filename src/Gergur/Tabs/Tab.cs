@@ -353,6 +353,9 @@ public sealed class Tab : ITabHandle, IDisposable
 
         _webView = webView;
         var core = webView.CoreWebView2;
+        // Before anything is navigated, so a muted tab never makes a sound.
+        if (_muted)
+            core.IsMuted = true;
 
         core.DocumentTitleChanged += OnDocumentTitleChanged;
         core.SourceChanged += OnSourceChanged;
@@ -371,12 +374,12 @@ public sealed class Tab : ITabHandle, IDisposable
         webView.KeyDown += OnWebViewKeyDown;
 
         _owner.Blocker.Attach(core);
-        if (_owner.Env.Settings.PageAdCleanup && Blocking.PageCleanup.Script is { } script)
+        if (CleanupScriptFor(_owner.Env.Settings) is { } script)
         {
             // Recorded before the await, so a settings change arriving during it sees this
             // registration and can take it away again.
             var adding = core.AddScriptToExecuteOnDocumentCreatedAsync(script);
-            _pageCleanupScript = (core, adding);
+            _pageCleanupScript = (core, adding, script);
             await adding;
         }
         await core.AddScriptToExecuteOnDocumentCreatedAsync(ErrorReporterScript);
@@ -447,7 +450,14 @@ public sealed class Tab : ITabHandle, IDisposable
     // produces it and recorded before that task is awaited: recorded after, two changes
     // inside one round trip both saw nothing registered, the script went in twice and ran
     // twice on every page, and turning it off later took away only one of the two.
-    private (CoreWebView2 Core, Task<string> Id)? _pageCleanupScript;
+    //
+    // The text is kept as well, because it carries the relaxed sites: a change to that list
+    // swaps the registered script for one with the new list in it.
+    private (CoreWebView2 Core, Task<string> Id, string Text)? _pageCleanupScript;
+
+    /// <summary>The cleanup script these settings want registered, or none.</summary>
+    private static string? CleanupScriptFor(Settings settings)
+        => settings.PageAdCleanup ? Blocking.PageCleanup.ScriptFor(Blocking.RelaxedSites.Parse(settings.RelaxedSites)) : null;
 
     // Settings that changed while this tab was suspended, applied when it wakes. Nothing is
     // pushed into a suspended view, because calls into one can wake it, and a tab woken
@@ -467,6 +477,9 @@ public sealed class Tab : ITabHandle, IDisposable
             _settingsWhileAsleep = settings;
             return;
         }
+        // One at a time: the swap below awaits between taking the old script out and putting
+        // the new one in, and two changes inside that moment registered the script twice.
+        await _settingsGate.WaitAsync();
         try
         {
             // Inside the try: the getter itself throws once the browser process is gone,
@@ -475,17 +488,21 @@ public sealed class Tab : ITabHandle, IDisposable
                 return;
             BrowserEnvironment.ApplyViewSettings(core, settings);
             bool registered = _pageCleanupScript is { } current && current.Core == core;
-            if (settings.PageAdCleanup && !registered && Blocking.PageCleanup.Script is { } script)
+            string? wanted = CleanupScriptFor(settings);
+            // Turned off, or a different script wanted (the relaxed sites changed, or the
+            // file did): the one there goes first, so a page never runs two.
+            if (registered && wanted != _pageCleanupScript!.Value.Text)
             {
-                var adding = core.AddScriptToExecuteOnDocumentCreatedAsync(script);
-                _pageCleanupScript = (core, adding);
-                await adding;
-            }
-            else if (!settings.PageAdCleanup && registered)
-            {
-                var added = _pageCleanupScript!.Value.Id;
+                var added = _pageCleanupScript.Value.Id;
                 _pageCleanupScript = null;
+                registered = false;
                 core.RemoveScriptToExecuteOnDocumentCreated(await added);
+            }
+            if (wanted is not null && !registered)
+            {
+                var adding = core.AddScriptToExecuteOnDocumentCreatedAsync(wanted);
+                _pageCleanupScript = (core, adding, wanted);
+                await adding;
             }
         }
         catch (Exception ex)
@@ -493,7 +510,13 @@ public sealed class Tab : ITabHandle, IDisposable
             // A renderer that died a moment ago. The next build takes the settings anyway.
             DebugLog.Write($"live settings not applied url={Url}: {ex.Message}");
         }
+        finally
+        {
+            _settingsGate.Release();
+        }
     }
+
+    private readonly SemaphoreSlim _settingsGate = new(1, 1);
 
     /// <summary>
     /// Whether a navigation held for a slow build should go ahead now it has finished: only
@@ -627,23 +650,30 @@ public sealed class Tab : ITabHandle, IDisposable
     }
 
     /// <summary>Silences a tab without pausing it. Note an audible tab is exempt from
-    /// suspension whether or not it is muted: it is still doing work.</summary>
+    /// suspension whether or not it is muted: it is still doing work.
+    ///
+    /// Remembered on the tab as well as set on the engine, and given to every view the tab
+    /// builds. A mute used to live only in the engine, so a tab with no view yet could not
+    /// be muted at all, and a rebuilt view came back audible. That first case is the one an
+    /// agent needs: a tab it opens muted has to be silent from its first frame, not from
+    /// the moment after the page has already started playing.</summary>
     public bool IsMuted
     {
-        get { try { return Core?.IsMuted ?? false; } catch { return false; } }
+        get { try { return Core?.IsMuted ?? _muted; } catch { return _muted; } }
         set
         {
+            _muted = value;
             try
             {
                 if (Core is { } core)
-                {
                     core.IsMuted = value;
-                    RaiseUpdated(); // the strip marks muted tabs
-                }
             }
             catch { }
+            RaiseUpdated(); // the strip marks muted tabs
         }
     }
+
+    private bool _muted;
 
     /// <summary>
     /// The page called window.close(). Chromium only honours that for windows opened by

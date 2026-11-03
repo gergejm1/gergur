@@ -309,7 +309,9 @@ public sealed class TabBuildFailureTests
 
         Assert.DoesNotContain("ContainsFocus", agent);
         Assert.Contains("_session.WindowInUse()", Body(agent, "? ActiveEntry()"));
-        Assert.Contains("session.WindowInUse()", Body(form, "static void OpenExternalUrl("));
+        // A link from another app: the person's own window used last, else the window in use.
+        Assert.Contains("session.WindowForPersonsLink()", Body(form, "static void OpenExternalUrl("));
+        Assert.Contains("PickPersonsWindow(windows, LastPersonsWindow, LastActiveWindow, w => !w.OpenedByAgent)", Body(session, "public MainForm? WindowForPersonsLink()"));
         Assert.DoesNotContain("ContainsFocus", Body(form, "static void OpenExternalUrl("));
         Assert.Contains("NoteActive(this)", Body(form, "override void OnActivated("));
         Assert.Contains("PickWindow(windows, LastActiveWindow)", Body(session, "public MainForm? WindowInUse()"));

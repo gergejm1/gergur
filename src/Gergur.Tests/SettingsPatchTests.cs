@@ -216,6 +216,8 @@ public sealed class SettingsPatchTests
             // the next launch on, while the status bar still shows the vpn as on.
             nameof(Settings.VpnLocalPort),
             nameof(Settings.SearchUrlTemplate),
+            // Sites the blocker stands down on, at every later launch.
+            nameof(Settings.RelaxedSites),
         ];
 
         foreach (string name in mustRefuse)

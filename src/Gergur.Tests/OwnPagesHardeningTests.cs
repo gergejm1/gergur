@@ -59,6 +59,7 @@ public sealed class OwnPagesHardeningTests : IDisposable
             ["history.html"] = Page.History,
             ["downloads.html"] = Page.Downloads,
             ["bookmarks.html"] = Page.Bookmarks,
+            ["settings.html"] = Page.Settings,
         };
         // Every op-shaped string literal, not only the ones written straight into a call: the
         // downloads page passes open, showInFolder and cancel through a variable. And "open",
@@ -67,7 +68,7 @@ public sealed class OwnPagesHardeningTests : IDisposable
         foreach (var (file, page) in pages)
         {
             string source = File.ReadAllText(FindSource("src", "Gergur", "Assets", file));
-            foreach (Match literal in Regex.Matches(source, @"[""'`]((?:history|bookmarks|downloads)\.(?!html\b|css\b|js\b)[A-Za-z]+)[""'`]"))
+            foreach (Match literal in Regex.Matches(source, @"[""'`]((?:history|bookmarks|downloads|settings)\.(?!html\b|css\b|js\b)[A-Za-z]+)[""'`]"))
                 ops.Add((page, literal.Groups[1].Value));
             ops.Add((page, "open"));
         }
@@ -446,9 +447,20 @@ public sealed class OwnPagesWiringTests
         Assert.Contains("OpenedByAgent = true", Body(form, "internal static async Task<MainForm> OpenWindowAsync("));
         Assert.Contains("ClaimForPerson()", Body(form, "internal static void OpenExternalUrl("));
         Assert.Contains("ClaimForPerson()", Body(form, "internal async Task AdoptTabAsync("));
-        Assert.Matches(@"TabClicked \+= async \(_, tab\) => \{ ClaimForPerson\(\);", form);
+        // Clicking between an agent's tabs is looking at its work, not taking the window over.
+        Assert.Matches(@"TabClicked \+= async \(_, tab\) => \{ await ActivateTabAsync\(tab\); \};", form);
         Assert.Matches(@"NewTabClicked \+= \(_, _\) => \{ ClaimForPerson\(\);", form);
         Assert.Matches(@"NavigationRequested \+= async \(_, url\) => \{ ClaimForPerson\(\);", form);
+        // The routes only a person takes, now that a tab click no longer claims.
+        Assert.Contains("ClaimForPerson()", Body(form, "private async Task OpenBookmarkAsync("));
+        Assert.Contains("url => { ClaimForPerson(); _ = NavigateActiveAsync(url); },", form);   // history panel
+        Assert.Contains("OpenUrl: url => { ClaimForPerson(); _ = NewTabAsync(url); },", form);  // phone panel
+        Assert.Contains("\"New tab\", \"Ctrl+T\", () => { ClaimForPerson(); _ = NewTabAsync(); }", form);
+        Assert.Contains("\"Reopen closed tab\", \"Ctrl+Shift+T\", () => { ClaimForPerson(); _ = ReopenClosedTabAsync(); }", form);
+        Assert.Contains("item.Click += (_, _) => { ClaimForPerson(); _ = NavigateActiveAsync(url); };", form);   // bookmarks submenu
+        Assert.Contains("new DropForm(_session.Drop, url => { ClaimForPerson(); _ = NewTabAsync(url); });", form);
+        // A link from another app goes to the person's own window, not an agent's they looked at.
+        Assert.Contains("session.WindowForPersonsLink()", Body(form, "internal static void OpenExternalUrl("));
         Assert.Contains("_form.ClaimForPerson()", Body(Code("src", "Gergur", "UI", "ShortcutRouter.cs"), "public bool Handle(Keys keyData)"));
     }
 

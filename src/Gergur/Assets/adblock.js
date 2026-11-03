@@ -11,6 +11,22 @@
 (function () {
     "use strict";
 
+    // Sites the person has relaxed blocking on. Gergur writes the list over this line
+    // when it registers the script (PageCleanup.Compose); kept inside this closure so a
+    // page cannot read it. On a relaxed site nothing is taken out of what the site sends
+    // and nothing is hidden, and the page is not reloaded between videos: the ads arrive
+    // as the site meant them to. A video ad that plays is still muted, run at 16x and
+    // skipped by the tick below, which is what lets YouTube see its ads being shown.
+    var RELAXED_SITES = [];
+    function relaxedHere() {
+        var host = String(location.hostname || "").toLowerCase().replace(/\.$/, "");
+        for (var r = 0; r < RELAXED_SITES.length; r++) {
+            var site = RELAXED_SITES[r];
+            if (host === site || (host.length > site.length && host.slice(-site.length - 1) === "." + site)) return true;
+        }
+        return false;
+    }
+
     // ---------------------------------------------------------------- pruning core
 
     // Keys whose value is ad payload wherever they appear. Deleting these is what
@@ -24,6 +40,14 @@
         "importantForAds",
         "daiConfig",
         "playerAdParams",
+        // Not an ad, but the "Ad blockers are not allowed on YouTube" box. It is a
+        // message the server attaches to a player response it has flagged
+        // (auxiliaryUi.messageRenderers), and the player shows it, pauses, and in its
+        // harder form refuses to carry on after a few videos, which in a playlist reads
+        // as songs going by without playing. Taken out at the same safe moment as the ad
+        // payload, before the player is handed the response.
+        "bkaEnforcementMessageViewModel",
+        "enforcementMessageViewModel",
     ];
 
     // Objects that *are* an ad. These arrive as elements of a list of things to
@@ -243,7 +267,7 @@
 
     /// How many ticks running the same skip button may be pressed without the ad going
     /// away. A script click is not a real one, and a button that ignores it would other-
-    /// wise be pressed for the whole break with the seek sitting unreachable behind it,
+    /// wise be pressed for the whole break with the speed-up sitting unreachable behind it,
     /// which is the ad playing out in full. After this many we stop believing it.
     var GIVE_UP_ON_SKIP_AFTER = 5;
 
@@ -252,9 +276,9 @@
     ///
     /// "ad-showing" on its own is not that. An overlay ad, and a server-stitched break
     /// if the daiConfig pruning ever stops taking, both set it while the element still
-    /// holds the film, and seeking to the end there ends what the viewer is watching,
+    /// holds the film, and speeding that up plays what the viewer is watching too fast,
     /// silently and looking exactly like a YouTube fault. "ad-interrupting" is the class
-    /// that says the ad has taken the element over, so only that earns the seek.
+    /// that says the ad has taken the element over, so only that earns the speed-up.
     function interrupting(player, video) {
         if (!player || !video) return false;
         if (!/(^|\s)ad-interrupting(\s|$)/.test(player.className || "")) return false;
@@ -262,7 +286,7 @@
         // And a length an ad could plausibly be. If the class ever appears over a
         // server-stitched break that still holds the film, this is what stands between
         // a wrong guess and ending a feature-length video someone is watching. Refusing
-        // to seek costs a muted ad; seeking wrongly costs them the thing itself.
+        // to speed it up costs a muted ad; speeding it up wrongly costs them the thing itself.
         return video.duration <= LONGEST_PLAUSIBLE_AD;
     }
 
@@ -334,7 +358,10 @@
             (document.head || document.documentElement).appendChild(style);
         } catch (e) { }
     }
-    if (document.readyState === "loading")
+    var RELAXED = typeof location !== "undefined" && relaxedHere();
+    if (RELAXED) {
+        // Nothing hidden on a relaxed site; the YouTube section below still runs for the tick.
+    } else if (document.readyState === "loading")
         document.addEventListener("DOMContentLoaded", injectCss);
     else
         injectCss();
@@ -370,7 +397,8 @@
     // four to five such loads apiece, never started the video at all. Re-measured three
     // of three after the prune changes that followed review, with the whole of the
     // shipped configuration on.
-    ["ytInitialPlayerResponse", "ytInitialData", "ytInitialReelWatchSequenceResponse"]
+    // Relaxed: the payload is left as the site sent it, ads and all.
+    (RELAXED ? [] : ["ytInitialPlayerResponse", "ytInitialData", "ytInitialReelWatchSequenceResponse"])
         .forEach(function (name) {
             var held = window[name];
             try {
@@ -428,7 +456,9 @@
     // has work to do on music and inside an embed, where an ad that renders is just as
     // unwelcome as one here.
     var WATCH_SITE = /^(www\.|m\.)?youtube\.com$/;
-    if (WATCH_SITE.test(location.hostname) && window.top === window) forceRealNavigation();
+    // Not on a relaxed site: reloading per video only exists so the hook above can prune
+    // the payload, and there it prunes nothing.
+    if (!RELAXED && WATCH_SITE.test(location.hostname) && window.top === window) forceRealNavigation();
 
     function forceRealNavigation() {
         // How long a video stays remembered as "just forced". Long enough to catch the
@@ -585,7 +615,7 @@
     // user's own session. Blocking an ad does not require speaking for them.
     //
     // Nothing else picks that up either, and that is the honest state of it: a survey
-    // or banner overlay sets "ad-showing" alone, so the seek below never runs on it,
+    // or banner overlay sets "ad-showing" alone, so the speed-up below never runs on it,
     // and the cosmetic list leaves the player's own furniture alone for the reasons
     // given up there. Removing it from the payload is the only thing that handles it,
     // so if one ever gets through it stays on screen.
@@ -604,8 +634,125 @@
     // silent for the rest of the session with nothing on screen to explain it.
     var mutedElement = null;
 
+    // The element we sped up, and the speed it had before, for the same reason the mute
+    // is kept by element: to be put back exactly, on exactly what was changed.
+    //
+    // Speeding through an ad replaced seeking to its end. The seek was the one thing in
+    // here that could not be taken back, and it was wrong twice over: on 2026-09-24 it
+    // wedged the player outright (three of three), and where YouTube stitches the ad into
+    // the same stream as the song, which it now does on playlists, the element's end is
+    // the song's end. Seeking there ended the song, the playlist moved on, the next one's
+    // break did the same, and songs went by without playing. A wrong guess about speed
+    // costs a moment of the song played fast and is undone as the break ends.
+    var fastElement = null;
+    var rateBefore = 1;
+    var FAST = 16;
+
+    // The enforcement box, once handled, is not handled again until it is gone: a resumed
+    // video the person then paused themselves must stay paused.
+    var enforcementHandled = null;
+    var enforcementForced = false;
+    var enforcementWaited = 0;
+
     var pressedButton = null;
     var pressedTimes = 0;
+
+    /// Puts back what the speed-up changed. Safe to call when nothing was.
+    function restoreSpeed() {
+        if (breakWatcher) {
+            try { breakWatcher.disconnect(); } catch (e) { }
+            breakWatcher = null;
+        }
+        if (!fastElement) return;
+        try { fastElement.playbackRate = rateBefore; } catch (e) { }
+        fastElement = null;
+    }
+
+    // The end of a break is caught the moment the player drops the class, not on the next
+    // tick. A playlist plays in a background tab, where the browser runs this timer about
+    // once a second at best, and a second at 16x is sixteen seconds of somebody's song.
+    // A MutationObserver is not a timer: it runs as the class changes, hidden tab or not.
+    var breakWatcher = null;
+
+    function watchForBreakEnd(player) {
+        if (breakWatcher || typeof MutationObserver !== "function") return;
+        try {
+            breakWatcher = new MutationObserver(function () {
+                try {
+                    if (/(^|\s)ad-interrupting(\s|$)/.test(player.className || "")) return;
+                    restoreSpeed();
+                    if (mutedElement) {
+                        mutedElement.muted = false;
+                        mutedElement = null;
+                    }
+                } catch (e) { }
+            });
+            breakWatcher.observe(player, { attributes: true, attributeFilter: ["class"] });
+        } catch (e) {
+            breakWatcher = null;
+        }
+    }
+
+    /// The "Ad blockers are not allowed" box, if the server's message got past the
+    /// pruning above (it arrives in a fetched response on music.youtube.com, which nothing
+    /// here may touch). Closed the way the person would, through its own close button,
+    /// and the video it paused is played. Only when that leaves it up, two ticks later, is
+    /// it taken out of the page: pulling a dialog out from under its overlay manager
+    /// first would leave that manager holding a dialog it thinks is open, and the next
+    /// dialog the site opens (a sign-in prompt, a share box) could come up behind a
+    /// backdrop nobody can close.
+    function dismissEnforcement() {
+        var box = document.querySelector("ytd-enforcement-message-view-model");
+        var dialog = box && typeof box.closest === "function" ? box.closest("tp-yt-paper-dialog") : null;
+        if (!box || !enforcementShown(dialog)) {
+            enforcementHandled = null;
+            enforcementForced = false;
+            enforcementWaited = 0;
+            return;
+        }
+        if (enforcementHandled !== box) {
+            enforcementHandled = box;
+            enforcementForced = false;
+            enforcementWaited = 0;
+            var close = box.querySelector("#dismiss-button button, button[aria-label='Close'], #dismiss-button");
+            if (close && typeof close.click === "function") close.click();
+            playPausedFilm();
+            return;
+        }
+        if (enforcementForced) return;
+        // Two ticks, about 600ms, for its own close to finish: a dialog that animates shut
+        // is still "shown" for a moment, and forcing that one out is the harm above.
+        if (++enforcementWaited < 2) return;
+        // Still up after its own button was pressed, or it had none.
+        enforcementForced = true;
+        if (dialog && dialog.parentNode) dialog.parentNode.removeChild(dialog);
+        else if (box.parentNode) box.parentNode.removeChild(box);
+        // Only the backdrop that is showing; any other belongs to a dialog that is closed.
+        var backdrops = document.querySelectorAll("tp-yt-iron-overlay-backdrop[opened], tp-yt-iron-overlay-backdrop.opened");
+        for (var b = 0; b < backdrops.length; b++) {
+            if (backdrops[b].parentNode) backdrops[b].parentNode.removeChild(backdrops[b]);
+        }
+        playPausedFilm();
+    }
+
+    /// Whether the dialog holding the box is on screen. A paper dialog that has been
+    /// closed stays in the page, hidden, so being found is not the same as being up.
+    function enforcementShown(dialog) {
+        if (!dialog) return true;
+        if (dialog.style && dialog.style.display === "none") return false;
+        if (typeof dialog.hasAttribute === "function" && !dialog.hasAttribute("opened")) return false;
+        return true;
+    }
+
+    function playPausedFilm() {
+        var film = document.querySelector("#movie_player video, .html5-video-player video");
+        if (film && film.paused && typeof film.play === "function") {
+            try {
+                var started = film.play();
+                if (started && typeof started.catch === "function") started.catch(function () { });
+            } catch (e) { }
+        }
+    }
 
     // 300ms rather than anything longer because a skip button has to be caught while it
     // is up, and rather than anything shorter because this runs for the life of every
@@ -616,6 +763,8 @@
             // A watch page behind a hover preview, or a miniplayer running while the
             // feed scrolls, put another .html5-video-player ahead of it in document
             // order, and reading that one's class list meant the ad went unnoticed.
+            try { dismissEnforcement(); } catch (e) { }
+
             var adPlayer = document.querySelector(".html5-video-player.ad-interrupting");
             var adVideo = adPlayer ? adPlayer.querySelector("video") : null;
 
@@ -627,6 +776,9 @@
                 mutedElement.muted = false;
                 mutedElement = null;
             }
+            // The speed comes back on the same gate, for the same reasons. Checked again
+            // below, once it is known whether this tick still counts as a break.
+            if (fastElement && fastElement !== adVideo) restoreSpeed();
 
             var showing = adPlayer || document.querySelector(".html5-video-player.ad-showing");
             if (!showing) {
@@ -648,6 +800,9 @@
                 adVideo.muted = true;
                 mutedElement = adVideo;
             }
+            // Still "ad-interrupting" but no longer believable as an ad (its length has
+            // grown past any real one): give the element its speed back.
+            if (!isBreak) restoreSpeed();
 
             // Scoped to that player, for the reason above.
             var skip = showing.querySelector(SKIP_SELECTORS);
@@ -668,7 +823,16 @@
                 pressedButton = null;
                 pressedTimes = 0;
             }
-            if (isBreak) adVideo.currentTime = adVideo.duration;
+            // Never a seek: see fastElement. Run the break out fast and silent instead.
+            if (isBreak) {
+                if (fastElement !== adVideo) {
+                    var rate = adVideo.playbackRate;
+                    rateBefore = typeof rate === "number" && rate > 0 && rate < FAST ? rate : 1;
+                    fastElement = adVideo;
+                    watchForBreakEnd(adPlayer);
+                }
+                if (adVideo.playbackRate !== FAST) adVideo.playbackRate = FAST;
+            }
         } catch (e) { }
     }, 300);
 })();

@@ -45,14 +45,35 @@ public sealed class MainForm : Form
     /// Opened by an agent through /window. Its tabs are the agent's work, so they are never
     /// saved as the person's session: see <see cref="AppSession.SessionOf"/>.
     /// </summary>
-    internal bool OpenedByAgent { get; private set; }
+    internal bool OpenedByAgent
+    {
+        get => _openedByAgent;
+        private set
+        {
+            if (_openedByAgent == value)
+                return;
+            _openedByAgent = value;
+            // Only an agent's window can be hidden again; once it is the person's, X closes it.
+            _hideButton.Visible = value;
+            LayoutToolbar();
+        }
+    }
+
+    private bool _openedByAgent;
 
     /// <summary>
     /// The person has used this window, so it is theirs from now on and its tabs are their
-    /// session. Called from what only a person does: typing in the address bar, clicking
-    /// the tab strip, a keyboard shortcut, a link from another app, or dragging in a tab
-    /// from a window of their own. Without it, dragging every tab into an agent's window
-    /// emptied their own, which then saved as "no tabs" while the tabs lived on unsaved.
+    /// session. Called from what only a person does: typing in the address bar, opening a
+    /// new tab from the strip or the menu, reopening a closed tab, a bookmark, a history
+    /// entry, a link from the phone panel or drop window, a keyboard shortcut, a link from
+    /// another app, or dragging in a tab from a window of their own. Without it, dragging every tab into an agent's
+    /// window emptied their own, which then saved as "no tabs" while the tabs lived on
+    /// unsaved.
+    ///
+    /// Not clicking between its tabs: that is looking at what the agent is doing, which the
+    /// agents panel brings the window forward for. Claiming on it made the window theirs
+    /// behind their back, and X then closed it for good, agent's work and all, instead of
+    /// hiding it again.
     /// </summary>
     internal void ClaimForPerson() => OpenedByAgent = false;
 
@@ -76,7 +97,17 @@ public sealed class MainForm : Form
     private ToolStripStatusLabel _memoryLabel = null!;
     private ToolStripStatusLabel _sleepLabel = null!;
     private ToolStripStatusLabel _blockedLabel = null!;
-    private ContextMenuStrip _menu = null!;
+    // Made when first opened, and owned windows of this form: see OnFormClosed.
+    private MainMenuFlyout? _mainMenu;
+    private DownloadsFlyout? _downloadsPanel;
+    private HistoryFlyout? _historyPanel;
+    private AgentsFlyout? _agentsPanel;
+    private PhoneFlyout? _phonePanel;
+    private GlyphButton _phoneButton = null!;
+    private GlyphButton _agentsButton = null!;
+    private GlyphButton _hideButton = null!;
+    private ToolTip _hideTip = null!;
+    private AppSession? _agentsHookedTo;
     private System.Windows.Forms.Timer _statusTimer = null!;
 
     /// <summary>The first window: loads settings, brings up the shared services, restores the session.</summary>
@@ -85,10 +116,10 @@ public sealed class MainForm : Form
     {
     }
 
-    private MainForm(AppSession? session, string? startupUrl, bool isSecondaryWindow, SessionWindow? restore)
+    private MainForm(AppSession? session, string? startupUrl, bool isSecondaryWindow, SessionWindow? restore, Settings? settings = null)
     {
         _session = session;
-        _settings = session?.Settings ?? Settings.Load();
+        _settings = session?.Settings ?? settings ?? Settings.Load();
         _startupUrl = startupUrl;
         _isSecondaryWindow = isSecondaryWindow;
         _restore = restore;
@@ -205,7 +236,7 @@ public sealed class MainForm : Form
         _hostPanel = new Panel { Dock = DockStyle.Fill, BackColor = Theme.WindowBg };
 
         _tabStrip = new TabStripControl { Dock = DockStyle.Top, Height = 42, Font = new Font("Segoe UI", 9.5f) };
-        _tabStrip.TabClicked += async (_, tab) => { ClaimForPerson(); await ActivateTabAsync(tab); };
+        _tabStrip.TabClicked += async (_, tab) => { await ActivateTabAsync(tab); };   // looking, not claiming: see ClaimForPerson
         _tabStrip.TabCloseClicked += async (_, tab) => { await CloseTabAsync(tab); };
         _tabStrip.NewTabClicked += (_, _) => { ClaimForPerson(); _ = NewTabAsync(); };
         _tabStrip.TabReordered += (_, move) => Tabs?.MoveTab(move.From, move.To);
@@ -225,7 +256,9 @@ public sealed class MainForm : Form
         _tabStrip.MinimizeClicked += (_, _) => WindowState = FormWindowState.Minimized;
         _tabStrip.MaximizeClicked += (_, _) =>
             WindowState = WindowState == FormWindowState.Maximized ? FormWindowState.Normal : FormWindowState.Maximized;
-        _tabStrip.CloseWindowClicked += (_, _) => BeginInvoke(new Action(Close));
+        //
+        // In an agent's window X hides it again rather than closing it: see SendBackToAgent.
+        _tabStrip.CloseWindowClicked += (_, _) => BeginInvoke(new Action(CloseOrSendBack));
 
         _toolbar = new Panel { Dock = DockStyle.Top, Height = 46, BackColor = Theme.ToolbarBg };
         _backButton = MakeToolButton(Glyphs.Back, 8);
@@ -254,16 +287,40 @@ public sealed class MainForm : Form
         _downloadsButton = MakeToolButton(Glyphs.Download, 0);
         _bookmarkButton = MakeToolButton(Glyphs.StarOutline, 0);
         _menuButton = MakeToolButton(Glyphs.Menu, 0);
+        // Beside the menu: who is driving the browser, there whenever agents may be.
+        _agentsButton = MakeToolButton(AgentGlyphs.Robot, 0);
+        _agentsButton.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+        _agentsButton.AccessibleName = "Agents";
+        _agentsButton.Visible = _settings.AgentServerEnabled;
+        _agentsButton.Click += (_, _) => ToggleAgentsPanel();
+        // In an agent's window only, nearest the address bar: back behind the person's
+        // windows, the agent still working in it. Shown from OpenedByAgent.
+        _hideButton = MakeToolButton(AgentGlyphs.SendBack, 0);
+        _hideButton.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+        _hideButton.AccessibleName = "Hide this agent window";
+        _hideButton.Visible = false;
+        _hideButton.Click += (_, _) => SendBackToAgent();
+        _hideTip = new ToolTip();
+        _hideTip.SetToolTip(_hideButton, "Hide this agent window. The agent keeps working in it.");
+        // The phone drop, a click away: and a file dragged onto it goes to the phone.
+        _phoneButton = MakeToolButton(PhoneGlyphs.Phone, 0);
+        _phoneButton.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+        _phoneButton.AccessibleName = "Phone drop";
+        _phoneButton.Click += (_, _) => TogglePhonePanel();
+        _phoneButton.AllowDrop = true;
+        _phoneButton.DragEnter += OnPhoneButtonDragEnter;
+        _phoneButton.DragDrop += (_, e) => _phonePanel?.OnDragDrop(_phoneButton, e);
+        _phoneButton.DragLeave += (_, _) => _phonePanel?.SetDragging(false);
         _downloadsButton.Anchor = AnchorStyles.Top | AnchorStyles.Right;
         _bookmarkButton.Anchor = AnchorStyles.Top | AnchorStyles.Right;
         _menuButton.Anchor = AnchorStyles.Top | AnchorStyles.Right;
-        _downloadsButton.Click += (_, _) => OpenDownloads();
+        _downloadsButton.Click += (_, _) => ToggleDownloadsPanel();
         _bookmarkButton.Click += (_, _) => ToggleBookmark();
-        _menuButton.Click += (_, _) => ShowMainMenu();
+        _menuButton.Click += (_, _) => ToggleMainMenu();
 
         _toolbar.Controls.AddRange(
             [_backButton, _forwardButton, _reloadButton, _addressPill,
-             _downloadsButton, _bookmarkButton, _menuButton]);
+             _hideButton, _downloadsButton, _bookmarkButton, _phoneButton, _agentsButton, _menuButton]);
         _toolbar.Resize += (_, _) => LayoutToolbar();
         // The hairline between the chrome and the page, drawn here when the bookmarks bar is
         // hidden, since then the toolbar is the chrome's bottom edge.
@@ -333,11 +390,10 @@ public sealed class MainForm : Form
         Controls.Add(_toolbar);
         Controls.Add(_tabStrip);
 
-        BuildMenu();
         LayoutToolbar();
 
         _statusTimer = new System.Windows.Forms.Timer { Interval = 5_000 };
-        _statusTimer.Tick += (_, _) => UpdateStatus();
+        _statusTimer.Tick += (_, _) => { UpdateStatus(); UpdateAgentsButton(); UpdatePhoneButton(); };
     }
 
     private GlyphButton MakeToolButton(string glyph, int x)
@@ -351,6 +407,8 @@ public sealed class MainForm : Form
             return;
         }
         UpdateDownloadsButton();
+        if (_downloadsPanel is { Visible: true } panel)
+            panel.Relayout();
         _downloadsPushPending = true;
         _pagePushTimer.Start();
     }
@@ -441,7 +499,69 @@ public sealed class MainForm : Form
             _session.Downloads,
             // A plain click replaces the page in its own tab; Ctrl or middle click opens a
             // tab behind it, as a link does anywhere else.
-            (url, newTab) => _ = newTab ? (Task)manager.CreateTabAsync(url, activate: false) : tab.NavigateAsync(url));
+            (url, newTab) => _ = newTab ? (Task)manager.CreateTabAsync(url, activate: false) : tab.NavigateAsync(url),
+            new SettingsHost(this, _session));
+    }
+
+    /// <summary>
+    /// What the settings page acts through. Anything that puts up a window (the phone
+    /// drop's question, the pairing link) or closes this one (a restart) is done after the
+    /// page's request has been answered: from inside the engine's message handler, showing
+    /// a window is the kind of re-entry it throws on.
+    /// </summary>
+    private sealed class SettingsHost(MainForm window, AppSession session) : ISettingsHost
+    {
+        public Settings Settings => session.Settings;
+        public Settings StartedWith => session.StartedWith;
+        public bool PhoneRunning => session.PhoneBridge?.IsRunning == true;
+        public IReadOnlyList<string> VpnProfiles => VpnTunnel.ListProfiles().Select(p => p.Name).ToArray();
+
+        public string? Commit()
+        {
+            string? problem = null;
+            try
+            {
+                if (!session.Settings.Save())
+                    problem = "It was not saved: Gergur could not read its settings file when it started, so it is leaving that file alone. The change lasts until Gergur closes.";
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                DebugLog.WriteAlways($"settings not saved: {ex.Message}");
+                problem = "It was not saved: the settings file could not be written (something may have it open, or the disk may be full). It is in force now, and the next save that succeeds writes it out.";
+            }
+            ApplyLiveSettings(session);
+            window.PushSettingsChanged();
+            return problem;
+        }
+
+        public void TogglePhone() => Later(() =>
+        {
+            window.TogglePhoneBridge();
+            window.PushSettingsChanged();
+        });
+
+        public void ShowPairing() => Later(window.ShowPairingLink);
+
+        public void Restart() => Later(window.RestartForNewEngineFlags);
+
+        private void Later(Action action)
+        {
+            if (!window.IsDisposed && window.IsHandleCreated)
+                window.BeginInvoke(action);
+        }
+    }
+
+    /// <summary>Tells every open settings page, in every window, to read the settings again.</summary>
+    private void PushSettingsChanged()
+    {
+        foreach (var window in _session?.Windows ?? [])
+        {
+            foreach (var tab in window.Tabs?.Tabs ?? [])
+            {
+                if (tab.State != TabState.Suspended && tab.ShownPage == InternalPages.Page.Settings)
+                    tab.PostToPage("""{"event":"settings"}""", InternalPages.Page.Settings);
+            }
+        }
     }
 
     /// <summary>The running count the button is currently painted for.</summary>
@@ -530,6 +650,13 @@ public sealed class MainForm : Form
                 Bounds = placed;
             return;
         }
+        // Alt+F4 and the taskbar's Close, in an agent's window: hidden, as X does. The low four
+        // bits of the command are the system's own. A quit or an agent's own close is WM_CLOSE.
+        if (_openedByAgent && WindowStacking.IsSystemClose(m.Msg, m.WParam))
+        {
+            SendBackToAgent();
+            return;
+        }
         base.WndProc(ref m);
     }
 
@@ -568,11 +695,79 @@ public sealed class MainForm : Form
     /// <summary>Scales a design-time pixel count to this window's dpi.</summary>
     private int Scaled(int atNinetySix) => (int)Math.Round(atNinetySix * DeviceDpi / 96.0);
 
+    /// <summary>
+    /// The buttons right of the address bar, right to left, leaving out the agents button
+    /// while the agent API is off: a hidden button holding its place leaves a gap.
+    ///
+    /// Decided from the setting, never from Control.Visible. That reads false for every
+    /// control until its window is first shown, and the toolbar is laid out while the window
+    /// is still being built: filtering on it left no buttons at all, and the first window
+    /// threw at startup (IndexOutOfRange in this method) before it ever appeared.
+    /// </summary>
+    internal GlyphButton[] ToolbarButtons
+    {
+        get
+        {
+            GlyphButton[] always = _settings.AgentServerEnabled
+                ? [_menuButton, _agentsButton, _phoneButton, _bookmarkButton, _downloadsButton]
+                : [_menuButton, _phoneButton, _bookmarkButton, _downloadsButton];
+            // The hide button, nearest the address bar, in an agent's window only.
+            return _openedByAgent ? [.. always, _hideButton] : always;
+        }
+    }
+
+    /// <summary>A window built on the given settings rather than the real file, for tests. Never shown, never given a session.</summary>
+    internal static MainForm ForLayoutTest(Settings settings, bool agentsWindow = false)
+        => new(session: null, startupUrl: null, isSecondaryWindow: false, restore: null, settings) { OpenedByAgent = agentsWindow };
+
+    /// <summary>Test hook: what X in the window's corner does now.</summary>
+    internal bool CloseHides => _openedByAgent;
+
+    /// <summary>X in the window's corner: closes a window of the person's, hides an agent's.</summary>
+    private void CloseOrSendBack()
+    {
+        if (_openedByAgent)
+            SendBackToAgent();
+        else
+            Close();
+    }
+
+    /// <summary>
+    /// Hides an agent's window again: back behind the person's own windows, as it was
+    /// opened, with the one of theirs they used last in front. What X, Alt+F4, the taskbar's
+    /// Close and the hide button do in a window an agent opened.
+    ///
+    /// Closing it would end the agent's work under it: every tab it had open, mid task, with
+    /// nothing to tell it why. The person brought it forward to look, from the agents panel,
+    /// and X is the reflex for "done looking". Behind rather than minimised, because behind
+    /// is how the agent had it and what its screenshots are taken from; a minimised page
+    /// counts as hidden to the engine and stops drawing.
+    ///
+    /// An agent closing its own window, Gergur quitting, and the person closing its tabs all
+    /// still close it: those come through Close or WM_CLOSE, not through here.
+    /// </summary>
+    internal void SendBackToAgent()
+    {
+        if (_closing || IsDisposed || !IsHandleCreated)
+            return;
+        _mainMenu?.Dismiss();
+        _downloadsPanel?.Dismiss();
+        _historyPanel?.Dismiss();
+        _agentsPanel?.Dismiss();
+        _phonePanel?.Dismiss();
+        MainForm? theirs = _session is { } session
+            ? AppSession.WindowToReturnTo(session.Windows, session.LastPersonsWindow, this,
+                w => w is { OpenedByAgent: false, IsDisposed: false, Visible: true } && w.WindowState != FormWindowState.Minimized)
+            : null;
+        if (!WindowStacking.SendBack(Handle, theirs))
+            DebugLog.WriteAlways("an agent window could not be sent back");
+    }
+
     private void LayoutToolbar()
     {
         // Right to left, off the widths the buttons actually have rather than the ones
         // they had at 96 dpi. See ToolbarLayout for what that cost.
-        GlyphButton[] rightHand = [_menuButton, _bookmarkButton, _downloadsButton];
+        GlyphButton[] rightHand = ToolbarButtons;
         int gap = Scaled(4);
         int[] lefts = ToolbarLayout.RightToLeft(
             _toolbar.Width, rightHand.Select(b => b.Width).ToArray(), gap, Scaled(8));
@@ -585,53 +780,433 @@ public sealed class MainForm : Form
     }
 
     /// <summary>
-    /// Opens the main menu against the screen the button is actually on.
+    /// Opens the main menu, or closes it when it is open. It is placed on the screen the
+    /// button is actually on (<see cref="MenuPlacement"/>): left to itself a drop-down slid
+    /// onto the neighbouring monitor, measured with three side by side.
     ///
-    /// Left to itself the drop-down slides onto the neighbouring monitor rather than
-    /// opening the other way, and on a desktop with monitors either side it lands on a
-    /// different screen from the window. Measured with three monitors side by side: a
-    /// button 48px from a monitor's right edge put the menu at x=0, on the next screen
-    /// along. Asking for the other direction only moves the problem to the left edge,
-    /// so the position is worked out here and kept inside the button's own screen.
-    ///
-    /// The items have to exist before they can be measured, so they are built here, and
-    /// only here. Building them again from an Opening handler was not free: each build
-    /// walks the VPN profile directory several times over, so a second one put a dozen
-    /// synchronous directory reads on the UI thread every time the menu was opened.
+    /// The entries are built here, each time, so what the menu says is what is true when it
+    /// opens: the zoom of the tab in front, whether the blocker is on, the vpn in force.
     /// </summary>
-    private void ShowMainMenu()
+    private void ToggleMainMenu()
     {
-        RebuildMenuItems();
-        var button = new Rectangle(_menuButton.PointToScreen(Point.Empty), _menuButton.Size);
-        // FromRectangle, not FromControl: a window straddling two monitors is mostly on
-        // one of them while this button is on the other, and the button is what matters.
-        _menu.Show(MenuPlacement.For(
-            button, _menu.GetPreferredSize(Size.Empty), Screen.FromRectangle(button).WorkingArea));
+        _downloadsPanel?.Dismiss();
+        _historyPanel?.Dismiss();
+        _phonePanel?.Dismiss();
+        _mainMenu ??= new MainMenuFlyout();
+        if (_mainMenu.Visible)
+        {
+            _mainMenu.Dismiss();
+            return;
+        }
+        if (_mainMenu.JustDismissed)
+            return;   // the click on the button that just closed it
+        _mainMenu.Open(this, _menuButton, MainMenuEntries());
     }
 
-    private void BuildMenu()
+    /// <summary>
+    /// Opens the downloads panel from its button, or closes it. Ctrl+J still goes straight
+    /// to the full page, and the panel's last line does too.
+    /// </summary>
+    private void ToggleDownloadsPanel()
     {
-        _menu = new ContextMenuStrip { Renderer = new ChromeRenderer() };
-        RebuildMenuItems();
+        if (_session is null)
+        {
+            OpenDownloads();
+            return;
+        }
+        _mainMenu?.Dismiss();
+        _historyPanel?.Dismiss();
+        _phonePanel?.Dismiss();
+        var panel = DownloadsPanel(_session);
+        if (panel.Visible)
+        {
+            panel.Dismiss();
+            return;
+        }
+        if (panel.JustDismissed)
+            return;
+        panel.ShowFromButton(this, _downloadsButton);
     }
 
-    private void RebuildMenuItems()
+    /// <summary>
+    /// A download just started from a tab in this window: show it in the panel, which goes
+    /// again by itself. Only for the person: an agent's window, a window in the background
+    /// or one showing a film fullscreen gets nothing put over it.
+    /// </summary>
+    private void ShowNewDownload()
     {
-        // Snapshot, clear, then dispose. Disposing an item removes it from Items, so
-        // disposing them in a loop over Items throws on the second one and leaves the
-        // menu half torn down: MenuRebuildTests keeps that fact. Without this every
-        // submenu the viewer has opened keeps its window handle for the life of the
-        // process, and an undisposed control with a handle is never collected.
-        var replaced = _menu.Items.Cast<ToolStripItem>().ToArray();
-        _menu.Items.Clear();
-        foreach (var item in replaced)
-            item.Dispose();
-        _menu.Items.Add(new ToolStripMenuItem("New tab\tCtrl+T", null, (_, _) => _ = NewTabAsync()));
-        _menu.Items.Add(new ToolStripMenuItem("Reopen closed tab\tCtrl+Shift+T", null, (_, _) => _ = ReopenClosedTabAsync()));
-        _menu.Items.Add(new ToolStripSeparator());
+        if (_session is null || _closing || OpenedByAgent || IsPageFullScreen || !Visible
+            || WindowState == FormWindowState.Minimized || GetForegroundWindow() != Handle)
+            return;
+        if (_mainMenu is { Visible: true })
+            return;
+        DownloadsPanel(_session).ShowForNewDownload(this, _downloadsButton);
+    }
 
+    /// <summary>
+    /// The menu's History tile: the last few places in a panel under the menu button, with
+    /// the way through to the full page. Ctrl+H still goes straight to the page.
+    /// </summary>
+    private void ShowHistoryPanel()
+    {
+        if (_session is not { } session)
+        {
+            OpenHistory();
+            return;
+        }
+        _mainMenu?.Dismiss();
+        _downloadsPanel?.Dismiss();
+        _phonePanel?.Dismiss();
+        _historyPanel ??= new HistoryFlyout(
+            () => session.History.TryRead(max: 200),
+            url => { ClaimForPerson(); _ = NavigateActiveAsync(url); },
+            OpenHistory);
+        _historyPanel.ShowFromButton(this, _menuButton);
+    }
+
+    /// <summary>The menu's Downloads tile: the downloads panel, hanging from its own button.</summary>
+    private void ShowDownloadsPanel()
+    {
+        if (_session is not { } session)
+        {
+            OpenDownloads();
+            return;
+        }
+        _mainMenu?.Dismiss();
+        _historyPanel?.Dismiss();
+        DownloadsPanel(session).ShowFromButton(this, _downloadsButton);
+    }
+
+    /// <summary>
+    /// Opens the agents panel from its button, or closes it: who has used the browser,
+    /// what each did last, and their tabs, any of which can be brought forward.
+    /// </summary>
+    private void ToggleAgentsPanel()
+    {
+        if (_session is not { } session)
+            return;
+        HookAgents();
+        _mainMenu?.Dismiss();
+        _downloadsPanel?.Dismiss();
+        _historyPanel?.Dismiss();
+        _phonePanel?.Dismiss();
+        if (_agentsPanel is null)
+        {
+            _agentsPanel = new AgentsFlyout(session.Agents.Snapshot, AgentTab, id => _ = ShowAgentTabAsync(id), AgentApiLine);
+            session.Agents.Changed += _agentsPanel.AgentsChanged;
+        }
+        if (_agentsPanel.Visible)
+        {
+            _agentsPanel.Dismiss();
+            return;
+        }
+        if (_agentsPanel.JustDismissed)
+            return;
+        _agentsPanel.ShowFrom(this, _agentsButton);
+    }
+
+    /// <summary>
+    /// Opens the phone panel from its button, or closes it: send the page, a file or a
+    /// message to the phone, see what came from it, pair one, or turn the drop on.
+    /// </summary>
+    private void TogglePhonePanel()
+    {
+        if (_session is not { } session)
+            return;
+        var panel = PhonePanel(session);
+        if (panel.Visible)
+        {
+            panel.Dismiss();
+            return;
+        }
+        if (panel.JustDismissed)
+            return;
+        ShowPhonePanel(session);
+    }
+
+    private PhoneFlyout PhonePanel(AppSession session)
+    {
+        if (_phonePanel is null)
+        {
+            _phonePanel = new PhoneFlyout(session.Drop, new PhoneActions(
+                IsRunning: () => _session?.PhoneBridge?.IsRunning == true,
+                CanSendPage: () => Tabs?.ActiveTab is { } tab && !HomePage.IsHome(tab.Url),
+                SendPage: SendPageToPhone,
+                Toggle: TogglePhoneBridge,
+                Pair: ShowPairingLink,
+                ShowAll: OpenDrop,
+                OpenUrl: url => { ClaimForPerson(); _ = NewTabAsync(url); },
+                Say: ShowMessage));
+            session.Drop.Changed += _phonePanel.DropChanged;
+            _phonePanel.Dismissed += (_, _) => MarkDropSeen();
+        }
+        return _phonePanel;
+    }
+
+    private void ShowPhonePanel(AppSession session)
+    {
+        _mainMenu?.Dismiss();
+        _downloadsPanel?.Dismiss();
+        _historyPanel?.Dismiss();
+        _agentsPanel?.Dismiss();
+        MarkDropSeen();
+        PhonePanel(session).ShowFromButton(this, _phoneButton);
+    }
+
+    /// <summary>
+    /// A file dragged over the phone button opens the panel under it, so it can be let go
+    /// there or on the panel. Only while the drop is on: off, the drag is refused.
+    /// </summary>
+    private void OnPhoneButtonDragEnter(object? sender, DragEventArgs e)
+    {
+        if (_session is not { } session)
+        {
+            e.Effect = DragDropEffects.None;
+            return;
+        }
+        var panel = PhonePanel(session);
+        if (!panel.Visible)
+            ShowPhonePanel(session);
+        panel.OnDragEnter(sender, e);
+    }
+
+    /// <summary>Everything from the phone up to now has been seen: the dot goes, in every window.</summary>
+    private void MarkDropSeen()
+    {
+        if (_session is not { } session)
+            return;
+        session.DropSeenUtc = DateTime.UtcNow;
+        foreach (var window in session.Windows)
+            window.UpdatePhoneButton();
+    }
+
+    /// <summary>The drop changed, on whatever thread changed it.</summary>
+    private void OnDropChanged(object? sender, EventArgs e)
+    {
+        if (_closing || IsDisposed || !IsHandleCreated)
+            return;
+        try { BeginInvoke(UpdatePhoneButton); }
+        catch (InvalidOperationException) { }   // the handle went between the check and the call
+    }
+
+    /// <summary>A dot on the phone button for anything from the phone not seen yet; dim while the drop is off.</summary>
+    private void UpdatePhoneButton()
+    {
+        if (_session is not { } session || _phoneButton.IsDisposed)
+            return;
+        // Open, the panel is showing it: seen.
+        int unseen = _phonePanel is { Visible: true } ? 0 : UnseenFromPhone(session.Drop.Items, session.DropSeenUtc);
+        bool running = session.PhoneBridge?.IsRunning == true;
+        Color? dot = unseen > 0 ? Theme.Accent : null;
+        if (_phoneButton.Dot != dot)
+            _phoneButton.Dot = dot;
+        var ink = running ? Theme.Text : Theme.TextDim;
+        if (_phoneButton.GlyphColor != ink)
+            _phoneButton.GlyphColor = ink;
+        string name = unseen switch
+        {
+            0 => running ? "Phone drop" : "Phone drop (off)",
+            1 => "Phone drop, 1 new from your phone",
+            _ => $"Phone drop, {unseen} new from your phone",
+        };
+        if (_phoneButton.AccessibleName != name)
+            _phoneButton.AccessibleName = name;
+    }
+
+    /// <summary>How many things came from the phone after <paramref name="seenUtc"/>.</summary>
+    internal static int UnseenFromPhone(IReadOnlyList<DropItem> items, DateTime seenUtc)
+        => items.Count(i => i.From == "phone" && i.AddedUtc > seenUtc);
+
+    /// <summary>Listens for agents acting, once this window has a session to listen to.</summary>
+    private void HookAgents()
+    {
+        if (_session is not { } session || ReferenceEquals(_agentsHookedTo, session))
+            return;
+        session.Agents.Changed += OnAgentsChanged;
+        _agentsHookedTo = session;
+    }
+
+    /// <summary>An agent acted, on the agent server's thread.</summary>
+    private void OnAgentsChanged()
+    {
+        if (_closing || IsDisposed || !IsHandleCreated)
+            return;
+        try { BeginInvoke(UpdateAgentsButton); }
+        catch (InvalidOperationException) { }   // the handle went between the check and the call
+    }
+
+    /// <summary>The dot on the agents button while an agent is active, gone 30 seconds after.</summary>
+    private void UpdateAgentsButton()
+    {
+        if (_session is not { } session)
+            return;
+        HookAgents();
+        bool active = session.Agents.AnyActive(DateTime.UtcNow);
+        _agentsButton.Dot = active ? Theme.Live : null;
+        _agentsButton.AccessibleName = active ? "Agents (an agent is working)" : "Agents";
+    }
+
+    /// <summary>A tab by id, in any window, as the agents panel shows it.</summary>
+    private AgentTabInfo? AgentTab(string id)
+    {
+        foreach (var window in _session?.Windows ?? [])
+        {
+            if (window.Tabs?.Tabs.FirstOrDefault(t => t.Id == id) is { } tab)
+                return new AgentTabInfo(tab.Id, tab.Title, InternalPages.NameOf(tab.Url), window.OpenedByAgent);
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Brings an agent's tab forward: its window to the front, restored if minimised, with
+    /// the tab chosen. An agent's window is a window like any other, only opened behind,
+    /// so this is all "opening their hidden tab" needs.
+    /// </summary>
+    private async Task ShowAgentTabAsync(string id)
+    {
+        foreach (var window in _session?.Windows ?? [])
+        {
+            if (window.Tabs?.Tabs.FirstOrDefault(t => t.Id == id) is not { } tab)
+                continue;
+            try
+            {
+                if (window.WindowState == FormWindowState.Minimized)
+                    window.WindowState = FormWindowState.Normal;
+                await window.Tabs.ActivateAsync(tab);
+                window.Activate();
+            }
+            catch (Exception ex)
+            {
+                DebugLog.WriteAlways($"an agent's tab could not be shown: {ex.Message}");
+                ShowMessage("That tab could not be shown.");
+            }
+            return;
+        }
+        ShowMessage("That tab has closed.");
+    }
+
+    /// <summary>The agents panel's last line: whether agents can connect, and where.</summary>
+    private string AgentApiLine()
+        => _session is { } s && s.Settings.AgentServerEnabled
+            ? $"Agent API on 127.0.0.1:{s.Settings.AgentServerPort} \u00B7 token protected"
+            : "Agent API off. Turn it on in Settings.";
+
+    private DownloadsFlyout DownloadsPanel(AppSession session)
+        => _downloadsPanel ??= new DownloadsFlyout(session.Downloads, OpenDownloads, ShowMessage);
+
+    /// <summary>
+    /// What the main menu holds, in order. Everything the old list had is here; the vpn,
+    /// phone drop and bookmark lists open to the side exactly as they did, built by the same
+    /// methods.
+    /// </summary>
+    private IReadOnlyList<MenuEntry> MainMenuEntries()
+    {
+        var blocker = _session?.Blocker;
+        return
+        [
+            new MenuAction("New tab", "Ctrl+T", () => { ClaimForPerson(); _ = NewTabAsync(); }, MenuGlyphs.NewTab),
+            new MenuAction("New window", "Ctrl+N", () => _ = NewWindowAsync(), MenuGlyphs.NewWindow),
+            new MenuAction("Reopen closed tab", "Ctrl+Shift+T", () => { ClaimForPerson(); _ = ReopenClosedTabAsync(); }, MenuGlyphs.Reopen),
+            new MenuSeparator(),
+            new MenuTiles(
+            [
+                new MenuTile(MenuGlyphs.History, "History", ShowHistoryPanel),
+                new MenuTile(Glyphs.Download, "Downloads", ShowDownloadsPanel,
+                    () => (_session?.Downloads.RunningCount ?? 0) is > 0 and var n ? n.ToString(System.Globalization.CultureInfo.CurrentCulture) : null),
+                new MenuTile(MenuGlyphs.Bookmarks, "Bookmarks", OpenBookmarks),
+            ]),
+            new MenuSeparator(),
+            new MenuAction("Bookmark this page", "Ctrl+D", ToggleBookmark, Glyphs.StarOutline),
+            new MenuSubmenu("Bookmarks", () => _session is { Bookmarks.Items.Count: > 0 and var count } ? count.ToString("N0", System.Globalization.CultureInfo.CurrentCulture) : null,
+                BuildBookmarksMenu, MenuGlyphs.Bookmarks),
+            new MenuZoom(
+                () => (int)Math.Round((Tabs?.ActiveTab?.ZoomFactor ?? 1.0) * 100),
+                () => ZoomBy(-0.1), () => ZoomBy(0.1), ZoomReset),
+            new MenuAction("Find in page", "Ctrl+F", OpenFind, MenuGlyphs.Find),
+            new MenuToggle("Mute tab", () => "Ctrl+M", () => Tabs?.ActiveTab?.IsMuted == true,
+                Tabs?.ActiveTab is null ? null : ToggleMuteActiveTab, MenuGlyphs.Mute),
+            new MenuAction("Print", "Ctrl+P", PrintActive, MenuGlyphs.Print),
+            new MenuAction("Save as PDF", null, () => _ = SaveAsPdfAsync(), MenuGlyphs.Save),
+            new MenuSeparator(),
+            new MenuToggle("Ad blocking",
+                // "no host list" rather than a count, because the built-in path rules mean the
+                // count is never zero, and "5 rules" would read like a list had loaded.
+                () => blocker?.HasHostList == true ? $"{blocker.RuleCount:N0} rules" : "no host list",
+                () => blocker?.Enabled == true,
+                blocker is null ? null : ToggleBlocking, MenuGlyphs.Shield),
+            .. RelaxEntry(),
+            new MenuSubmenu("VPN", VpnMenuDetail, BuildVpnMenu, MenuGlyphs.Vpn),
+            new MenuSubmenu("Phone drop", () => _session?.PhoneBridge?.IsRunning == true ? "on" : "off", BuildPhoneMenu, MenuGlyphs.Phone),
+            new MenuSeparator(),
+            new MenuFooter(
+            [
+                new MenuAction("Settings", null, OpenSettings, MenuGlyphs.Settings),
+                new MenuAction("DevTools", "F12", OpenDevTools, MenuGlyphs.DevTools),
+                new MenuSubmenu("More", () => null, BuildMoreToolsMenu, Glyphs.More),
+            ]),
+        ];
+    }
+
+    /// <summary>The vpn line's state, from what the engine runs with: see BuildVpnMenu.</summary>
+    private string? VpnMenuDetail()
+    {
+        if (_session is null)
+            return "not ready";
+        if (!ProxyInForce)
+            return "off";
+        return _session.Vpn.ActiveProfileName ?? VpnTunnel.ResolveProfile(_settings.VpnProfile)?.Name ?? "on";
+    }
+
+    /// <summary>
+    /// The menu's "Relax blocking on this site" switch, for the site in front; nothing on a
+    /// page that is not a web page. See <see cref="Blocking.RelaxedSites"/>.
+    /// </summary>
+    private IEnumerable<MenuEntry> RelaxEntry()
+    {
+        string site = Blocking.RelaxedSites.SiteOf(Tabs?.ActiveTab?.Url);
+        if (site.Length == 0)
+            yield break;
+        yield return new MenuToggle($"Relax blocking on {site}",
+            () => IsRelaxed(site) ? "ads load, sped up" : null,
+            () => IsRelaxed(site),
+            () => SetRelaxed(site, !IsRelaxed(site)),
+            MenuGlyphs.Relax);
+    }
+
+    private bool IsRelaxed(string site) => Blocking.RelaxedSites.Parse(_settings.RelaxedSites).Contains(site);
+
+    /// <summary>
+    /// Relaxes blocking on a site, or stops, and reloads the tab in front when it is on that
+    /// site: the page script is given to a page as it is created, so the page showing has
+    /// the old one until it loads again.
+    /// </summary>
+    private void SetRelaxed(string site, bool relaxed)
+    {
+        if (_session is not { } session)
+            return;
+        _settings.RelaxedSites = Blocking.RelaxedSites.With(_settings.RelaxedSites, site, relaxed);
+        SaveSettingsOrSay(StillInForce);
+        ApplyLiveSettings(session);
+        if (Tabs?.ActiveTab is { } tab && Blocking.RelaxedSites.SiteOf(tab.Url) == site)
+            tab.Reload();
+        ShowMessage(relaxed ? $"Blocking relaxed on {site}: its ads load and video ads are muted and sped up." : $"Blocking back on for {site}.");
+    }
+
+    private void ToggleBlocking()
+    {
+        var blocker = _session?.Blocker;
+        if (blocker is null)
+            return;
+        blocker.Enabled = !blocker.Enabled;
+        _settings.BlocklistEnabled = blocker.Enabled;
+        SaveSettingsOrSay(StillInForce);   // in force either way; this only says if it will not last
+        UpdateStatus();
+    }
+
+    /// <summary>Bookmarks side list: the bar, the page, then every bookmark.</summary>
+    private ToolStripMenuItem BuildBookmarksMenu()
+    {
         var bookmarks = new ToolStripMenuItem("Bookmarks");
-        bookmarks.DropDownItems.Add(new ToolStripMenuItem("Bookmark this page\tCtrl+D", null, (_, _) => ToggleBookmark()));
         bookmarks.DropDownItems.Add(new ToolStripMenuItem("Show bookmarks bar\tCtrl+Shift+B", null, (_, _) => ToggleBookmarksBar())
         {
             Checked = _settings.ShowBookmarksBar,
@@ -644,69 +1219,77 @@ public sealed class MainForm : Form
             {
                 var item = new ToolStripMenuItem(Truncate(bookmark.Title, 60)) { ToolTipText = bookmark.Url };
                 var url = bookmark.Url;
-                item.Click += (_, _) => _ = NavigateActiveAsync(url);
+                item.Click += (_, _) => { ClaimForPerson(); _ = NavigateActiveAsync(url); };
                 bookmarks.DropDownItems.Add(item);
             }
         }
-        _menu.Items.Add(bookmarks);
-        _menu.Items.Add(new ToolStripMenuItem("History\tCtrl+H", null, (_, _) => OpenHistory()));
-        int running = _session?.Downloads.RunningCount ?? 0;
-        _menu.Items.Add(new ToolStripMenuItem(
-            running > 0 ? $"Downloads ({running} running)\tCtrl+J" : "Downloads\tCtrl+J",
-            null, (_, _) => OpenDownloads()));
-        _menu.Items.Add(new ToolStripSeparator());
+        return bookmarks;
+    }
 
-        _menu.Items.Add(new ToolStripMenuItem("Find in page\tCtrl+F", null, (_, _) => OpenFind()));
-
-        var zoom = new ToolStripMenuItem($"Zoom ({(Tabs?.ActiveTab?.ZoomFactor ?? 1.0) * 100:0}%)");
-        zoom.DropDownItems.Add(new ToolStripMenuItem("Zoom in\tCtrl++", null, (_, _) => ZoomBy(0.1)));
-        zoom.DropDownItems.Add(new ToolStripMenuItem("Zoom out\tCtrl+-", null, (_, _) => ZoomBy(-0.1)));
-        zoom.DropDownItems.Add(new ToolStripMenuItem("Reset\tCtrl+0", null, (_, _) => ZoomReset()));
-        _menu.Items.Add(zoom);
-
-        _menu.Items.Add(new ToolStripMenuItem("Mute tab\tCtrl+M", null, (_, _) => ToggleMuteActiveTab())
-        {
-            Checked = Tabs?.ActiveTab?.IsMuted == true,
-        });
-        _menu.Items.Add(new ToolStripMenuItem("Print…\tCtrl+P", null, (_, _) => PrintActive()));
-        _menu.Items.Add(new ToolStripMenuItem("Save as PDF…", null, async (_, _) => await SaveAsPdfAsync()));
-        _menu.Items.Add(new ToolStripSeparator());
-
-        var blocker = _session?.Blocker;
-        // "no host list" rather than a count, because the built-in path rules mean the
-        // count is never zero now, and "5 rules" would read like a list had loaded.
-        string rules = blocker?.HasHostList == true
-            ? $"{blocker.RuleCount:N0} rules"
-            : "no host list";
-        var blocking = new ToolStripMenuItem($"Ad/tracker blocking ({(blocker?.Enabled == true ? "on" : "off")}, {rules})")
-        {
-            Checked = blocker?.Enabled == true,
-        };
-        blocking.Click += (_, _) =>
-        {
-            if (blocker is null)
-                return;
-            blocker.Enabled = !blocker.Enabled;
-            _settings.BlocklistEnabled = blocker.Enabled;
-            SaveSettingsOrSay(StillInForce);   // in force either way; this only says if it will not last
-            UpdateStatus();
-        };
-        _menu.Items.Add(blocking);
-        _menu.Items.Add(new ToolStripMenuItem("Update blocklist (StevenBlack hosts)", null, async (_, _) => await UpdateBlocklistAsync(silent: false)));
-
-        _menu.Items.Add(BuildVpnMenu());
-        _menu.Items.Add(BuildPhoneMenu());
-        _menu.Items.Add(new ToolStripSeparator());
-
-        _menu.Items.Add(new ToolStripMenuItem("Browser task manager", null, (_, _) => Tabs?.ActiveTab?.OpenTaskManager()));
-        _menu.Items.Add(new ToolStripMenuItem("DevTools\tF12", null, (_, _) => OpenDevTools()));
-        _menu.Items.Add(new ToolStripMenuItem("Dump memory CSV", null, (_, _) => DumpMemoryCsv()));
-        _menu.Items.Add(new ToolStripMenuItem("Settings…", null, (_, _) => OpenSettings()));
-        _menu.Items.Add(new ToolStripMenuItem("Open data folder", null, (_, _) =>
+    /// <summary>The tools nobody needs every day.</summary>
+    private ToolStripMenuItem BuildMoreToolsMenu()
+    {
+        var more = new ToolStripMenuItem("More");
+        more.DropDownItems.Add(new ToolStripMenuItem("Update blocklist (StevenBlack hosts)", null, async (_, _) => await UpdateBlocklistAsync(silent: false)));
+        more.DropDownItems.Add(new ToolStripMenuItem("Browser task manager", null, (_, _) => Tabs?.ActiveTab?.OpenTaskManager()));
+        more.DropDownItems.Add(new ToolStripMenuItem("Dump memory CSV", null, (_, _) => DumpMemoryCsv()));
+        more.DropDownItems.Add(new ToolStripMenuItem("Open data folder", null, (_, _) =>
         {
             Directory.CreateDirectory(Settings.DataDir);
             System.Diagnostics.Process.Start("explorer.exe", Settings.DataDir);
         }));
+        return more;
+    }
+
+    /// <summary>
+    /// A window of the person's own, with a new tab in it. Not an agent's window: it is
+    /// part of their session from the start.
+    /// </summary>
+    public async Task NewWindowAsync()
+    {
+        if (_session is null || _closing)
+            return;
+        MainForm? window = null;
+        try
+        {
+            window = new MainForm(_session, null, isSecondaryWindow: true, restore: null);
+            // Stepped down and right from this one, so the new window is seen to open
+            // rather than landing exactly on top and looking like nothing happened.
+            if (WindowState == FormWindowState.Normal)
+            {
+                window.StartPosition = FormStartPosition.Manual;
+                window.Bounds = CascadedBounds(Bounds, Scaled(32), Screen.FromControl(this).WorkingArea);
+            }
+            window.Show();
+            await window.Ready;
+            await window.NewTabAsync();
+        }
+        catch (Exception ex)
+        {
+            // Called from the menu and a shortcut as fire and forget: a failure here would
+            // otherwise vanish, and the person would only see that nothing opened.
+            DebugLog.WriteAlways($"a new window could not be opened: {ex.GetType().Name}: {ex.Message}");
+            // Half built, it would stay on screen empty and be saved into the session.
+            if (window is { IsDisposed: false })
+            {
+                try { window.Close(); }
+                catch (Exception closeError) { DebugLog.WriteAlways($"and could not be closed: {closeError.Message}"); }
+            }
+            if (!IsDisposed)
+                ShowMessage("Could not open a new window.");
+        }
+    }
+
+    /// <summary>
+    /// <paramref name="from"/> moved down and right by <paramref name="step"/>, or back to
+    /// the top left of <paramref name="screen"/> when that would run off its bottom or right.
+    /// </summary>
+    internal static Rectangle CascadedBounds(Rectangle from, int step, Rectangle screen)
+    {
+        var r = new Rectangle(from.X + step, from.Y + step, from.Width, from.Height);
+        if (r.Right > screen.Right || r.Bottom > screen.Bottom)
+            r.Location = screen.Location;
+        return r;
     }
 
     private static string Truncate(string text, int max)
@@ -735,6 +1318,10 @@ public sealed class MainForm : Form
         {
             if (_session is null)
                 await StartSharedServicesAsync();
+            // Closed during that wait: its unsubscribing has already run, so anything added
+            // now would never be taken off and would keep the disposed window alive.
+            if (_closing || IsDisposed)
+                return;
             var session = _session!;
             session.AddWindow(this);
 
@@ -743,7 +1330,9 @@ public sealed class MainForm : Form
             // them has to be live in every one of them.
             session.Downloads.Changed += OnDownloadsChanged;
             session.Bookmarks.Changed += OnBookmarksChanged;
+            session.Drop.Changed += OnDropChanged;
             _bookmarksBar.SetBookmarks(session.Bookmarks.Items);
+            UpdatePhoneButton();
             UpdateDownloadsButton();
             _pagePushTimer.Tick += (_, _) => PushToOwnPages();
 
@@ -818,6 +1407,7 @@ public sealed class MainForm : Form
         _session.Env.Core.BrowserProcessExited += OnBrowserProcessExited;
         _session.Env.Core.NewBrowserVersionAvailable += OnNewBrowserVersionAvailable;
         _session.StartAgent();
+        HookAgents();
         _session.StartPhoneBridge();
         // Only the first window listens, or an arrival would notify once per window.
         _session.Drop.ItemAdded += OnDropItemArrived;
@@ -863,7 +1453,7 @@ public sealed class MainForm : Form
             return;
         // Not ContainsFocus: this runs on the pipe thread, where focus is always somebody
         // else's, so a link from another app always went to window 0.
-        var window = session.WindowInUse();
+        var window = session.WindowForPersonsLink();
         if (window is null || window.IsDisposed)
             return;
         window.BeginInvoke(() =>
@@ -1059,11 +1649,20 @@ public sealed class MainForm : Form
 
     protected override void OnFormClosed(FormClosedEventArgs e)
     {
-        // Not a child of this form, so closing the window does not take it with it, and
-        // it owns a window handle from the first time it is shown. Here rather than in
+        // Not children of this form, so closing the window does not take them with it, and
+        // each owns a window handle from the first time it is shown. Here rather than in
         // OnFormClosing, because that one can still be cancelled, and a live window with
         // a disposed menu would throw on the next click of the button.
-        _menu.Dispose();
+        _mainMenu?.Dispose();
+        _downloadsPanel?.Dispose();
+        _historyPanel?.Dispose();
+        if (_agentsPanel is not null && _agentsHookedTo is not null)
+            _agentsHookedTo.Agents.Changed -= _agentsPanel.AgentsChanged;
+        _agentsPanel?.Dispose();
+        _phonePanel?.Dispose();
+        _hideTip.Dispose();
+        if (_agentsHookedTo is not null)
+            _agentsHookedTo.Agents.Changed -= OnAgentsChanged;
         _memoryLabel.Dispose();   // in no strip now, so nothing else disposes it
         base.OnFormClosed(e);
     }
@@ -1086,6 +1685,9 @@ public sealed class MainForm : Form
             _session.Drop.ItemAdded -= OnDropItemArrived;
             _session.Downloads.Changed -= OnDownloadsChanged;
             _session.Bookmarks.Changed -= OnBookmarksChanged;
+            _session.Drop.Changed -= OnDropChanged;
+            if (_phonePanel is not null)
+                _session.Drop.Changed -= _phonePanel.DropChanged;
         }
         _pagePushTimer.Stop();
         _pagePushTimer.Dispose();
@@ -1397,6 +1999,9 @@ public sealed class MainForm : Form
                 return;
             var item = _session.Downloads.Track(operation);
             ShowMessage($"Downloading {item.FileName}…");
+            // After the engine's event has returned: the panel is a window, and showing one
+            // from inside a WebView2 handler is the kind of re-entry it throws on.
+            BeginInvoke(ShowNewDownload);
             if (Tabs is { } manager
                 && (manager.IsSetAside(tab) || Tab.OnlyOpenedForADownload(tab.Opener is not null, tab.Url, tab.Title)))
             {
@@ -1815,6 +2420,7 @@ public sealed class MainForm : Form
     {
         if (Tabs is null)
             return;
+        ClaimForPerson();   // only a person opens a bookmark
         if (newTab)
             await Tabs.CreateTabAsync(url, activate: false);
         else
@@ -1840,6 +2446,7 @@ public sealed class MainForm : Form
     internal static void ApplyLiveSettings(AppSession session)
     {
         session.Blocker.Enabled = session.Settings.BlocklistEnabled;
+        session.Blocker.Relaxed = Blocking.RelaxedSites.Parse(session.Settings.RelaxedSites);
         foreach (var window in session.Windows)
         {
             window._addressBar.SearchUrlTemplate = session.Settings.SearchUrlTemplate;
@@ -1854,50 +2461,11 @@ public sealed class MainForm : Form
     }
 
     /// <summary>
-    /// Modal, unlike history and downloads: settings are shared by every window, so
-    /// letting two of these disagree with each other would be asking for trouble.
-    /// What can be applied without a restart is applied here and now.
+    /// The settings page, gergur://settings: a page in a tab like History, rather than the
+    /// modal property grid it replaced. Each change is saved as it is made, what can apply
+    /// at once does, and the page says what is waiting for a restart and offers one.
     /// </summary>
-    public void OpenSettings()
-    {
-        if (_session is null)
-            return;
-        using var dialog = new SettingsForm(_settings);
-        if (dialog.ShowDialog(this) != DialogResult.OK)
-            return;
-
-        ApplyLiveSettings(_session);
-
-        if (!dialog.Saved)
-        {
-            // Not "Settings saved", and no offer to restart: a restart reads the file, and
-            // the file has not got the change, so it would quietly undo what was just set.
-            // A box, as TogglePhoneBridge does for answers to a dialog: the status label
-            // clips, and the half that says what to do is the half that goes.
-            // Worded per case. A refused save never writes, so a restart setting will not
-            // happen; a failed write leaves the change in memory, where the next save that
-            // does succeed writes it out with everything else.
-            MessageBox.Show(this, dialog.WriteFailed
-                    ? WriteFailedText + "\n\nWhat applies without a restart is in force now, and the next save that succeeds writes it out. What needs a restart has not happened, and will only once a later save succeeds and Gergur restarts."
-                    : NotSavedText + "\n\nWhat applies without a restart is in force until Gergur closes. What needs a restart will not happen.",
-                "Gergur", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            return;
-        }
-
-        if (dialog.ChangedRestartSettings.Count == 0)
-        {
-            ShowMessage("Settings saved.");
-            return;
-        }
-        string names = string.Join(", ", dialog.ChangedRestartSettings);
-        var answer = MessageBox.Show(this,
-            $"These take effect only when the engine restarts:\n\n{names}\n\nRestart Gergur now? Your tabs come back.",
-            "Gergur", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
-        if (answer == DialogResult.Yes)
-            RestartForNewEngineFlags();
-        else
-            ShowMessage("Settings saved; engine changes apply on the next restart.");
-    }
+    public void OpenSettings() => _ = OpenOwnPageAsync(InternalPages.Page.Settings);
 
     // ------------------------------------------------------------------ phone drop
 
@@ -1945,7 +2513,7 @@ public sealed class MainForm : Form
             _dropWindow.Activate();
             return;
         }
-        _dropWindow = new DropForm(_session.Drop, url => _ = NewTabAsync(url));
+        _dropWindow = new DropForm(_session.Drop, url => { ClaimForPerson(); _ = NewTabAsync(url); });
         _dropWindow.FormClosed += (_, _) => _dropWindow = null;
         _dropWindow.Show(this);
     }
@@ -2160,7 +2728,10 @@ public sealed class MainForm : Form
         try
         {
             if (_settings.Save())
+            {
+                PushSettingsChanged();   // a settings page open beside the menu shows the change
                 return true;
+            }
             why = NotSavedText;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)

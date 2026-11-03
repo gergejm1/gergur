@@ -16,6 +16,12 @@ public sealed class RequestBlocker
     private long _blockedCount;
 
     public bool Enabled { get; set; }
+
+    /// <summary>
+    /// Sites whose pages are not blocked (<see cref="RelaxedSites"/>). Replaced whole,
+    /// never changed in place, so the request handler always reads one complete list.
+    /// </summary>
+    public IReadOnlyList<string> Relaxed { get; set; } = [];
     public string BlocklistPath { get; } = Path.Combine(Settings.DataDir, "blocklist.txt");
     public string EasyListHostsPath { get; } = Path.Combine(Settings.DataDir, "easylist-hosts.txt");
     public long BlockedCount => Interlocked.Read(ref _blockedCount);
@@ -183,13 +189,38 @@ public sealed class RequestBlocker
         if (!Enabled)
             return;
         if (Uri.TryCreate(e.Request.Uri, UriKind.Absolute, out var uri)
-            && (_list.IsBlocked(uri.Host) || IsAdPath(uri)))
+            && (_list.IsBlocked(uri.Host) || IsAdPath(uri))
+            && !OnRelaxedPage((CoreWebView2)sender!, e, uri))
         {
             var core = (CoreWebView2)sender!;
             e.Response = core.Environment.CreateWebResourceResponse(null, 403, "Blocked", "");
             Interlocked.Increment(ref _blockedCount);
         }
     }
+
+    /// <summary>
+    /// Whether the request comes from a page on a relaxed site. Asked only of a request
+    /// that would otherwise be blocked, so the engine is not asked for its address on
+    /// every request of every tab. The page is the tab's address, or for a document being
+    /// navigated to, that document: the first request of a visit to a relaxed site comes
+    /// while the tab still shows the page before it.
+    /// </summary>
+    private bool OnRelaxedPage(CoreWebView2 core, CoreWebView2WebResourceRequestedEventArgs e, Uri uri)
+    {
+        var relaxed = Relaxed;
+        if (relaxed.Count == 0)
+            return false;
+        if (e.ResourceContext == CoreWebView2WebResourceContext.Document && Gergur.Blocking.RelaxedSites.Covers(relaxed, uri.Host))
+            return true;
+        string? page;
+        try { page = core.Source; }
+        catch { return false; }
+        return IsRelaxedPage(relaxed, page);
+    }
+
+    /// <summary>Whether a page address is on one of the relaxed sites.</summary>
+    internal static bool IsRelaxedPage(IReadOnlyList<string> relaxed, string? pageUrl)
+        => Uri.TryCreate(pageUrl, UriKind.Absolute, out var page) && Gergur.Blocking.RelaxedSites.Covers(relaxed, page.Host);
 
     /// <summary>Downloads/refreshes the StevenBlack hosts list plus EasyList's
     /// simple domain rules. Returns the combined rule count.</summary>

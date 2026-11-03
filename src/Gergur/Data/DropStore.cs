@@ -474,10 +474,18 @@ public sealed class DropStore
         Directory.CreateDirectory(FilesDir);
         string path = Path.Combine(FilesDir, stored);
         long size;
-        using (var file = File.Create(path))
+        try
         {
+            using var file = File.Create(path);
             content.CopyTo(file);
             size = file.Length;
+        }
+        catch
+        {
+            // A full disk or a source that stopped reading part way: nothing refers to the
+            // half written file, so it goes now rather than waiting for the orphan sweep.
+            try { File.Delete(path); } catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
+            throw;
         }
         if (from != "pc")
             MarkAsFromNetwork(path);

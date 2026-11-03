@@ -279,7 +279,9 @@ public sealed class WindowChromeTests
         string form = Code("src", "Gergur", "UI", "MainForm.cs");
 
         Assert.Matches(@"MinimizeClicked \+= .*WindowState = FormWindowState\.Minimized", form.Replace("\n", " "));
-        Assert.Matches(@"CloseWindowClicked \+= .*BeginInvoke\(new Action\(Close\)\)", form.Replace("\n", " "));
+        // Closes a window of the person's; hides an agent's again (AgentsPanelTests has that half).
+        Assert.Matches(@"CloseWindowClicked \+= .*BeginInvoke\(new Action\(CloseOrSendBack\)\)", form.Replace("\n", " "));
+        Assert.Matches(@"private void CloseOrSendBack\(\)\s*\{\s*if \(_openedByAgent\)\s*SendBackToAgent\(\);\s*else\s*Close\(\);", form);
         Assert.Contains("_tabStrip.WindowMaximized = WindowState == FormWindowState.Maximized", form);
     }
 
