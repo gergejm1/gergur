@@ -14,7 +14,17 @@ public sealed class TabManager
     public Control Host { get; }
     public RequestBlocker Blocker { get; }
 
+    /// <summary>The tabs on the strip.</summary>
     public IReadOnlyList<Tab> Tabs => _tabs;
+
+    // Tabs the person took off the strip, to listen to from the now-playing panel.
+    private readonly List<Tab> _tuckedAway = new();
+
+    /// <summary>The tabs the person took off the strip.</summary>
+    internal IReadOnlyList<Tab> TuckedAway => _tuckedAway;
+
+    /// <summary>Every tab of the person's in this window: the strip's, then those tucked away.</summary>
+    internal IReadOnlyList<Tab> AllTabs => _tuckedAway.Count == 0 ? _tabs : [.. _tabs, .. _tuckedAway];
 
     /// <summary>
     /// Whether the window these tabs are in is an agent's. Asked as each tab's view is
@@ -133,6 +143,47 @@ public sealed class TabManager
         DisposeWhenDone(tab, until);
     }
 
+    /// <summary>
+    /// Takes a tab off the strip and keeps it playing, for a playlist listened to from the
+    /// now-playing panel. Its page goes on as in any tab behind another. Nothing else sees it
+    /// as a tab: Ctrl+Tab, the strip and agents' lists do not. It is saved with the session, as
+    /// an ordinary tab, so hiding one can never lose it. The window is never left with an empty
+    /// strip: a new tab comes up when this was the only one.
+    /// </summary>
+    internal async Task TuckAwayAsync(Tab tab)
+    {
+        if (!_tabs.Contains(tab))
+            return;
+        if (_tabs.Count == 1)
+            await CreateTabAsync(HomePage.Url);
+        int index = _tabs.IndexOf(tab);
+        if (index < 0)
+            return;
+        _tabs.RemoveAt(index);
+        _tuckedAway.Add(tab);
+        tab.TuckedAway = true;
+        bool wasActive = ActiveTab == tab;
+        if (wasActive)
+            ActiveTab = null;
+        if (_shown == tab)
+            _shown = null;
+        tab.Deactivate();
+        if (wasActive)
+            await ActivateAsync(_tabs[Math.Min(index, _tabs.Count - 1)]);
+        else
+            RaiseChanged();
+    }
+
+    /// <summary>Puts a tucked away tab back on the strip, last, and in front.</summary>
+    internal async Task BringBackAsync(Tab tab)
+    {
+        if (!_tuckedAway.Remove(tab))
+            return;
+        tab.TuckedAway = false;
+        _tabs.Add(tab);
+        await ActivateAsync(tab);
+    }
+
     /// <summary>Whether this tab is out of the strip, waiting on a download.</summary>
     internal bool IsSetAside(Tab tab) => _setAside.ContainsKey(tab);
 
@@ -170,7 +221,7 @@ public sealed class TabManager
     /// </summary>
     internal void RefreshSound()
     {
-        foreach (var tab in _tabs.Concat(_setAside.Keys))
+        foreach (var tab in _tabs.Concat(_setAside.Keys).Concat(_tuckedAway))
         {
             try
             {
@@ -292,6 +343,15 @@ public sealed class TabManager
     private async Task RemoveAndDisposeAsync(Tab tab, bool remember, Tab? activateInstead)
     {
         DebugLog.Write($"CloseTabAsync url={tab.Url}\n{Environment.StackTrace}");
+        if (_tuckedAway.Remove(tab))
+        {
+            if (remember && !HomePage.IsHome(tab.Url))
+                _recentlyClosed.Push(new TabSnapshot(tab.Url, tab.Title));
+            tab.Dispose();
+            ForgetOpener(tab);
+            RaiseChanged();
+            return;
+        }
         int index = _tabs.IndexOf(tab);
         if (index < 0)
             return;
@@ -309,12 +369,14 @@ public sealed class TabManager
             _shown = null;
         tab.Dispose();
         // Popups it opened stop pointing at it, or a closed tab stays reachable from each.
-        foreach (var other in _tabs.Concat(_setAside.Keys))
-        {
-            if (other.Opener == tab)
-                other.Opener = null;
-        }
+        ForgetOpener(tab);
 
+        // The music tucked away goes on: closing the last tab on the strip is not closing it.
+        if (_tabs.Count == 0 && _tuckedAway.Count > 0)
+        {
+            await CreateTabAsync(HomePage.Url);
+            return;
+        }
         if (_tabs.Count == 0)
         {
             RaiseChanged();
@@ -334,6 +396,15 @@ public sealed class TabManager
             RaiseChanged();
     }
 
+    private void ForgetOpener(Tab tab)
+    {
+        foreach (var other in _tabs.Concat(_setAside.Keys).Concat(_tuckedAway))
+        {
+            if (other.Opener == tab)
+                other.Opener = null;
+        }
+    }
+
     /// <summary>How many closed tabs Ctrl+Shift+T can bring back.</summary>
     internal int RecentlyClosedCount => _recentlyClosed.Count;
 
@@ -350,11 +421,7 @@ public sealed class TabManager
         if (_shown == tab)
             _shown = null;
         // Leaving this window: popups here stop pointing at it, and it at its opener here.
-        foreach (var other in _tabs.Concat(_setAside.Keys))
-        {
-            if (other.Opener == tab)
-                other.Opener = null;
-        }
+        ForgetOpener(tab);
         tab.Opener = null;
         tab.DetachOwnerHandlers();
         bool wasActive = ActiveTab == tab;
@@ -421,6 +488,9 @@ public sealed class TabManager
         foreach (var tab in _setAside.Keys)
             tab.Dispose();
         _setAside.Clear();
+        foreach (var tab in _tuckedAway)
+            tab.Dispose();
+        _tuckedAway.Clear();
         _shown = null;
         ActiveTab = null;
     }

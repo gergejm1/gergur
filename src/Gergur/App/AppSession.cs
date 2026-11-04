@@ -41,6 +41,16 @@ public sealed class AppSession
     /// <summary>The Google account the person signs in to each site with, learned from their own sign-ins.</summary>
     public GoogleAccountStore GoogleAccounts { get; } = new();
     public DownloadManager Downloads { get; } = new();
+
+    /// <summary>Which tab the toolbar's now-playing control drives, across the person's windows.</summary>
+    internal NowPlaying Media { get; } = new();
+
+    /// <summary>The song recognizer's library, read the first time it is needed.</summary>
+    private readonly Lazy<Music.SongLibrary> _songLibrary = new(() => new Music.SongLibrary());
+
+    /// <summary>The song recognizer: learns the person's songs, and says what a tab plays (<see cref="Music.SongListener"/>).</summary>
+    internal Music.SongListener Songs => _songs ??= new Music.SongListener(() => _songLibrary.Value, () => Settings.LearnSongs);
+    private Music.SongListener? _songs;
     public DropStore Drop { get; } = new();
 
     /// <summary>When the phone panel was last opened in any window: what came from the phone after it is new, and dots the phone button.</summary>
@@ -323,7 +333,7 @@ public sealed class AppSession
     {
         var session = SessionOf(_windows
             .Where(w => w.Tabs is not null)
-            .Select(w => (w.OpenedByAgent, w.Tabs!.Tabs, w.Tabs.ActiveTab)));
+            .Select(w => (w.OpenedByAgent, w.Tabs!.AllTabs, w.Tabs.ActiveTab)));
         if (session is not null)
             SessionStore.Save(session);
     }

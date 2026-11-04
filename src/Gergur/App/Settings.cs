@@ -73,6 +73,10 @@ public sealed class Settings
     [Description("Runs uBlock Origin Lite inside the browser, downloaded from its releases on GitHub and kept up to date (checked every six hours; a new version takes over at the next start). Its YouTube rules keep videos and playlists playing where YouTube refuses a browser it thinks blocks ads, and while it runs Gergur's own YouTube ad code stands down. The check and download go straight to GitHub, not through the VPN. Needs a restart.")]
     public bool UBlockLite { get; set; } = true;
 
+    [Category(Privacy), DisplayName("Learn the songs I play")]
+    [Description("While you play music on YouTube or YouTube Music, Gergur keeps a fingerprint of each song (never the audio) on this computer, so What song is this? on the now-playing panel can name it when it plays again, under talking in another video too. It can only name songs it has learned this way. Nothing is sent anywhere. Turning this off stops learning; to forget the songs, delete the songs folder in Gergur's data folder.")]
+    public bool LearnSongs { get; set; } = true;
+
     [Category(Privacy), DisplayName("Save passwords")]
     [Description("Offer to save a password when you sign in to a site, and fill saved ones in. Kept encrypted inside the profile. Agents sign in with saved ones (gergur_login) and never see them; their own windows never offer to save. Applies at once, open tabs included.")]
     public bool SavePasswords { get; set; } = true;

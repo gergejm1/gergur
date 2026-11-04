@@ -223,7 +223,7 @@ public sealed class AgentsPanelTests
         {
             using var form = MainForm.ForLayoutTest(new Settings { AgentServerEnabled = agentApi }, agentsWindow);
             var buttons = form.ToolbarButtons;
-            Assert.Equal((agentApi ? 5 : 4) + (agentsWindow ? 1 : 0), buttons.Length);
+            Assert.Equal((agentApi ? 6 : 5) + (agentsWindow ? 1 : 0), buttons.Length);
             Assert.Equal(agentsWindow, buttons[^1].AccessibleName == "Hide this agent window");
             for (int i = 1; i < buttons.Length; i++)
             {
@@ -251,7 +251,7 @@ public sealed class AgentsPanelTests
             form.ClaimForPerson();
             Assert.False(form.CloseHides);
             Assert.DoesNotContain(form.ToolbarButtons, b => b.AccessibleName == "Hide this agent window");
-            Assert.Equal(5, form.ToolbarButtons.Length);
+            Assert.Equal(6, form.ToolbarButtons.Length);
         });
 
         OnSta(() =>

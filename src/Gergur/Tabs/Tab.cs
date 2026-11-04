@@ -11,7 +11,7 @@ namespace Gergur.Tabs;
 /// url/title/favicon. All WebView2 access funnels through this class: raw API
 /// calls silently resume suspended tabs and would wake a tab that is meant to be left alone.
 /// </summary>
-public sealed class Tab : ITabHandle, IDisposable
+public sealed class Tab : ITabHandle, IDisposable, Music.IHearingTab
 {
     private TabManager _owner; // reassigned when the tab is torn off into another window
     private WebView2? _webView;
@@ -156,6 +156,9 @@ public sealed class Tab : ITabHandle, IDisposable
 
     public bool IsCurrent => _owner.ActiveTab == this;
 
+    /// <summary>Taken off the tab strip by the person and still playing; see <see cref="TabManager.TuckAwayAsync"/>.</summary>
+    internal bool TuckedAway { get; set; }
+
     public bool IsPlayingAudio
     {
         get
@@ -163,6 +166,192 @@ public sealed class Tab : ITabHandle, IDisposable
             try { return Core?.IsDocumentPlayingAudio ?? false; }
             catch { return false; }
         }
+    }
+
+    /// <summary>When this tab last began making sound. For <see cref="NowPlaying"/>.</summary>
+    internal DateTime? SoundStartedUtc { get; private set; }
+
+    /// <summary>When this tab was last heard: the moment its sound began or stopped.</summary>
+    internal DateTime? SoundLastHeardUtc { get; private set; }
+
+    /// <summary>The site this tab was on when its sound last began.</summary>
+    internal string? SoundHost { get; private set; }
+
+    private void OnPlayingAudioChanged(object? sender, object e)
+    {
+        var now = DateTime.UtcNow;
+        if (IsPlayingAudio)
+        {
+            SoundStartedUtc = now;
+            SoundHost = NowPlaying.HostOf(CommittedUrl);
+        }
+        SoundLastHeardUtc = now;
+        if (IsPlayingAudio)
+            ConsiderPlayingBehind();
+        else
+            StayUpForAWhile();   // between two songs, or paused: the next one may start any moment
+        RaiseUpdated();   // the strip's note
+    }
+
+    /// <summary>
+    /// How long a tab not in front stays up after its sound stopped or one of its media buttons
+    /// was pressed. Longer than the silence between two songs.
+    /// </summary>
+    internal static readonly TimeSpan PlayingBehindGrace = TimeSpan.FromSeconds(60);
+
+    private bool _playsBehind;
+    private DateTime _upUntilUtc;
+
+    /// <summary>
+    /// Whether a tab not in front keeps its page up, out of sight, instead of being hidden.
+    /// A page told it is hidden does not get on with its music: YouTube's player then takes no
+    /// new playlist from the page when a song changes, hides its Next button, drops its
+    /// handlers, and when that song ends plays whatever it last suggested, off the list
+    /// (measured signed out, the same five endings: in front 5 of 5 stayed on the queue, hidden
+    /// it left the playlist at the second). So not hidden while it is heard, for
+    /// <see cref="PlayingBehindGrace"/> after, and always when it was hidden from the strip on
+    /// purpose, where its controls are all the person has.
+    /// </summary>
+    internal static bool StaysUpBehind(bool tuckedAway, bool playing, DateTime now, DateTime upUntil) =>
+        tuckedAway || playing || now < upUntil;
+
+    /// <summary>Puts this tab's view where <see cref="StaysUpBehind"/> says, if it is not in front. UI thread.</summary>
+    private void ConsiderPlayingBehind()
+    {
+        if (_disposed || _webView is not { } view || State != TabState.Hidden)
+            return;
+        bool up = StaysUpBehind(TuckedAway, IsPlayingAudio, DateTime.UtcNow, _upUntilUtc);
+        if (up == _playsBehind)
+            return;
+        _playsBehind = up;
+        if (up)
+        {
+            PlaceBehind(view);
+        }
+        else
+        {
+            view.Visible = false;
+            PlaceInPageArea(view);
+        }
+    }
+
+    /// <summary>
+    /// Up, and out of the way. Beside the window's page area, so nothing can show through when
+    /// no page covers it: a child window outside its parent is clipped. At full size: the page
+    /// lays itself out as it would in front. A docked view that was never shown has no size.
+    /// Off the Tab key's round, which only passes over hidden controls by itself: the person's
+    /// keys must not land in a page they cannot see.
+    /// </summary>
+    internal static void PlaceBehind(Control view)
+    {
+        var size = view.Parent is { ClientSize: { Width: > 0, Height: > 0 } area } ? area : view.Size;
+        view.TabStop = false;
+        view.Dock = DockStyle.None;
+        view.Bounds = new Rectangle(-size.Width - 64, 0, size.Width, size.Height);
+        view.Visible = true;
+    }
+
+    /// <summary>Back where a tab's view lives, whether or not it was behind.</summary>
+    internal static void PlaceInPageArea(Control view)
+    {
+        view.Dock = DockStyle.Fill;
+        view.TabStop = true;
+    }
+
+    /// <summary>Keeps this tab up for <see cref="PlayingBehindGrace"/> from now, then looks again. UI thread.</summary>
+    private void StayUpForAWhile()
+    {
+        _upUntilUtc = DateTime.UtcNow + PlayingBehindGrace;
+        ConsiderPlayingBehind();
+        if (!_lookingAgain)
+            _ = LookAgainAfterGraceAsync();
+    }
+
+    private bool _lookingAgain;
+
+    /// <summary>One at a time, however often the sound comes and goes: it waits out the latest grace.</summary>
+    private async Task LookAgainAfterGraceAsync()
+    {
+        _lookingAgain = true;
+        try
+        {
+            for (var left = _upUntilUtc - DateTime.UtcNow; !_disposed && left > TimeSpan.Zero; left = _upUntilUtc - DateTime.UtcNow)
+                await Task.Delay(left + TimeSpan.FromSeconds(1));
+            ConsiderPlayingBehind();
+        }
+        catch (Exception ex)
+        {
+            DebugLog.Write($"a tab playing behind could not be looked at again: {ex.Message}");
+        }
+        finally
+        {
+            _lookingAgain = false;
+        }
+    }
+
+    /// <summary>
+    /// What this tab's music is doing, asked of the page and then of the frames it holds
+    /// (a player embedded from another site), and the frame that answered, null for the page
+    /// itself. Null when nothing in it has media, or the tab has no live page; never wakes a
+    /// parked tab, and never asks one of the browser's own pages. UI thread.
+    /// </summary>
+    internal async Task<(MediaState State, CoreWebView2Frame? Frame)?> ReadMediaAsync(TimeSpan budget)
+    {
+        if (Core is not { } core || RefusalFor(Url, _navigationUnderWay?.Uri, CommittedUrl) is not null)
+            return null;
+        var (json, inTime) = await WithBudget(core.ExecuteScriptAsync(MediaControl.ReadScript), budget, "null");
+        if (inTime && MediaControl.Parse(json) is { HasMedia: true } own)
+            return (own, null);
+        IReadOnlyList<(CoreWebView2Frame Frame, string Result)> frames;
+        try
+        {
+            frames = await ReadFramesAsync(MediaControl.ReadScript, budget);
+        }
+        catch (InternalPages.OwnPageRefusedException)
+        {
+            return null;   // went to one of the browser's own pages meanwhile
+        }
+        foreach (var (frame, answer) in frames)
+        {
+            if (MediaControl.Parse(answer) is { HasMedia: true } framed)
+                return (framed, frame);
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Runs one of the song recognizer's scripts (<see cref="Music.SongPage"/>) in this tab's
+    /// page and answers what it said, or null when it said nothing in time. The page itself
+    /// only: a player in another site's frame is not listened to. Never wakes the tab, and
+    /// never runs in one of the browser's own pages. UI thread.
+    /// </summary>
+    internal async Task<string?> HearAsync(string js, TimeSpan budget)
+    {
+        if (Core is not { } core || RefusalFor(Url, _navigationUnderWay?.Uri, CommittedUrl) is not null)
+            return null;
+        var (json, inTime) = await WithBudget(core.ExecuteScriptAsync(js), budget, "null");
+        return inTime ? json : null;
+    }
+
+    string Music.IHearingTab.Url => Url;
+    bool Music.IHearingTab.IsPlayingAudio => IsPlayingAudio;
+    DateTime? Music.IHearingTab.SoundStartedUtc => SoundStartedUtc;
+    Task<string?> Music.IHearingTab.HearAsync(string js, TimeSpan budget) => HearAsync(js, budget);
+
+    /// <summary>
+    /// Presses play, pause, next or previous for this tab's music, where
+    /// <see cref="ReadMediaAsync"/> found it. Answers what was done, or "none". UI thread.
+    /// </summary>
+    internal async Task<string> RunMediaAsync(MediaAction action, TimeSpan budget)
+    {
+        if (await ReadMediaAsync(budget) is not { } found || Core is not { } core)
+            return "none";
+        StayUpForAWhile();   // a song loading in a hidden page is what goes wrong
+        string js = MediaControl.CommandScript(action);
+        if (found.Frame is { } frame)
+            return MediaControl.Done((await ReadFrameScriptAsync(frame, js, budget)).Result);
+        var (json, inTime) = await WithBudget(core.ExecuteScriptAsync(js), budget, "null");
+        return inTime ? MediaControl.Done(json) : "none";
     }
 
     public bool CanGoBack
@@ -386,6 +575,7 @@ public sealed class Tab : ITabHandle, IDisposable
         core.WindowCloseRequested += OnWindowCloseRequested;
         core.DownloadStarting += OnDownloadStarting;
         core.ContainsFullScreenElementChanged += OnContainsFullScreenElementChanged;
+        core.IsDocumentPlayingAudioChanged += OnPlayingAudioChanged;
         core.ScriptDialogOpening += OnScriptDialogOpening;
         // An agent's window answers alert, confirm, prompt and "leave this page?" itself:
         // shown, they would be modal boxes from a window the person cannot see, and the
@@ -409,6 +599,10 @@ public sealed class Tab : ITabHandle, IDisposable
         await core.AddScriptToExecuteOnDocumentCreatedAsync(ErrorReporterScript);
         // Gmail's service worker wedges every page it controls here; see SiteWorkarounds.
         await core.AddScriptToExecuteOnDocumentCreatedAsync(SiteWorkarounds.GmailNoServiceWorkerScript);
+        // The site's own play, pause and next, for the toolbar's now-playing control.
+        await core.AddScriptToExecuteOnDocumentCreatedAsync(MediaControl.HookScript);
+        // A playlist song YouTube would start at its very end, which skips it.
+        await core.AddScriptToExecuteOnDocumentCreatedAsync(MediaControl.SongStartScript);
         // Which Google account the person picks on a sign-in; see GoogleSignIn.
         await core.AddScriptToExecuteOnDocumentCreatedAsync(GoogleSignIn.ChoiceScript);
         // Google's own sign-in chooser, the one the browser draws, watched in an agent's window
@@ -416,6 +610,7 @@ public sealed class Tab : ITabHandle, IDisposable
         await RefreshFedCmAsync();
 
         State = TabState.Hidden;
+        ConsiderPlayingBehind();   // a hidden tab rebuilt out of sight stays up like before
         if (navigateToStoredUrl && Url is not ("" or "about:blank"))
             TryNavigateCore(Url);
         RaiseUpdated();
@@ -739,6 +934,8 @@ public sealed class Tab : ITabHandle, IDisposable
                 RaiseBuildFailed();
             return;
         }
+        _playsBehind = false;
+        PlaceInPageArea(_webView);   // it may have been playing behind, out of the page area
         _webView.Visible = true; // auto-resumes a suspended page
         _webView.BringToFront();
         HasRendered = true;
@@ -762,6 +959,10 @@ public sealed class Tab : ITabHandle, IDisposable
         if (State != TabState.Suspended)
             State = TabState.Hidden;
         LastActiveUtc = DateTime.UtcNow;
+        // Hidden first and then put up again rather than never hidden: hiding is what takes the
+        // keyboard away from a page, and the person's keys must not go on to a tab out of sight.
+        _playsBehind = false;
+        ConsiderPlayingBehind();
         RaiseUpdated();
     }
 
@@ -3114,6 +3315,7 @@ public sealed class Tab : ITabHandle, IDisposable
 
     private void DetachAndDisposeWebView()
     {
+        _playsBehind = false;
         // The one place every way of losing the view for good goes through: discarded to
         // save memory, closed, or a renderer that died. Nothing is going to load or reply
         // now, so say so rather than leaving every caller to sit out its full timeout,

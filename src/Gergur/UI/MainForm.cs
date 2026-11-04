@@ -62,7 +62,7 @@ public sealed class MainForm : Form
                 UpdateAskBar();
             // Whose window it is decides who answers page dialogs: see Tab.RefreshDialogMode.
             if (Tabs is not null)
-                foreach (var tab in Tabs.Tabs)
+                foreach (var tab in Tabs.AllTabs)
                     tab.RefreshDialogMode();
             UpdateAgentBanner();
             LayoutToolbar();
@@ -142,9 +142,25 @@ public sealed class MainForm : Form
     private MainMenuFlyout? _mainMenu;
     private DownloadsFlyout? _downloadsPanel;
     private HistoryFlyout? _historyPanel;
+    private NowPlayingFlyout? _mediaPanel;
+    // The note on the toolbar while a tab in any of the person's windows plays music.
+    private GlyphButton _mediaButton = null!;
+    private readonly ToolTip _mediaTip = new();
+    private readonly System.Windows.Forms.Timer _mediaTimer = new() { Interval = 1000 };
+    private string? _mediaTipText;
+    private bool _mediaShown;
+    private Tab? _mediaTab;
+    private Tab? _mediaPanelTab;   // the tab the open panel describes
+    private Tab? _mediaReading;   // the tab whose page is being asked, one ask per tab
+    // The page's last good answer, kept a few seconds so one slow read does not grey the panel.
+    private (Tab Tab, MediaState State, DateTime AtUtc)? _mediaLastGood;
     private AgentsFlyout? _agentsPanel;
     private PhoneFlyout? _phonePanel;
     private GlyphButton _phoneButton = null!;
+    // "What song is this?": a microphone that listens to whatever plays in Gergur.
+    private SongFlyout? _songPanel;
+    private GlyphButton _songButton = null!;
+    private readonly ToolTip _songTip = new();
     private GlyphButton _agentsButton = null!;
     private GlyphButton _hideButton = null!;
     private AgentBanner _agentBanner = null!;
@@ -375,6 +391,12 @@ public sealed class MainForm : Form
         };
 
         _downloadsButton = MakeToolButton(Glyphs.Download, 0);
+        // Nearest the address bar, and only while something plays: see UpdateMediaButton.
+        _mediaButton = MakeToolButton(MediaGlyphs.Note, 0);
+        _mediaButton.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+        _mediaButton.AccessibleName = "Now playing";
+        _mediaButton.Visible = false;
+        _mediaButton.Click += (_, _) => ToggleMediaPanel();
         _bookmarkButton = MakeToolButton(Glyphs.StarOutline, 0);
         _menuButton = MakeToolButton(Glyphs.Menu, 0);
         // Beside the menu: who is driving the browser, there whenever agents may be.
@@ -413,6 +435,11 @@ public sealed class MainForm : Form
         _phoneButton.DragEnter += OnPhoneButtonDragEnter;
         _phoneButton.DragDrop += (_, e) => _phonePanel?.OnDragDrop(_phoneButton, e);
         _phoneButton.DragLeave += (_, _) => _phonePanel?.SetDragging(false);
+        _songButton = MakeToolButton(SongGlyphs.Listen, 0);
+        _songButton.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+        _songButton.AccessibleName = "What song is this?";
+        _songTip.SetToolTip(_songButton, "What song is this? Listens to whatever is playing in Gergur.");
+        _songButton.Click += (_, _) => ToggleSongPanel();
         _downloadsButton.Anchor = AnchorStyles.Top | AnchorStyles.Right;
         _bookmarkButton.Anchor = AnchorStyles.Top | AnchorStyles.Right;
         _menuButton.Anchor = AnchorStyles.Top | AnchorStyles.Right;
@@ -422,7 +449,7 @@ public sealed class MainForm : Form
 
         _toolbar.Controls.AddRange(
             [_backButton, _forwardButton, _reloadButton, _addressPill,
-             _hideButton, _downloadsButton, _bookmarkButton, _phoneButton, _agentsButton, _menuButton]);
+             _hideButton, _mediaButton, _downloadsButton, _bookmarkButton, _songButton, _phoneButton, _agentsButton, _menuButton]);
         _toolbar.Resize += (_, _) => LayoutToolbar();
         // The hairline between the chrome and the page, drawn here when the bookmarks bar is
         // hidden, since then the toolbar is the chrome's bottom edge.
@@ -966,10 +993,12 @@ public sealed class MainForm : Form
         get
         {
             GlyphButton[] always = _settings.AgentServerEnabled
-                ? [_menuButton, _agentsButton, _phoneButton, _bookmarkButton, _downloadsButton]
-                : [_menuButton, _phoneButton, _bookmarkButton, _downloadsButton];
-            // The hide button, nearest the address bar, in an agent's window only.
-            return _openedByAgent ? [.. always, _hideButton] : always;
+                ? [_menuButton, _agentsButton, _phoneButton, _songButton, _bookmarkButton, _downloadsButton]
+                : [_menuButton, _phoneButton, _songButton, _bookmarkButton, _downloadsButton];
+            // The now-playing note while something plays, then nearest the address bar the
+            // hide button, in an agent's window only (which never shows the note).
+            GlyphButton[] shown = _mediaShown ? [.. always, _mediaButton] : always;
+            return _openedByAgent ? [.. shown, _hideButton] : shown;
         }
     }
 
@@ -1015,8 +1044,10 @@ public sealed class MainForm : Form
         _mainMenu?.Dismiss();
         _downloadsPanel?.Dismiss();
         _historyPanel?.Dismiss();
+        _mediaPanel?.Dismiss();
         _agentsPanel?.Dismiss();
         _phonePanel?.Dismiss();
+        _songPanel?.Dismiss();
         // One of theirs comes forward. A minimised one only when every one of theirs is
         // minimised, and then restored: a hidden window left as the active one would take
         // their typing where nobody can see it, which is worse than a window coming back.
@@ -1085,6 +1116,348 @@ public sealed class MainForm : Form
         _agentBanner.SetAgent(AgentOwnerName ?? "An agent", task);
     }
 
+    // ------------------------------------------------------------------ now playing
+
+    /// <summary>How long the panel waits on a page for what it plays, or for a button.</summary>
+    private static readonly TimeSpan MediaBudget = TimeSpan.FromSeconds(1.5);
+
+    /// <summary>How often, and how far apart, a next or previous the page cannot take yet is asked again.</summary>
+    internal const int MediaRetries = 4;
+    internal static readonly TimeSpan MediaRetryGap = TimeSpan.FromMilliseconds(500);
+
+    /// <summary>
+    /// The tabs the now-playing control may drive: every tab in each of the person's windows,
+    /// those tucked away included, none in an agent's.
+    /// </summary>
+    private static IEnumerable<Tab> PersonTabs(AppSession session)
+        => session.Windows.ToArray()
+            .Where(w => !w.OpenedByAgent && !w.IsDisposed && w.Tabs is not null)
+            .SelectMany(w => w.Tabs!.AllTabs.ToArray());
+
+    /// <summary>
+    /// Once a second: whether something plays in any of the person's windows, which tab, and
+    /// whether it is heard. Shows the note on the toolbar while there is one, lit while it is
+    /// heard, and keeps an open panel up to date. Never in an agent's window.
+    /// </summary>
+    private void UpdateMediaButton()
+    {
+        if (_session is not { } session || _closing || IsDisposed || _openedByAgent)
+        {
+            _mediaTab = null;
+            SetMediaShown(false);
+            return;
+        }
+        // The song recognizer listens whether or not this window is seen: music plays on with
+        // every window minimised. Each window ticks it; it acts at most every 2.5 s.
+        _ = session.Songs.Tick(PersonTabs(session), DateTime.UtcNow);
+        // Nothing to show in a window nobody can see; it catches up when it is shown.
+        if (!Visible || WindowState == FormWindowState.Minimized)
+            return;
+        var tab = session.Media.Current(PersonTabs(session), DateTime.UtcNow);
+        _mediaTab = tab;
+        SetMediaShown(tab is not null);
+        if (tab is null)
+        {
+            _mediaPanel?.Dismiss();
+            return;
+        }
+        bool heard = tab.IsPlayingAudio;
+        _mediaButton.GlyphColor = heard ? Theme.Accent : Theme.Text;
+        // The song's own name while the panel has it for this tab; the tab's title otherwise,
+        // since a closed panel's last view is of whatever played when it was last open.
+        string name = _mediaPanel is { Visible: true, View: { } shown } && ReferenceEquals(_mediaPanelTab, tab) ? shown.Title : MediaControl.Clean(tab.Title);
+        string tip = (heard ? "Now playing: " : "Paused: ") + name;
+        if (tip != _mediaTipText)
+        {
+            _mediaTipText = tip;
+            _mediaTip.SetToolTip(_mediaButton, tip);
+            _mediaButton.AccessibleName = tip;
+        }
+        if (_mediaPanel is { Visible: true })
+            _ = RefreshMediaPanelAsync(tab);
+    }
+
+    internal void SetMediaShown(bool shown)
+    {
+        if (shown == _mediaShown)
+            return;
+        _mediaShown = shown;
+        _mediaButton.Visible = shown;
+        LayoutToolbar();
+    }
+
+    /// <summary>Opens the now-playing panel from its button, or closes it.</summary>
+    private void ToggleMediaPanel()
+    {
+        if (_session is null || _mediaTab is not { } tab)
+            return;
+        _mainMenu?.Dismiss();
+        _downloadsPanel?.Dismiss();
+        _historyPanel?.Dismiss();
+        _agentsPanel?.Dismiss();
+        _phonePanel?.Dismiss();
+        _songPanel?.Dismiss();
+        _mediaPanel ??= new NowPlayingFlyout(action => _ = RunMediaAsync(action), () => _ = GoToMediaTabAsync(), () => _ = HideMediaTabAsync(), () => _ = CloseMediaTabAsync());
+        if (_mediaPanel.Visible)
+        {
+            _mediaPanel.Dismiss();
+            return;
+        }
+        if (_mediaPanel.JustDismissed)
+            return;
+        _mediaPanelTab = tab;
+        // Up at once with what the tab itself says; the page's own answer follows.
+        _mediaPanel.ShowFromButton(this, _mediaButton, NowPlayingView.Of(null, tab.Title, tab.Url, tab.IsPlayingAudio, tab.TuckedAway));
+        _ = RefreshMediaPanelAsync(tab);
+    }
+
+    /// <summary>Asks the page what it plays and puts that in the open panel. One ask at a time.</summary>
+    private async Task RefreshMediaPanelAsync(Tab tab)
+    {
+        if (ReferenceEquals(_mediaReading, tab))
+            return;
+        _mediaReading = tab;
+        try
+        {
+            var found = await tab.ReadMediaAsync(MediaBudget);
+            // Closed, or moved on to another tab, while this one was asked.
+            if (_mediaPanel is not { Visible: true } panel || IsDisposed || !ReferenceEquals(_mediaTab, tab))
+                return;
+            var now = DateTime.UtcNow;
+            var state = KeptState(found?.State, tab, _mediaLastGood, now);
+            if (found is { } good)
+                _mediaLastGood = (tab, good.State, now);
+            _mediaPanelTab = tab;
+            panel.SetView(NowPlayingView.Of(state, tab.Title, tab.Url, tab.IsPlayingAudio, tab.TuckedAway));
+        }
+        catch (Exception ex)
+        {
+            DebugLog.Write($"what a tab plays could not be read: {ex.Message}");
+        }
+        finally
+        {
+            if (ReferenceEquals(_mediaReading, tab))
+                _mediaReading = null;
+        }
+    }
+
+    /// <summary>How long a page's last good answer stands in for one that did not come.</summary>
+    internal static readonly TimeSpan MediaAnswerKept = TimeSpan.FromSeconds(5);
+
+    /// <summary>
+    /// What the panel goes by: the page's answer, or when none came in time (a busy page, a
+    /// read cut short) its last good answer for the same tab, for <see cref="MediaAnswerKept"/>;
+    /// without that the buttons went grey for a second whenever a read was slow, and a click
+    /// in that second was lost. Whether it is playing is still the engine's, live.
+    /// </summary>
+    internal static MediaState? KeptState(MediaState? answer, object tab, (object Tab, MediaState State, DateTime AtUtc)? lastGood, DateTime now)
+        => answer ?? (lastGood is { } last && ReferenceEquals(last.Tab, tab) && now - last.AtUtc <= MediaAnswerKept
+            ? last.State with { Playing = false, Paused = false }
+            : null);
+
+    /// <summary>Presses one of the site's buttons for the tab now playing.</summary>
+    private async Task RunMediaAsync(MediaAction action)
+    {
+        if (_mediaTab is not { } tab)
+            return;
+        try
+        {
+            string done = await tab.RunMediaAsync(action, MediaBudget);
+            // Next or previous pressed in the first moment of a song: YouTube has neither its
+            // handler nor its Next button then (measured: hidden, no link, the film at 0 s),
+            // and both are back within about a second. Asked again rather than lost, so two
+            // quick presses skip two songs.
+            for (int retry = 0; done == "none" && action is MediaAction.Next or MediaAction.Previous && retry < MediaRetries && !IsDisposed; retry++)
+            {
+                await Task.Delay(MediaRetryGap);
+                if (!ReferenceEquals(_mediaTab, tab))
+                    break;
+                done = await tab.RunMediaAsync(action, MediaBudget);
+            }
+            DebugLog.Write($"media button {action}: the page did {done}");
+            if (IsDisposed)
+                return;
+            if (done == "none")
+                ShowMessage("That page did not take the button.");
+            // The page needs a moment to change song or state before it is asked again.
+            await Task.Delay(400);
+            if (IsDisposed)
+                return;
+            UpdateMediaButton();
+            if (_mediaPanel is { Visible: true })
+                await RefreshMediaPanelAsync(tab);
+        }
+        catch (Exception ex)
+        {
+            DebugLog.WriteAlways($"a media button could not be pressed: {ex.Message}");
+            if (!IsDisposed)
+                ShowMessage("That page did not take the button.");
+        }
+    }
+
+    /// <summary>Whether this window's song panel is listening, so a second press waits for the first.</summary>
+    private bool _identifying;
+
+    /// <summary>
+    /// Opens the song panel from its button, which starts listening to whatever plays in
+    /// Gergur, or closes it.
+    /// </summary>
+    private void ToggleSongPanel()
+    {
+        if (_session is null)
+            return;
+        _songPanel ??= new SongFlyout(() => _ = ListenForSongAsync());
+        if (_songPanel.Visible)
+        {
+            _songPanel.Dismiss();
+            return;
+        }
+        if (_songPanel.JustDismissed)
+            return;
+        _mainMenu?.Dismiss();
+        _downloadsPanel?.Dismiss();
+        _historyPanel?.Dismiss();
+        _mediaPanel?.Dismiss();
+        _agentsPanel?.Dismiss();
+        _phonePanel?.Dismiss();
+        if (!_identifying)
+            _songPanel.SetAnswer(SongAnswer.Listening, "");
+        _songPanel.ShowFromButton(this, _songButton);
+        _ = ListenForSongAsync();
+    }
+
+    /// <summary>
+    /// The tab to listen to: of the person's tabs making sound, the one that began last, on
+    /// any site. Agents' windows are never listened to.
+    /// </summary>
+    private static Tab? PlayingTab(AppSession session)
+        => PersonTabs(session).Where(t => t.IsPlayingAudio).MaxBy(t => t.SoundStartedUtc ?? DateTime.MinValue);
+
+    /// <summary>
+    /// "What song is this?": listens to the tab playing (<see cref="Music.SongListener.IdentifyAsync"/>)
+    /// and puts the answer in the song panel.
+    /// </summary>
+    private async Task ListenForSongAsync()
+    {
+        if (_session is not { } session || _songPanel is not { } panel || _identifying)
+            return;
+        // Set before anything that can throw, and always reset: a flag left set would make
+        // every later press do nothing, and this runs unobserved.
+        _identifying = true;
+        string site = "";
+        try
+        {
+            if (PlayingTab(session) is not { } tab)
+            {
+                DebugLog.Write("what song is this: nothing is playing");
+                panel.SetAnswer(SongAnswer.NothingPlaying, "");
+                return;
+            }
+            site = NowPlaying.SiteOf(tab.Url);
+            _songButton.GlyphColor = Theme.Accent;
+            panel.SetAnswer(SongAnswer.Listening, site.Length > 0 ? "To the tab playing on " + site : "To the tab playing");
+            var found = await session.Songs.IdentifyAsync(tab, DateTime.UtcNow);
+            DebugLog.Write(found is null
+                ? "what song is this: nothing heard"
+                : $"what song is this: {(found.Song is { } song ? song.Title + " by " + song.Artist : "none")}, score {found.Score}, next best {found.RunnerUp}, of {found.Known} songs");
+            if (!panel.IsDisposed)
+                panel.SetAnswer(SongAnswer.Of(found, session.Settings.LearnSongs), site.Length > 0 ? "Heard on " + site : "");
+        }
+        catch (Exception ex)
+        {
+            DebugLog.WriteAlways($"what song a tab plays could not be found: {ex.Message}");
+            if (!panel.IsDisposed)
+                panel.SetAnswer(SongAnswer.Failed, "");
+        }
+        finally
+        {
+            _identifying = false;
+            if (!_songButton.IsDisposed)
+                _songButton.GlyphColor = Theme.Text;
+        }
+    }
+
+    /// <summary>Brings the tab now playing to the front, in whichever of the person's windows it is.</summary>
+    private async Task GoToMediaTabAsync()
+    {
+        if (_session is not { } session || _mediaTab is not { } tab)
+            return;
+        foreach (var window in session.Windows.ToArray())
+        {
+            if (window.OpenedByAgent || window.IsDisposed || window.Tabs is not { } tabs || !tabs.AllTabs.Contains(tab))
+                continue;
+            try
+            {
+                if (tab.TuckedAway)
+                    await tabs.BringBackAsync(tab);
+                else
+                    await tabs.ActivateAsync(tab);
+                window.ShowToPerson();
+                tab.FocusPage();
+            }
+            catch (Exception ex)
+            {
+                DebugLog.WriteAlways($"the tab playing could not be shown: {ex.Message}");
+                ShowMessage("That tab could not be shown.");
+            }
+            return;
+        }
+        ShowMessage("That tab has closed.");
+    }
+
+    /// <summary>The window of the person's that holds this tab, on its strip or tucked away.</summary>
+    private static MainForm? PersonWindowOf(AppSession session, Tab tab)
+        => session.Windows.ToArray().FirstOrDefault(w => !w.OpenedByAgent && !w.IsDisposed && w.Tabs is { } tabs && tabs.AllTabs.Contains(tab));
+
+    /// <summary>
+    /// The panel's Hide tab: the tab now playing leaves the strip and goes on playing, and the
+    /// panel stays up, now offering it back. The toolbar's note stays for as long as it is hidden.
+    /// </summary>
+    private async Task HideMediaTabAsync()
+    {
+        if (_session is not { } session || _mediaTab is not { } tab || PersonWindowOf(session, tab) is not { } window)
+            return;
+        if (!ReferenceEquals(_mediaPanelTab, tab))
+            return;   // the control has just moved on: the panel is still describing another tab
+        try
+        {
+            await window.Tabs!.TuckAwayAsync(tab);
+            // The hidden page may have had the keyboard, as a closed one does; see CloseTabAsync.
+            if (window.Tabs.ActiveTab is { } now && ReferenceEquals(window, this))
+                now.FocusPage();
+            window.UpdateChrome(forceAddressBar: true);
+            UpdateMediaButton();
+            if (_mediaPanel is { Visible: true })
+                await RefreshMediaPanelAsync(tab);
+        }
+        catch (Exception ex)
+        {
+            DebugLog.WriteAlways($"the tab playing could not be hidden: {ex.Message}");
+            ShowMessage("That tab could not be hidden.");
+        }
+    }
+
+    /// <summary>The panel's Close tab, for a tab tucked away: it has no strip to close it from.</summary>
+    private async Task CloseMediaTabAsync()
+    {
+        if (_session is not { } session || _mediaTab is not { } tab || PersonWindowOf(session, tab) is not { } window)
+            return;
+        // A tab that began to play this moment has taken over the control, and the panel says so
+        // only once its page has answered: the button pressed was for the hidden one.
+        if (!tab.TuckedAway || !ReferenceEquals(_mediaPanelTab, tab))
+            return;
+        try
+        {
+            await window.Tabs!.CloseTabAsync(tab);
+            UpdateMediaButton();
+        }
+        catch (Exception ex)
+        {
+            DebugLog.WriteAlways($"the tab playing could not be closed: {ex.Message}");
+            ShowMessage("That tab could not be closed.");
+        }
+    }
+
     private void LayoutToolbar()
     {
         // Right to left, off the widths the buttons actually have rather than the ones
@@ -1113,7 +1486,9 @@ public sealed class MainForm : Form
     {
         _downloadsPanel?.Dismiss();
         _historyPanel?.Dismiss();
+        _mediaPanel?.Dismiss();
         _phonePanel?.Dismiss();
+        _songPanel?.Dismiss();
         _mainMenu ??= new MainMenuFlyout();
         if (_mainMenu.Visible)
         {
@@ -1138,7 +1513,9 @@ public sealed class MainForm : Form
         }
         _mainMenu?.Dismiss();
         _historyPanel?.Dismiss();
+        _mediaPanel?.Dismiss();
         _phonePanel?.Dismiss();
+        _songPanel?.Dismiss();
         var panel = DownloadsPanel(_session);
         if (panel.Visible)
         {
@@ -1160,7 +1537,7 @@ public sealed class MainForm : Form
         if (_session is null || _closing || OpenedByAgent || IsPageFullScreen || !Visible
             || WindowState == FormWindowState.Minimized || GetForegroundWindow() != Handle)
             return;
-        if (_mainMenu is { Visible: true })
+        if (_mainMenu is { Visible: true } || _mediaPanel is { Visible: true } || _songPanel is { Visible: true })
             return;
         DownloadsPanel(_session).ShowForNewDownload(this, _downloadsButton);
     }
@@ -1179,6 +1556,8 @@ public sealed class MainForm : Form
         _mainMenu?.Dismiss();
         _downloadsPanel?.Dismiss();
         _phonePanel?.Dismiss();
+        _songPanel?.Dismiss();
+        _mediaPanel?.Dismiss();
         _historyPanel ??= new HistoryFlyout(
             () => session.History.TryRead(max: 200),
             url => { ClaimForPerson(); _ = NavigateActiveAsync(url); },
@@ -1196,6 +1575,8 @@ public sealed class MainForm : Form
         }
         _mainMenu?.Dismiss();
         _historyPanel?.Dismiss();
+        _mediaPanel?.Dismiss();
+        _songPanel?.Dismiss();
         DownloadsPanel(session).ShowFromButton(this, _downloadsButton);
     }
 
@@ -1211,7 +1592,9 @@ public sealed class MainForm : Form
         _mainMenu?.Dismiss();
         _downloadsPanel?.Dismiss();
         _historyPanel?.Dismiss();
+        _mediaPanel?.Dismiss();
         _phonePanel?.Dismiss();
+        _songPanel?.Dismiss();
         if (_agentsPanel is null)
         {
             _agentsPanel = new AgentsFlyout(session.Agents.Snapshot, AgentTab, id => _ = ShowAgentTabAsync(id), AgentApiLine, OpenAgentsPage);
@@ -1270,7 +1653,9 @@ public sealed class MainForm : Form
         _mainMenu?.Dismiss();
         _downloadsPanel?.Dismiss();
         _historyPanel?.Dismiss();
+        _mediaPanel?.Dismiss();
         _agentsPanel?.Dismiss();
+        _songPanel?.Dismiss();
         MarkDropSeen();
         PhonePanel(session).ShowFromButton(this, _phoneButton);
     }
@@ -1737,6 +2122,8 @@ public sealed class MainForm : Form
             _tabStrip.Bind(Tabs);
 
             _statusTimer.Start();
+            _mediaTimer.Tick += (_, _) => UpdateMediaButton();
+            _mediaTimer.Start();
             // Once for the app. A freeze leaves nothing in the log by itself; this writes what
             // the browser had last been doing when the window stops answering.
             UiWatchdog.Start(this);
@@ -1997,7 +2384,9 @@ public sealed class MainForm : Form
     {
         if (Tabs is null || from.Tabs is null)
             return;
-        bool sourceEmpties = from.Tabs.Tabs.Count == 1;
+        // A window with music tucked away stays for it, with a new tab in place of the last one.
+        bool leavesEmptyStrip = from.Tabs.Tabs.Count == 1;
+        bool sourceEmpties = leavesEmptyStrip && from.Tabs.TuckedAway.Count == 0;
         if (!from.OpenedByAgent)
             ClaimForPerson();   // their tab, so their window now
 
@@ -2009,6 +2398,8 @@ public sealed class MainForm : Form
         tab.FocusPage();
         UpdateChrome(forceAddressBar: true);
 
+        if (leavesEmptyStrip && !sourceEmpties)
+            await from.NewTabAsync();
         if (sourceEmpties)
             from.Close();
         else
@@ -2055,6 +2446,10 @@ public sealed class MainForm : Form
         _mainMenu?.Dispose();
         _downloadsPanel?.Dispose();
         _historyPanel?.Dispose();
+        _mediaPanel?.Dispose();
+        _mediaTip.Dispose();
+        _songPanel?.Dispose();
+        _songTip.Dispose();
         _watchGlow?.Dispose();
         if (_agentsPanel is not null && _agentsHookedTo is not null)
             _agentsHookedTo.Agents.Changed -= _agentsPanel.AgentsChanged;
@@ -2094,6 +2489,8 @@ public sealed class MainForm : Form
         }
         _pagePushTimer.Stop();
         _pagePushTimer.Dispose();
+        _mediaTimer.Stop();
+        _mediaTimer.Dispose();
 
         Tabs?.DisposeAll(); // engine processes exit promptly once the last WebView is gone
         _session?.RemoveWindow(this); // stops the agent and tunnel when this was the last
@@ -2900,7 +3297,7 @@ public sealed class MainForm : Form
                 window._bookmarksBar.Visible = session.Settings.ShowBookmarksBar;
             // The page settings reach tabs already open, not only the next view built.
             // Each one catches its own failure, so nothing escapes the discard.
-            foreach (var tab in window.Tabs?.Tabs ?? [])
+            foreach (var tab in window.Tabs?.AllTabs ?? [])
                 _ = tab.ApplySettingsLiveAsync(session.Settings);
             window.UpdateStatus();
         }

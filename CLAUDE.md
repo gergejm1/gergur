@@ -547,7 +547,9 @@ wakes it. The user's browsing is personal: read what the task requires, nothing 
   `display`, not from the box being found. Both of these were
   written from the report and unit tested against stub pages; the 16x run-out has still
   not met a real stitched break (no ad ran in the live test below).
-- Playlist songs being "skipped" is YouTube refusing to play, not the ad code, measured
+- Playlist songs being "skipped" had this cause on 2026-11-02; two others were measured on
+  2026-11-04, see "A playlist skipping songs" under Now playing. This one is YouTube refusing
+  to play, not the ad code, measured
   2026-11-02 on the signed-in profile with the VPN off (`yt-playlist-test.ps1` in a muted
   agent window, then `getPlayerResponse()` on the tab): every song's
   `playabilityStatus.status` was `ERROR` with `errorScreen.enforcementMessageViewModel`
@@ -1230,3 +1232,215 @@ nothing is refused without it. It is kept as one printable line of at most 100 c
 This is a nudge, not a boundary: an agent can skip it by using the HTTP API, and agents
 that share a key share a task (every MCP client that sent no session id is "mcp:unnamed",
 and API callers with the same `X-Gergur-Agent` name are one agent).
+
+### Now playing
+
+While a tab in any of the person's windows plays sound, a note shows on the toolbar nearest
+the address bar (lit while heard, its tooltip "Now playing: ..." or "Paused: ..."), and a
+click drops a panel with the song, previous, play or pause, next, and below them Go to tab and
+Hide tab (`UI/NowPlayingFlyout.cs`). It drives that tab from whichever tab or window is in front.
+Which tab (`App/NowPlaying.cs`, checked once a second by each window): the one making sound,
+of two the one that began last; once nothing is heard, the last one chosen stays chosen for
+30 minutes while it is on the site it played on, so a paused song can be played again from
+the panel; a hidden tab (below) stays chosen for as long as it is open. Agents' windows are
+never asked and never show the note.
+
+Hide tab takes the tab off the strip and leaves its controls: the header then says "Now
+playing, tab hidden", and the row below reads Show tab (back on the strip, in front) and Close
+tab. `TabManager.TuckAwayAsync` moves it to a list beside the strip's, so it is not in the strip,
+Ctrl+Tab or agents' tab lists, and its window closing closes it. `AllTabs` is what session
+saving, settings and the note go through: after a restart it is an ordinary tab again. Hiding
+the only tab, or closing the last one left on the strip, leaves a new tab rather than closing
+the window under the music. With nothing making sound the control goes to a hidden tab once a
+paused one on the strip has been quiet for 5 minutes (not 30), so a song paused from the panel
+can be played again from it and the hidden one is soon back in reach; with two hidden, closing
+one brings up the other at once, and showing one does once it has been quiet that long. Hide and Close act only on the tab the panel describes: a
+tab that begins to play takes over the control a moment before the panel can say so. Closing
+the window ends a hidden tab like its other tabs, without asking.
+
+- The buttons are the site's own. A site hands Windows its play, pause, next and previous
+  through the Media Session API (`setActionHandler`), which a page cannot be asked for
+  afterwards, so `MediaControl.HookScript` notes each one at document creation and the
+  panel presses that one. Without a handler it plays and pauses the page's `<audio>` and
+  `<video>` directly, and on YouTube presses the player's own Next and Previous: YouTube
+  hands "next" over on a schedule of its own, and a press a few seconds into a playlist
+  found none (measured). The song's name is the one the site gives Windows
+  (`mediaSession.metadata`), else the tab's title.
+- The scripts run in the page's own world, where the site's handlers live, so the page can
+  lie about what it plays; that costs a wrong title. Its texts are cut to one clean line
+  (`MediaControl.Clean`), nothing it says is opened or run, and a page that claims a next
+  without having media is not believed. A player in a frame from another site is found by
+  asking the page's frames (`Tab.ReadMediaAsync`). Reading never wakes a parked tab and
+  never asks one of the browser's own pages.
+- Media keys need nothing from Gergur: WebView2 already registers each page's media session
+  with Windows, measured on 2026-11-04 (Windows listed the test page's song as
+  `msedgewebview2.exe` with next available, its play and pause reached the page's own
+  handler, and a real play/pause key reached it with another app in front). Windows names it
+  `msedgewebview2.exe` in its media overlay, not Gergur.
+- A read that does not come back in time (a busy page) leaves the panel on the page's last
+  good answer for that tab, for 5 s (`MainForm.KeptState`), rather than greying its buttons
+  for a second and losing a click. A next or previous the page cannot take yet is asked
+  again, every 0.5 s, four times: in the first moment of a song YouTube has neither its
+  handler nor its Next button (measured: hidden, no link, the film at 0 s).
+- YouTube drops a next pressed while it is still changing songs, through its own handler
+  too, so it does to a media key what it does to the panel: two presses 0.3 s apart moved
+  the playlist on one song, measured twice. Not worked around.
+- The engine reports a tab as playing only when there is signal (digital silence is not
+  heard), and a muted tab still counts, so the live test plays a quiet tone in a tab opened
+  muted.
+- A tab not in front that is heard keeps its page up, out of sight (`Tab.StaysUpBehind`):
+  while it plays, for 60 s after it stopped or a panel button was pressed, and always when
+  hidden with Hide tab. Its view stays visible to the engine, moved beside the page area where
+  its parent clips it, so nothing shows through when no page covers it, and it re-docks when it
+  comes forward. It is hidden first and then put up, because hiding is what takes the keyboard
+  off a page, and it is off the Tab key's round (`TabStop`). The cost is a background video being drawn as if it were in front, while heard.
+  A page up behind cannot be suspended (`TrySuspendAsync` refuses a visible view).
+
+#### A playlist skipping songs
+
+Two causes measured on 2026-11-04, and neither is the 2026-11-02 one (nothing refused to play):
+
+- A song already heard starts at its saved watch position. YouTube hands that position over
+  with the song's data and the player seeks to it in its own `loadedmetadata`. At the very end
+  the song "ends" within about 0.5 s and the playlist moves on: a stay of 5 to 13 s with the
+  time reading 0, on the signed-in profile (one song at 154 of 155 s, another at 123 of
+  124). Songs never played, and the first song of a direct navigation, start at 0, and signed
+  out it does not happen. Not every fully watched song does it. `MediaControl.SongStartScript`
+  sends a new song in a playlist (`list=`) back to 0 when it starts near its end (its last 30
+  s or last tenth), or part way through anything YouTube files under Music; a film or talk
+  resumes, and a link naming a time (`t`, `start`), the person's own seek, the song a reload
+  of the page comes back to, and an ad are left alone. It is a capture
+  listener that waits for the player's own handler and decides once per song, by the time the
+  song plays. Not
+  established: which field carries the position, and whether uBO Lite's rewrite of the player
+  request plays a part (`UBlockLite` is dialog-only, so it cannot be turned off for a test on
+  the real profile). `s.youtube.com`, which records the position, is not blocked.
+- A page told it is hidden: YouTube's player takes no new playlist from the page when a song
+  changes (Next hidden, handlers dropped, the Next link pointing at its own suggestion rather
+  than the queue), and when that song ends it follows the suggestion, off the list. Signed
+  out, five song endings each: tab in front 5 of 5 stayed on the queue, tab behind left the
+  playlist at the second ending, and with the page kept up behind 5 of 5 stayed. Pressing the
+  hidden Next left the playlist too, which is why this is not fixed in the page.
+  `p.nextVideo()` from a hand-built list URL also left it.
+
+The earlier history "index jumps" were no evidence of either: history does not record every
+playlist step.
+
+Verified on 2026-11-04 in a test instance started on a hidden Windows desktop (its real
+window, toolbar and panel, clicked with window messages, nothing on the person's screen;
+`scratchpad/medialive`): no note while nothing plays; the note with the tab's title once it
+plays, still there with another tab in front; the panel at its laid-out size under it;
+pause, play, next and previous reaching the site's own handlers; "Paused" with the song's
+own name; Go to tab bringing the tab forward; a plain `<audio>` page paused and played with
+next doing nothing; a player in a frame from another site paused and played; a real
+YouTube Mix paused, played, and moved to the next song both through its handler and, with
+the handler taken away (a song well under way), through its Next button; the note gone once
+the tab left for a page with nothing playing. On a cold start YouTube reports playing before
+any sound, and the note follows about 3.6 s later, when the engine hears it. The page
+scripts also run under node against a stand-in page (`MediaScriptTests`): handlers noted and
+pressed, a refused action never noted, a throwing handler falling through to the page's
+media, YouTube's buttons on YouTube only. Not yet used by the person in their own Gergur.
+
+Hide tab and the page kept up, verified on 2026-11-04 the same way (`scratchpad/hidelive`, a
+real signed-out Mix, tab muted): Hide tab takes it off the strip, another tab comes forward
+with none of the hidden page showing (photographed), the panel and note stay; the playlist
+moves on by itself while hidden; pause, play and next from the panel; two songs later Show tab
+finds it on the queue, in front, nothing reloaded, at full size; Close tab; the only tab and the
+last strip tab leave a new tab with the window and note staying; saved with the session. On
+the strip behind another tab it is up while heard, still up 30 s after a pause, hidden once the
+grace is over, and up again when the panel presses play. `SongStartScript`'s built text on the
+signed-in profile, in a hidden agent window, one step through the queue's link: one song went
+from 158 of 158 to 0 and played on (35 s watched); by hand beforehand, another went from
+154 of 155 to 0, played to its end, and moved to the right next song, against 5 s and a skip
+without it. That real run was before the script learned its playlist, reload and ad rules; the
+final text ran in the test instance on a real Mix behind another tab, with a stand-in moving the
+next song to 286 of 287 s the way the player does: back to 0, still that song 24 s on, in the
+playlist. Those rules themselves ran under node only (`TuckedAwayTabTests`, each one broken on
+purpose and caught). Not verified: signed in with a page up behind, keyboard focus after leaving a
+playing tab (hidden first by design, not measured) and the Tab key skipping it (`TabStop`, by
+WinForms' rule), moving the last strip tab to another window with a hidden tab behind, and the
+person's own use.
+
+### What song is this?
+
+A microphone on the toolbar, beside the phone button, drops a panel like the agents and
+phone ones (`UI/SongFlyout.cs`, `MainForm.ToggleSongPanel`). Opening it starts listening: it
+says "Listening..." and which site, then the song and artist, or that it does not know it,
+with "Listen again" below. It listens to whatever plays in the person's windows, on any
+site (TikTok, YouTube, anything with `<audio>` or `<video>`): of the tabs making sound, the
+one that began last (`MainForm.PlayingTab`), never an agent's window. Nothing playing says
+so at once. It names the song under talking too ("a song in the background of a video").
+There is no outside service: Gergur keeps its own library, learned from the songs the person
+plays (`Settings.LearnSongs`, on by default, Privacy), so it can only name a song it has
+heard here, and it only learns from YouTube and YouTube Music. A song heard only on TikTok
+is never known.
+
+- Fingerprints are Shazam's published method (Wang, 2003; `Music/AudioFingerprint.cs`):
+  spectrogram peaks at 11025 Hz, chosen per band so a voice cannot take them all, paired
+  into 24 bit hashes, and matched by how many of a clip's hashes agree on one offset in time.
+  A match needs 10 agreeing and three times the runner-up (`SongLibrary.Matches`). Measured
+  offline on real captures (four songs, a TED talk laid over a second playback): right 24 of
+  24 from no talk down to the song 6 dB under the talk, 19 to 21 of 24 at 10 dB under; a
+  wrong song never scored over 3, with 2000 decoy songs in the library too; a 10 s question
+  takes about 11 ms.
+- Listening happens in the page (`Music/SongPage.cs`): `captureStream` on the playing media,
+  an `AudioContext` at 11025 Hz, a processor whose output goes nowhere (gain 0), so nothing
+  heard changes, and a muted tab is heard all the same. It skips digital silence and
+  YouTube's ads (`ad-showing`), keeps at most 20 s, follows a playlist's next track
+  (`addtrack`), and stops by itself 15 s after the browser last took from it. The browser
+  takes what it heard every 2.5 s (`Music/SongListener.cs`, ticked by each window's
+  once-a-second timer, minimised or not, never an agent's window).
+- Learned: a YouTube video YouTube files under Music (the player's own
+  `microformat...category`), or anything on YouTube Music, not live, at most ten minutes.
+  Named from the video title and channel ("Artist - Song (Official Video)" by "ArtistVEVO"
+  is Song by Artist, `SongNames`), or from what YouTube Music hands Windows. Kept after 30 s
+  heard, then every 60 s, up to six minutes or the whole song, keyed by video id so the same
+  video on either site is one song; a longer hearing replaces a shorter one, and a song heard
+  in full is not listened to again. A talk, a stream, a mix or any other site is never learned.
+  Unless a question is open, a tab is not even read unless its own address (not what the page
+  says) is on youtube.com, www., m. or music.youtube.com, and a page claiming another of those
+  hosts than its address is never learned from (`SongPage.SongSiteOf`).
+- Kept in `songs` in the data folder: `songs.json` (names, how much was heard) and one
+  `{id}.fp` per song (its landmarks, about 37 KB a minute heard). Never audio. At most 500 songs,
+  the one learned longest ago going first. A `songs.json` that cannot be read is never
+  written over (nothing is learned that run). Each keep writes a new file and removes the old
+  one, never writing over it: Windows refuses to replace a file a question is reading
+  (measured in a test, sharing flags or not). Files the list does not name are removed at
+  start (only `{number}.fp` and its `.tmp`, and only when the list was read). The search index
+  is one array of every landmark, built when a question needs it and let go three minutes
+  after the last one (`SongListener.Tick` calls `ReleaseIdle`); full of four minute songs it
+  is about 75 MB while held. No file work happens under the lock the UI thread reads the list
+  with. Forgetting is deleting that folder; there is no button for it yet.
+- Asked while the tab's audio is already being heard (the song being learned), the answer
+  is at once; otherwise it listens for 10 s, up to 25. Audio heard on the tab's previous page,
+  or by a listener since replaced, never answers for the page now (measured live: it did,
+  before `_recentUrl` and the listener's name were checked).
+- The page's script runs in the page's own world, so a page can feed it what it likes; that
+  costs a wrong song learned under that page's own video id, nothing more.
+- One question at a time, app wide: two windows asking about the same tab share it, but a
+  second window asking about another tab while the first listens replaces it, and the first
+  says "Could not hear that tab" (`SongListener.IdentifyAsync`). Both pick the tab by the same
+  rule, so it needs two tabs playing and two windows asking within seconds; accepted.
+- Not done: a player in a frame from another site is not listened to (the page itself only),
+  and a site whose media is cross-origin without CORS gives silence to `captureStream`.
+
+The button was verified on 2026-11-04 in a test instance on a hidden Windows desktop
+(`scratchpad/songlive`, 12 checks, tab muted, the button found and clicked by window
+messages): on the toolbar row; with nothing playing it says so and the panel hangs from the
+button; Despacito played on YouTube was learned after 33 s and the button named it (score
+178); the same tab on a local page playing a made-up tune, asked with Listen again, answered
+"not a song Gergur knows" (score 2) and nothing was learned from it. All three panels were
+photographed and looked at. The now-playing harness passed again with its panel back as it
+was.
+
+Before the button, the same feature as a row of the now-playing panel was verified the same
+day (14 checks; run again after the review fixes): Despacito played on YouTube was learned
+after 33 s under its own name ("Despacito ft. Daddy Yankee" by Luis Fonsi), with only
+`songs.json` and one fingerprint file written; asked while it played it was named at once
+(score 234); a local page playing a second capture of it with a TED talk at the same
+loudness was named in 12.6 s (score 63, runner-up 0); the talk alone was "none" (score 0);
+nothing else was learned. Unit tests (`SongRecognizerTests`) cover names,
+which pages are songs, reading the page's answer, the library on disk, matching made-up songs
+under noise, and the listener learning and answering with stand-in tabs; `SongScriptTests`
+runs the page script under node. Not yet used by the person in their own Gergur, and not
+tried with a library of hundreds of real songs.

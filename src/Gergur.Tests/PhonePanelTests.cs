@@ -256,8 +256,8 @@ public sealed class PhonePanelTests : IDisposable
     {
         string form = Code("Gergur", "UI", "MainForm.cs");
         // In the toolbar whether or not the agents button is (the window itself is built in AgentsPanelTests).
-        Assert.Contains("[_menuButton, _agentsButton, _phoneButton, _bookmarkButton, _downloadsButton]", form);
-        Assert.Contains("[_menuButton, _phoneButton, _bookmarkButton, _downloadsButton]", form);
+        Assert.Contains("[_menuButton, _agentsButton, _phoneButton, _songButton, _bookmarkButton, _downloadsButton]", form);
+        Assert.Contains("[_menuButton, _phoneButton, _songButton, _bookmarkButton, _downloadsButton]", form);
         Assert.Contains("_phoneButton.AllowDrop = true;", form);
         Assert.Contains("_phoneButton.DragDrop += (_, e) => _phonePanel?.OnDragDrop(_phoneButton, e);", form);
         Assert.Contains("session.Drop.Changed += OnDropChanged;", form);
