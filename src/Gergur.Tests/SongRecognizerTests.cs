@@ -553,13 +553,18 @@ public sealed class SongRecognizerTests : IDisposable
         Assert.False(video.Ear);
 
         var asking = ear.IdentifyAsync(video, t);
-        for (int i = 0; i < 10 && !asking.IsCompleted; i++)
+        for (int i = 0; i < 16 && !asking.IsCompleted; i++)
+        {
             t = await TickFor(ear, [video], t, 1);
+            // A weak match waits for the next clip: let the question go round.
+            for (int spin = 0; spin < 2000 && !asking.IsCompleted && !ear.Asking; spin++)
+                await Task.Delay(1);
+        }
         var found = await asking;
         Assert.NotNull(found);
         Assert.Equal("B", found.Song?.Title);
         Assert.Equal(2, found.Known);
-        Assert.Equal(SongAnswer.Of(found, learning: true), new SongAnswer("B", "Band", false));
+        Assert.Equal(SongAnswer.Of(found, growing: true), new SongAnswer("B", "Band", false));
     }
 
     [Fact]
@@ -584,7 +589,7 @@ public sealed class SongRecognizerTests : IDisposable
         // the song, from audio heard on the page before.
         var library = new SongLibrary(_folder);
         var tab = new FakeTab("www.youtube.com", "aaaaaaaaaaa", Song(1, 120));
-        var ear = new SongListener(() => library, () => true, Inline);
+        var ear = new SongListener(() => library, () => true, Inline, keepListening: TimeSpan.Zero);
         var t = await TickFor(ear, [tab], DateTime.UtcNow, 14);
         await ear.Work;
         Assert.Equal(1, library.Count);
@@ -601,10 +606,14 @@ public sealed class SongRecognizerTests : IDisposable
         Assert.NotNull(found);
         Assert.Null(found.Song);
 
-        // A new listener on the same address (the page reloaded) is a new page too.
-        var again = new FakeTab("www.youtube.com", "aaaaaaaaaaa", Song(1, 120));
-        var ear2 = new SongListener(() => library, () => true, Inline);
-        t = await TickFor(ear2, [again], t, 6);
+        // A new listener on the same address (the page reloaded) is a new page too. Asked once
+        // first, since a page that is not a song is only heard while a question is open.
+        var again = new FakeTab("www.youtube.com", "aaaaaaaaaaa", Song(1, 120), category: "Entertainment");
+        var ear2 = new SongListener(() => library, () => true, Inline, keepListening: TimeSpan.Zero);
+        var earlier = ear2.IdentifyAsync(again, t);
+        for (int i = 0; i < 10 && !earlier.IsCompleted; i++)
+            t = await TickFor(ear2, [again], t, 1);
+        Assert.Equal("Song aaaaaaaaaaa", (await earlier)?.Song?.Title);
         again.EarName = "ear2";
         again.Audio = Song(8, 60);
         again.At = 0;
@@ -667,13 +676,22 @@ public sealed class SongRecognizerTests : IDisposable
     public async Task TheIndexIsLetGoAFewMinutesAfterAQuestion()
     {
         var library = new SongLibrary(_folder);
-        var tab = new FakeTab("www.youtube.com", "aaaaaaaaaaa", Song(1, 120));
+        var song = Song(1, 120);
+        library.Put(Info("aaaaaaaaaaa", "A"), 120, AudioFingerprint.Landmarks(song), DateTime.UtcNow);
+        var tab = new FakeTab("www.youtube.com", "vvvvvvvvvvv", song, category: "Entertainment");
         var ear = new SongListener(() => library, () => true, Inline);
-        var t = await TickFor(ear, [tab], DateTime.UtcNow, 14);
-        await ear.Work;
-        Assert.NotNull(await ear.IdentifyAsync(tab, t));
+        var t = DateTime.UtcNow;
+        var asking = ear.IdentifyAsync(tab, t);
+        for (int i = 0; i < 10 && !asking.IsCompleted; i++)
+        {
+            t = await TickFor(ear, [tab], t, 1);
+            // The answer is worked out off this thread: no more of the clock goes by than it took.
+            for (int spin = 0; spin < 2000 && !asking.IsCompleted && !ear.Asking; spin++)
+                await Task.Delay(1);
+        }
+        Assert.NotNull(await asking);
         Assert.True(library.HoldsIndex);
-        await ear.Tick([tab], t + SongLibrary.IndexKept);
+        await ear.Tick([tab], t + SongLibrary.IndexKept - TimeSpan.FromSeconds(10));
         Assert.True(library.HoldsIndex);
         await ear.Tick([tab], t + SongLibrary.IndexKept + SongListener.Every + TimeSpan.FromSeconds(1));
         Assert.False(library.HoldsIndex);
@@ -796,11 +814,11 @@ public sealed class SongRecognizerTests : IDisposable
     {
         var song = new LearnedSong(1, "youtube:a", "Song", "", "youtube.com", DateTime.UtcNow, 30);
         Assert.Equal(new SongAnswer("Song", "youtube.com", false), SongAnswer.Of(new Identification(song, 40, 2, 3), true));
-        Assert.Equal("It learns songs as you play them on YouTube.", SongAnswer.Of(new Identification(null, 0, 0, 0), true).Detail);
-        Assert.Equal("Learning songs is off in the settings.", SongAnswer.Of(new Identification(null, 0, 0, 0), false).Detail);
-        Assert.Equal("It knows 1 song, learned as you play them.", SongAnswer.Of(new Identification(null, 4, 2, 1), true).Detail);
-        Assert.Equal("It knows 12 songs, learned as you play them; learning is off.", SongAnswer.Of(new Identification(null, 4, 2, 12), false).Detail);
-        Assert.Equal("Not a song Gergur knows yet", SongAnswer.Of(new Identification(null, 4, 2, 12), false).Headline);
+        Assert.Equal("Its song library is still filling up.", SongAnswer.Of(new Identification(null, 0, 0, 0), true).Detail);
+        Assert.Equal("Its song library is off in the settings.", SongAnswer.Of(new Identification(null, 0, 0, 0), false).Detail);
+        Assert.Equal("Checked 1 song; more are being added.", SongAnswer.Of(new Identification(null, 4, 2, 1), true).Detail);
+        Assert.Equal("Checked 4,812 songs.", SongAnswer.Of(new Identification(null, 4, 2, 4812), false).Detail);
+        Assert.Equal("Could not find this song", SongAnswer.Of(new Identification(null, 4, 2, 12), false).Headline);
         Assert.True(SongAnswer.Listening.Busy);
     }
 

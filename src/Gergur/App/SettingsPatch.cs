@@ -60,6 +60,8 @@ internal static class SettingsPatch
         nameof(Settings.ExtraBrowserArguments),
         // The renderer sandbox boundary. Off, it stays off for every future session.
         nameof(Settings.DisableSiteIsolation),
+        // Sends the names of artists the person plays to another company, long after the agent has gone.
+        nameof(Settings.BuildSongLibrary),
         // Whether traffic goes through the tunnel, which profile, and what skips it.
         // "VpnBypassHosts": "*" sends everything around it while GET /settings still
         // reports the vpn as on and the status bar still shows it, so the browser would

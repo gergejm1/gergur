@@ -1197,7 +1197,8 @@ public sealed class MainForm : Form
         _agentsPanel?.Dismiss();
         _phonePanel?.Dismiss();
         _songPanel?.Dismiss();
-        _mediaPanel ??= new NowPlayingFlyout(action => _ = RunMediaAsync(action), () => _ = GoToMediaTabAsync(), () => _ = HideMediaTabAsync(), () => _ = CloseMediaTabAsync());
+        _mediaPanel ??= new NowPlayingFlyout(action => _ = RunMediaAsync(action), () => _ = GoToMediaTabAsync(), () => _ = HideMediaTabAsync(), () => _ = CloseMediaTabAsync(),
+            level => _ = SetMediaVolumeAsync(level), ToggleMediaMute);
         if (_mediaPanel.Visible)
         {
             _mediaPanel.Dismiss();
@@ -1207,7 +1208,7 @@ public sealed class MainForm : Form
             return;
         _mediaPanelTab = tab;
         // Up at once with what the tab itself says; the page's own answer follows.
-        _mediaPanel.ShowFromButton(this, _mediaButton, NowPlayingView.Of(null, tab.Title, tab.Url, tab.IsPlayingAudio, tab.TuckedAway));
+        _mediaPanel.ShowFromButton(this, _mediaButton, NowPlayingView.Of(null, tab.Title, tab.Url, tab.IsPlayingAudio, tab.TuckedAway, tab.IsMuted));
         _ = RefreshMediaPanelAsync(tab);
     }
 
@@ -1228,7 +1229,7 @@ public sealed class MainForm : Form
             if (found is { } good)
                 _mediaLastGood = (tab, good.State, now);
             _mediaPanelTab = tab;
-            panel.SetView(NowPlayingView.Of(state, tab.Title, tab.Url, tab.IsPlayingAudio, tab.TuckedAway));
+            panel.SetView(NowPlayingView.Of(state, tab.Title, tab.Url, tab.IsPlayingAudio, tab.TuckedAway, tab.IsMuted));
         }
         catch (Exception ex)
         {
@@ -1293,6 +1294,54 @@ public sealed class MainForm : Form
             if (!IsDisposed)
                 ShowMessage("That page did not take the button.");
         }
+    }
+
+    private double? _volumeWanted;
+    private bool _volumeSending;
+
+    /// <summary>
+    /// Has the tab the panel describes play at a level. A slider being dragged asks far faster
+    /// than a page answers, so one goes at a time and only the latest waits. A tab that has
+    /// just taken over the control is left alone: the slider was describing another.
+    /// </summary>
+    private async Task SetMediaVolumeAsync(double level)
+    {
+        _volumeWanted = level;
+        if (_volumeSending)
+            return;
+        _volumeSending = true;
+        try
+        {
+            while (_volumeWanted is { } next && !IsDisposed)
+            {
+                _volumeWanted = null;
+                if (_mediaTab is not { } tab || !ReferenceEquals(_mediaPanelTab, tab))
+                    return;
+                if (next > 0 && tab.IsMuted)
+                    tab.IsMuted = false;
+                string done = await tab.SetMediaVolumeAsync(next, MediaBudget);
+                DebugLog.Write($"media volume: the page did {done}");
+            }
+        }
+        catch (Exception ex)
+        {
+            DebugLog.WriteAlways($"a tab's volume could not be set: {ex.Message}");
+        }
+        finally
+        {
+            _volumeSending = false;
+            _volumeWanted = null;
+        }
+    }
+
+    /// <summary>Mutes the tab the panel describes, or takes its mute off, as Ctrl+M does for the tab in front.</summary>
+    private void ToggleMediaMute()
+    {
+        if (_mediaTab is not { } tab || !ReferenceEquals(_mediaPanelTab, tab))
+            return;
+        tab.IsMuted = !tab.IsMuted;
+        if (_mediaPanel is { Visible: true, View: { } view } panel)
+            panel.SetView(view with { TabMuted = tab.IsMuted });
     }
 
     /// <summary>Whether this window's song panel is listening, so a second press waits for the first.</summary>
@@ -1361,7 +1410,7 @@ public sealed class MainForm : Form
                 ? "what song is this: nothing heard"
                 : $"what song is this: {(found.Song is { } song ? song.Title + " by " + song.Artist : "none")}, score {found.Score}, next best {found.RunnerUp}, of {found.Known} songs");
             if (!panel.IsDisposed)
-                panel.SetAnswer(SongAnswer.Of(found, session.Settings.LearnSongs), site.Length > 0 ? "Heard on " + site : "");
+                panel.SetAnswer(SongAnswer.Of(found, session.Settings.LearnSongs || session.Settings.BuildSongLibrary), site.Length > 0 ? "Heard on " + site : "");
         }
         catch (Exception ex)
         {
@@ -2193,6 +2242,7 @@ public sealed class MainForm : Form
             _session.StartUBlockLite(work => ui.Post(_ => work(), null));
         else
             DebugLog.WriteAlways("uBO Lite updates not started: no UI context to hand results back to");
+        _session.StartSongCatalog();
         HookAgents();
         _session.StartPhoneBridge();
         // Only the first window listens, or an arrival would notify once per window.

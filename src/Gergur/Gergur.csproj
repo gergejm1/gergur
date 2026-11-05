@@ -22,6 +22,8 @@
          encoder is a lot of spec to get subtly wrong, and a QR that will not scan is
          worse than no QR. -->
     <PackageReference Include="QRCoder" Version="1.8.0" />
+    <!-- Decodes song previews (MP3 and AAC) through Windows' own decoders, in memory. -->
+    <PackageReference Include="NAudio.Wasapi" Version="2.2.1" />
   </ItemGroup>
 
   <ItemGroup>

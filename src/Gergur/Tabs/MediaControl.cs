@@ -18,7 +18,8 @@ internal enum MediaAction
 /// What a page says about its media: the song's name as the site gives it to Windows, whether
 /// it is playing, and which of the site's own buttons can be pressed from outside.
 /// </summary>
-internal sealed record MediaState(string Title, string Artist, bool HasMedia, bool Playing, bool Paused, bool CanNext, bool CanPrevious);
+/// <param name="Volume">How loud the page plays it, 0 to 1, 0 when the page has it muted; null when it has no volume to read.</param>
+internal sealed record MediaState(string Title, string Artist, bool HasMedia, bool Playing, bool Paused, bool CanNext, bool CanPrevious, double? Volume = null);
 
 /// <summary>
 /// Play, pause, next and previous for a page's music, from outside the page.
@@ -166,10 +167,23 @@ internal static class MediaControl
           };
         """;
 
+    /// <summary>
+    /// YouTube's player, which keeps a volume of its own and puts it back on the media element
+    /// with each song, so that is the one to read and set there: its own slider follows it and it
+    /// stays for the next song. Defines ytPlayer() for the scripts below.
+    /// </summary>
+    private const string YouTubePlayer = """
+          const ytPlayer = () => {
+            if (!/(^|\.)youtube\.com$/.test(location.hostname)) return null;
+            const p = document.querySelector('#movie_player');
+            return p && typeof p.getVolume === 'function' && typeof p.setVolume === 'function' ? p : null;
+          };
+        """;
+
     /// <summary>What the page plays, as an object: <see cref="Parse"/> reads it.</summary>
     internal const string ReadScript = """
         (() => {
-        """ + YouTubeButtons + """
+        """ + YouTubeButtons + YouTubePlayer + """
           const api = window[Symbol.for('gergur.media')];
           const has = action => { try { return !!(api && api.has(action)); } catch (e) { return false; } };
           const loaded = Array.from(document.querySelectorAll('video, audio')).filter(m => (m.currentSrc || m.srcObject) && m.readyState > 0);
@@ -177,7 +191,11 @@ internal static class MediaControl
           const session = navigator.mediaSession;
           const meta = session && session.metadata;
           const state = session ? session.playbackState : 'none';
+          const player = ytPlayer();
+          const heard = loaded.find(m => !m.paused && !m.ended) || loaded[0];
+          const volume = player ? (player.isMuted() ? 0 : player.getVolume() / 100) : heard ? (heard.muted ? 0 : heard.volume) : null;
           return {
+            volume: volume,
             title: meta ? String(meta.title || '') : '',
             artist: meta ? String(meta.artist || '') : '',
             media: loaded.length > 0 || has('play') || has('pause'),
@@ -237,6 +255,32 @@ internal static class MediaControl
     }
 
     /// <summary>
+    /// Sets how loud the page plays, 0 to 1: YouTube's player where there is one, else every
+    /// media element in the page, since a site can hold several and swap between them. A level
+    /// above nothing also takes the page's own mute off, as any volume slider does. Answers
+    /// "volume", or "none" when the page has nothing to set. Sound a page makes by Web Audio
+    /// alone has no volume to reach from here; the tab's mute still silences it.
+    /// </summary>
+    internal static string VolumeScript(double level)
+    {
+        string number = Math.Clamp(double.IsNaN(level) ? 0 : level, 0, 1).ToString("0.###", CultureInfo.InvariantCulture);
+        return """
+            ((level) => {
+            """ + YouTubePlayer + """
+              const player = ytPlayer();
+              if (player) {
+                player.setVolume(Math.round(level * 100));
+                if (level > 0 && player.isMuted()) player.unMute();
+                return 'volume';
+              }
+              const all = Array.from(document.querySelectorAll('video, audio')).filter(m => m.currentSrc || m.srcObject);
+              all.forEach(m => { m.volume = level; if (level > 0) m.muted = false; });
+              return all.length > 0 ? 'volume' : 'none';
+            })(LEVEL)
+            """.Replace("LEVEL", number, StringComparison.Ordinal);
+    }
+
+    /// <summary>
     /// Reads <see cref="ReadScript"/>'s answer as ExecuteScriptAsync hands it back (JSON).
     /// Null for anything that is not that object. Texts are cut to <see cref="MaxText"/> and
     /// cleared of control characters, since the page wrote them.
@@ -258,13 +302,20 @@ internal static class MediaControl
                 Flag(root, "playing"),
                 Flag(root, "paused"),
                 Flag(root, "next"),
-                Flag(root, "previous"));
+                Flag(root, "previous"),
+                Level(root));
         }
         catch (JsonException)
         {
             return null;
         }
     }
+
+    /// <summary>The page's volume, only when it is a number a volume can be.</summary>
+    private static double? Level(JsonElement root)
+        => root.TryGetProperty("volume", out var v) && v.ValueKind == JsonValueKind.Number && v.TryGetDouble(out double level) && level is >= 0 and <= 1
+            ? level
+            : null;
 
     private static string Text(JsonElement root, string name)
         => root.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() ?? "" : "";

@@ -354,6 +354,21 @@ public sealed class Tab : ITabHandle, IDisposable, Music.IHearingTab
         return inTime ? MediaControl.Done(json) : "none";
     }
 
+    /// <summary>
+    /// Sets how loud this tab's music plays, where <see cref="ReadMediaAsync"/> found it. Answers
+    /// "volume", or "none" when there is nothing to set. UI thread.
+    /// </summary>
+    internal async Task<string> SetMediaVolumeAsync(double level, TimeSpan budget)
+    {
+        if (await ReadMediaAsync(budget) is not { } found || Core is not { } core)
+            return "none";
+        string js = MediaControl.VolumeScript(level);
+        if (found.Frame is { } frame)
+            return MediaControl.Done((await ReadFrameScriptAsync(frame, js, budget)).Result);
+        var (json, inTime) = await WithBudget(core.ExecuteScriptAsync(js), budget, "null");
+        return inTime ? MediaControl.Done(json) : "none";
+    }
+
     public bool CanGoBack
     {
         get { try { return Core?.CanGoBack ?? false; } catch { return false; } }

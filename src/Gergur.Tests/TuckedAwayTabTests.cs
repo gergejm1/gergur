@@ -179,7 +179,7 @@ public sealed class TuckedAwayTabTests
             try
             {
                 var did = new List<string>();
-                using var panel = new NowPlayingFlyout(_ => did.Add("button"), () => did.Add("go"), () => did.Add("hide"), () => did.Add("close"));
+                using var panel = new NowPlayingFlyout(_ => did.Add("button"), () => did.Add("go"), () => did.Add("hide"), () => did.Add("close"), _ => did.Add("volume"), () => did.Add("mute"));
                 panel.SetView(new NowPlayingView("Song", "Band", "youtube.com", true, true, true, true));
                 panel.Relayout(keepPlace: false);
                 var hide = panel.Spots.Single(s => s.Spoken == "Hide tab");

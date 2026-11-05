@@ -54,6 +54,7 @@ internal static class Program
         new MainForm(argList.FirstOrDefault(a => !a.StartsWith('-'))).Show();
         SingleInstance.StartListener(MainForm.OpenExternalUrl);
         Application.Run(context);
+        App.AppSession.Current?.StopSongCatalog();
     }
 
     private static void FocusRunningInstance()

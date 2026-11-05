@@ -8,23 +8,23 @@ namespace Gergur.UI;
 /// <param name="Busy">Still listening: "Listen again" waits.</param>
 internal sealed record SongAnswer(string Headline, string Detail, bool Busy)
 {
-    public static readonly SongAnswer Listening = new("Listening...", "", Busy: true);
+    public static readonly SongAnswer Listening = new("Listening...", "This can take up to two minutes.", Busy: true);
 
     public static readonly SongAnswer NothingPlaying = new("Nothing is playing in Gergur", "Play something, then ask again.", false);
 
     public static readonly SongAnswer Failed = new("That did not work", "The song could not be looked up.", false);
 
-    /// <summary>The answer to show for what the recognizer found (null: it heard nothing), with learning on or off.</summary>
-    internal static SongAnswer Of(Identification? found, bool learning)
+    /// <summary>The answer to show for what the recognizer found (null: it heard nothing), and whether its library is still growing.</summary>
+    internal static SongAnswer Of(Identification? found, bool growing)
     {
         if (found is null)
             return new("Could not hear that tab", "It needs to be playing, with sound.", false);
         if (found.Song is { } song)
             return new(song.Title, song.Artist.Length > 0 ? song.Artist : song.Site, false);
         string detail = found.Known == 0
-            ? (learning ? "It learns songs as you play them on YouTube." : "Learning songs is off in the settings.")
-            : $"It knows {found.Known} song{(found.Known == 1 ? "" : "s")}, learned as you play them{(learning ? "." : "; learning is off.")}";
-        return new("Not a song Gergur knows yet", detail, false);
+            ? (growing ? "Its song library is still filling up." : "Its song library is off in the settings.")
+            : $"Checked {found.Known.ToString("N0", System.Globalization.CultureInfo.InvariantCulture)} song{(found.Known == 1 ? "" : "s")}{(growing ? "; more are being added." : ".")}";
+        return new("Could not find this song", detail, false);
     }
 }
 

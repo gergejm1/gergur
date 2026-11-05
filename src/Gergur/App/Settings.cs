@@ -74,8 +74,12 @@ public sealed class Settings
     public bool UBlockLite { get; set; } = true;
 
     [Category(Privacy), DisplayName("Learn the songs I play")]
-    [Description("While you play music on YouTube or YouTube Music, Gergur keeps a fingerprint of each song (never the audio) on this computer, so What song is this? on the now-playing panel can name it when it plays again, under talking in another video too. It can only name songs it has learned this way. Nothing is sent anywhere. Turning this off stops learning; to forget the songs, delete the songs folder in Gergur's data folder.")]
+    [Description("While you play music on YouTube or YouTube Music, Gergur keeps a fingerprint of each song (never the audio) on this computer, so What song is this? can name it when it plays again, under talking in another video too. Nothing about this is sent anywhere. Turning this off stops learning; to forget the songs, delete the songs folder in Gergur's data folder.")]
     public bool LearnSongs { get; set; } = true;
+
+    [Category(Privacy), DisplayName("Fill the song library from the internet")]
+    [Description("So What song is this? knows songs you have never played here. Gergur slowly goes through the charts and through artists you play and artists like them, downloading the 30 second previews Deezer and Apple offer, and keeps only a fingerprint of each. Up to 10,000 previews: about 180 MB on disk and several GB downloaded over many hours. The names of artists you play and their songs are sent to Deezer and Apple to find them, directly and not through the vpn. The question itself is always answered on this computer. Applies within a few minutes.")]
+    public bool BuildSongLibrary { get; set; } = true;
 
     [Category(Privacy), DisplayName("Save passwords")]
     [Description("Offer to save a password when you sign in to a site, and fill saved ones in. Kept encrypted inside the profile. Agents sign in with saved ones (gergur_login) and never see them; their own windows never offer to save. Applies at once, open tabs included.")]

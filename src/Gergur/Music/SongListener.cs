@@ -73,9 +73,12 @@ internal sealed class LearnSession(SongInfo info, DateTime startedUtc)
 /// <see cref="LearnAtMost"/> or the whole song. A song learned in full is not listened to
 /// again. Ads and silence are not heard (the page skips them).
 ///
-/// Asking: the last <see cref="ClipSeconds"/> of the tab, already heard if it was being
-/// listened to, else listened for (up to <see cref="ListenAtMost"/>), looked up in the
-/// library off the UI thread.
+/// Asking: a page that is itself a song says which at once. Otherwise the last
+/// <see cref="ClipSeconds"/> of the tab, already heard if it was being listened to, else
+/// listened for (up to <see cref="ListenAtMost"/>), looked up in the library off the UI thread,
+/// and looked up again every <see cref="StepSeconds"/> as it plays on, up to
+/// <see cref="KeepListening"/>: much of the library is 30 s previews, and the part of a song
+/// the library has may be yet to come.
 /// </summary>
 internal sealed class SongListener
 {
@@ -92,7 +95,22 @@ internal sealed class SongListener
     public static readonly TimeSpan QuietEnds = TimeSpan.FromSeconds(60);
 
     public const double ClipSeconds = 10;
+    public const double StepSeconds = 5;
     public static readonly TimeSpan ListenAtMost = TimeSpan.FromSeconds(25);
+
+    /// <summary>
+    /// How long a question goes on before it says the song was not found. Measured on twelve
+    /// real songs against previews: when it came, the answer came 11 to 33 s after asking on average.
+    /// </summary>
+    public static readonly TimeSpan KeepListening = TimeSpan.FromMinutes(2);
+
+    /// <summary>
+    /// A match this strong stands alone. A weaker one must come up for the same song again in the
+    /// same question, since a question looks many times over and a large library gives chance
+    /// more to work with. It need not be the very next clip: talk over a song comes and goes.
+    /// On real songs a right answer's median was 32, and a wrong song scored under this.
+    /// </summary>
+    public const int SureAtOnce = 20;
 
     /// <summary>Audio already heard counts as "now" for a question when it is this fresh.</summary>
     public static readonly TimeSpan FreshEnough = TimeSpan.FromSeconds(4);
@@ -102,6 +120,7 @@ internal sealed class SongListener
     private readonly Func<SongLibrary> _library;
     private readonly Func<bool> _learn;
     private readonly Func<Action, Task> _background;
+    private readonly TimeSpan _keepListening;
     private readonly RecentAudio _recent = new();
     private readonly HashSet<string> _done = new(StringComparer.Ordinal);
     private IHearingTab? _subject;
@@ -120,14 +139,21 @@ internal sealed class SongListener
         public IHearingTab Tab { get; } = tab;
         public DateTime UntilUtc { get; } = untilUtc;
         public int Fresh { get; set; }
+        public int Need { get; init; } = (int)(ClipSeconds * Rate);
+
+        /// <summary>The page turned out to say itself which song it is.</summary>
+        public SongInfo? Named { get; set; }
+
         public TaskCompletionSource<short[]?> Done { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
     }
 
     /// <param name="library">The songs; asked for only when needed, so it is not read at startup.</param>
     /// <param name="learn">Whether learning is on, read on each tick.</param>
     /// <param name="background">Runs fingerprinting off the UI thread (Task.Run); a test runs it in place.</param>
-    public SongListener(Func<SongLibrary> library, Func<bool> learn, Func<Action, Task>? background = null)
+    /// <param name="keepListening">How long a question goes on; null is <see cref="KeepListening"/>, a test passes less.</param>
+    public SongListener(Func<SongLibrary> library, Func<bool> learn, Func<Action, Task>? background = null, TimeSpan? keepListening = null)
     {
+        _keepListening = keepListening ?? KeepListening;
         _library = library;
         _learn = learn;
         _background = background ?? (a => Task.Run(a));
@@ -135,6 +161,9 @@ internal sealed class SongListener
 
     /// <summary>The song being learned now, for a test.</summary>
     internal LearnSession? Learning => _learning;
+
+    /// <summary>Whether a question is waiting on what the tab plays, for a test to tick against.</summary>
+    internal bool Asking => _ask is not null;
 
     /// <summary>Fingerprinting and saving under way, for a test to wait on.</summary>
     internal Task Work => _work;
@@ -224,7 +253,13 @@ internal sealed class SongListener
         foreach (var part in page.Parts)
             Take(part, info, learn, nowUtc);
 
-        if (_ask is { } ask && ReferenceEquals(ask.Tab, subject) && ask.Fresh >= ClipSeconds * Rate)
+        if (_ask is { } named && ReferenceEquals(named.Tab, subject) && info is not null)
+        {
+            named.Named = info;
+            named.Done.TrySetResult([]);
+            _ask = null;
+        }
+        else if (_ask is { } ask && ReferenceEquals(ask.Tab, subject) && ask.Fresh >= ask.Need)
         {
             ask.Done.TrySetResult(_recent.Last((int)(ClipSeconds * Rate)));
             _ask = null;
@@ -327,37 +362,71 @@ internal sealed class SongListener
     /// </summary>
     public async Task<Identification?> IdentifyAsync(IHearingTab tab, DateTime nowUtc)
     {
-        int need = (int)(ClipSeconds * Rate);
+        int clipLength = (int)(ClipSeconds * Rate);
         var library = _library();
         _asked = true;
+        // The page says itself which song this is: nothing to listen for.
+        if (ReferenceEquals(_subject, tab) && tab.Url == _recentUrl && _judged is { } known)
+            return Named(known, library, nowUtc);
         var prepared = _background(() => library.Prepare(nowUtc));
-        short[]? clip;
-        if (ReferenceEquals(_subject, tab) && tab.Url == _recentUrl && _recent.Count >= need && nowUtc - _recent.LastUtc <= FreshEnough)
-        {
-            clip = _recent.Last(need);
-        }
-        else
-        {
-            var ask = _ask is { } waiting && ReferenceEquals(waiting.Tab, tab) ? waiting : new Ask(tab, nowUtc + ListenAtMost);
-            if (!ReferenceEquals(_ask, ask))
-            {
-                _ask?.Done.TrySetResult(null);
-                _ask = ask;
-            }
-            _ = Tick([], nowUtc, force: true);
-            var done = await Task.WhenAny(ask.Done.Task, Task.Delay(ListenAtMost + TimeSpan.FromSeconds(5)));
-            clip = done == ask.Done.Task ? ask.Done.Task.Result : null;
-            if (ReferenceEquals(_ask, ask))
-                _ask = null;
-        }
-        await prepared;
-        if (clip is null)
-            return null;
-        var floats = ToFloats(clip);
         Identification? answer = null;
-        await _background(() => answer = library.Identify(floats, nowUtc));
-        return answer;
+        LearnedSong? tentative = null;
+        var giveUp = nowUtc + _keepListening;
+        for (bool first = true; ; first = false)
+        {
+            short[]? clip;
+            if (first && ReferenceEquals(_subject, tab) && tab.Url == _recentUrl && _recent.Count >= clipLength && nowUtc - _recent.LastUtc <= FreshEnough)
+            {
+                clip = _recent.Last(clipLength);
+            }
+            else
+            {
+                var from = first ? nowUtc : _lastTick;
+                var ask = _ask is { } waiting && ReferenceEquals(waiting.Tab, tab)
+                    ? waiting
+                    : new Ask(tab, from + ListenAtMost) { Need = first ? clipLength : (int)(StepSeconds * Rate) };
+                if (!ReferenceEquals(_ask, ask))
+                {
+                    _ask?.Done.TrySetResult(null);
+                    _ask = ask;
+                }
+                if (first)
+                    _ = Tick([], nowUtc, force: true);
+                var done = await Task.WhenAny(ask.Done.Task, Task.Delay(ListenAtMost + TimeSpan.FromSeconds(5)));
+                clip = done == ask.Done.Task ? ask.Done.Task.Result : null;
+                if (ReferenceEquals(_ask, ask))
+                    _ask = null;
+                if (ask.Named is { } named)
+                    return Named(named, library, nowUtc);
+            }
+            await prepared;
+            // Stopped being heard, or another question took over: what it found so far stands.
+            if (clip is null)
+                return answer;
+            var floats = ToFloats(clip);
+            Identification? found = null;
+            await _background(() => found = library.Identify(floats, _lastTick > nowUtc ? _lastTick : nowUtc));
+            bool last = _keepListening <= TimeSpan.Zero || _lastTick >= giveUp;
+            if (found is { Song: { } song })
+            {
+                bool confirmed = found.Score >= SureAtOnce || _keepListening <= TimeSpan.Zero
+                    || (tentative is not null && SongCatalog.SameSong(tentative.Title, tentative.Artist, song.Title, song.Artist));
+                if (confirmed)
+                    return found;
+                tentative = song;
+                answer = found with { Song = null };
+            }
+            else
+            {
+                answer = found;
+            }
+            if (last)
+                return answer;
+        }
     }
+
+    private static Identification Named(SongInfo song, SongLibrary library, DateTime nowUtc)
+        => new(new LearnedSong(0, song.Key, song.Title, song.Artist, song.Site, nowUtc, 0), 0, 0, library.Count);
 
     internal static float[] ToFloats(short[] samples)
     {

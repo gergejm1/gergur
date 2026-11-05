@@ -160,6 +160,56 @@ public sealed class AppSession
         return Current = new AppSession(settings, env, blocker, vpn);
     }
 
+    private CancellationTokenSource? _songCatalogStop;
+    private Task? _songCatalogRun;
+
+    /// <summary>
+    /// Fills the song library for the life of the app (<see cref="Music.SongCatalog"/>), off the
+    /// UI thread, from a couple of minutes after start so it never competes with the session
+    /// coming back. It reads <see cref="Settings.BuildSongLibrary"/> as it goes, so turning it
+    /// on or off needs no restart.
+    /// </summary>
+    public void StartSongCatalog()
+    {
+        if (_songCatalogStop is not null)
+            return;
+        _songCatalogStop = new CancellationTokenSource();
+        var stop = _songCatalogStop.Token;
+        _songCatalogRun = Task.Run(async () =>
+        {
+            try
+            {
+                await Task.Delay(TimeSpan.FromMinutes(2), stop);
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+            try
+            {
+                using var web = new Music.CatalogWeb();
+                var catalog = new Music.SongCatalog(_songLibrary.Value, () => Settings.BuildSongLibrary, web, Music.PreviewAudio.Decode,
+                    progressPath: Path.Combine(Music.SongLibrary.DefaultFolder, "catalog.json"));
+                await catalog.RunAsync(TimeSpan.Zero, stop);
+            }
+            catch (Exception ex)
+            {
+                // Only the catalog's own: nobody is waiting on this task but the wait at closing.
+                Gergur.Diagnostics.DebugLog.WriteAlways($"the song catalog could not start: {ex.Message}");
+            }
+        }, CancellationToken.None);
+    }
+
+    /// <summary>
+    /// Ends the catalog as the app closes, so the songs it holds are written. Waits a moment for
+    /// that and no more: anything lost is only fetched again.
+    /// </summary>
+    public void StopSongCatalog()
+    {
+        _songCatalogStop?.Cancel();
+        _songCatalogRun?.Wait(TimeSpan.FromSeconds(2));
+    }
+
     private CancellationTokenSource? _uBlockStop;
 
     /// <summary>

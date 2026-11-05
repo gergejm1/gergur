@@ -239,6 +239,15 @@ internal sealed class FingerprintIndex
     /// <summary>The best song for a clip, with how many landmarks agreed, and the runner-up's count.</summary>
     public (int Song, int Score, int Second, double OffsetSeconds) Best(IReadOnlyList<Landmark> clip)
     {
+        var ranked = Ranked(clip, 2);
+        if (ranked.Count == 0)
+            return (-1, 0, 0, 0);
+        return (ranked[0].Song, ranked[0].Score, ranked.Count > 1 ? ranked[1].Score : 0, ranked[0].OffsetSeconds);
+    }
+
+    /// <summary>The songs that best fit a clip, best first, at most <paramref name="most"/> of them.</summary>
+    public List<(int Song, int Score, double OffsetSeconds)> Ranked(IReadOnlyList<Landmark> clip, int most)
+    {
         Seal();
         var votes = new Dictionary<(int Song, int Offset), int>();
         foreach (var l in clip)
@@ -262,11 +271,9 @@ internal sealed class FingerprintIndex
             if (!perSong.TryGetValue(song, out var best) || score > best.Score)
                 perSong[song] = (score, offset);
         }
-        var ranked = perSong.OrderByDescending(p => p.Value.Score).Take(2).ToList();
-        if (ranked.Count == 0)
-            return (-1, 0, 0, 0);
-        return (ranked[0].Key, ranked[0].Value.Score, ranked.Count > 1 ? ranked[1].Value.Score : 0,
-            ranked[0].Value.Offset * (double)AudioFingerprint.Hop / AudioFingerprint.SampleRate);
+        return perSong.OrderByDescending(p => p.Value.Score).Take(most)
+            .Select(p => (p.Key, p.Value.Score, p.Value.Offset * (double)AudioFingerprint.Hop / AudioFingerprint.SampleRate))
+            .ToList();
     }
 
     private int LowerBound(ulong value)

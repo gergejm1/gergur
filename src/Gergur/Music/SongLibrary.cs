@@ -6,7 +6,7 @@ namespace Gergur.Music;
 
 /// <summary>A song Gergur has learned: its names, and how much of it was heard.</summary>
 /// <param name="Id">Its number here, which names its fingerprint file.</param>
-/// <param name="Key">Which song, "youtube:" and the video id.</param>
+/// <param name="Key">Which song: "youtube:" and the video id for one learned from playing it, "deezer:" or "apple:" and the track's id for a preview from the catalog.</param>
 /// <param name="Seconds">How much of it was heard, so a longer hearing replaces a shorter one.</param>
 internal sealed record LearnedSong(int Id, string Key, string Title, string Artist, string Site, DateTime LearnedUtc, double Seconds);
 
@@ -28,14 +28,25 @@ internal sealed record Identification(LearnedSong? Song, int Score, int RunnerUp
 /// question needs it and let go a few minutes after the last one (<see cref="ReleaseIdle"/>,
 /// called by <see cref="SongListener"/>), since it can be large and questions are rare: one
 /// array of every landmark, 8 bytes each, about 37 KB a minute of song heard.
+///
+/// Two kinds of song live here: those learned by playing them, whole, and previews from
+/// <see cref="SongCatalog"/>. The same song can be here several times over, which is what makes
+/// a match lead by name rather than by entry (<see cref="Identify"/>).
 /// </summary>
 internal sealed partial class SongLibrary
 {
     /// <summary>
-    /// At most this many songs; past it the one learned longest ago goes. Full of four minute
-    /// songs, the index for a question is about 75 MB, held for <see cref="IndexKept"/>.
+    /// At most this many songs learned by playing them; past it the one learned longest ago
+    /// goes. Full of four minute songs, the index for a question is about 75 MB, held for
+    /// <see cref="IndexKept"/>.
     /// </summary>
     public const int MaxSongs = 500;
+
+    /// <summary>
+    /// At most this many previews from the catalog, about 18 KB each on disk and in the index,
+    /// so about 180 MB of both when full. The catalog stops there; nothing is thrown away.
+    /// </summary>
+    public const int MaxCatalog = 10_000;
 
     /// <summary>A match needs this many landmarks agreeing (wrong songs measured at 3 at most)...</summary>
     public const int MinScore = 10;
@@ -65,10 +76,12 @@ internal sealed partial class SongLibrary
 
     /// <param name="folder">Where the songs live. Defaults to the profile; a test passes its own.</param>
     /// <param name="maxSongs">How many are kept; a test passes fewer.</param>
-    public SongLibrary(string? folder = null, int maxSongs = MaxSongs)
+    /// <param name="maxCatalog">How many previews are kept; a test passes fewer.</param>
+    public SongLibrary(string? folder = null, int maxSongs = MaxSongs, int maxCatalog = MaxCatalog)
     {
         _folder = folder ?? DefaultFolder;
         _maxSongs = maxSongs;
+        CatalogLimit = maxCatalog;
         (_songs, _unreadable) = Load(ListPath);
         if (!_unreadable)
             SweepUnlisted();
@@ -112,6 +125,104 @@ internal sealed partial class SongLibrary
     public int Count
     {
         get { lock (_gate) return _songs.Count; }
+    }
+
+    /// <summary>How many previews from the catalog there can be.</summary>
+    public int CatalogLimit { get; }
+
+    /// <summary>How many there are.</summary>
+    public int CatalogCount
+    {
+        get { lock (_gate) return _songs.Count(IsFromCatalog); }
+    }
+
+    /// <summary>Whether a song is a catalog preview rather than one learned by playing it.</summary>
+    internal static bool IsFromCatalog(LearnedSong song) => !song.Key.StartsWith("youtube:", StringComparison.Ordinal);
+
+    /// <summary>The artists of the songs learned by playing them, most recent first, each once.</summary>
+    public IReadOnlyList<string> LearnedArtists()
+    {
+        lock (_gate)
+        {
+            return _songs.Where(s => !IsFromCatalog(s) && s.Artist.Length > 0)
+                .OrderByDescending(s => s.LearnedUtc)
+                .Select(s => s.Artist)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+        }
+    }
+
+    /// <summary>The songs the catalog already has, by <see cref="SongCatalog.NameKey"/>.</summary>
+    public IReadOnlyList<string> CatalogNames()
+    {
+        lock (_gate)
+            return _songs.Where(IsFromCatalog).Select(s => SongCatalog.NameKey(s.Title, s.Artist)).ToArray();
+    }
+
+    /// <summary>
+    /// Keeps previews from the catalog in one go: the list is rewritten once, not once for each.
+    /// Those already kept are left, and past <see cref="CatalogLimit"/> the rest are dropped. How
+    /// many were kept. A question's index goes on without them until it is next built: nothing
+    /// is taken away, so what it holds stays right, and rebuilding it for each batch while
+    /// someone is listening would hold it twice over. Throws (IOException) when the files cannot
+    /// be written.
+    /// </summary>
+    public int PutCatalog(IEnumerable<(SongInfo Info, double Seconds, List<Landmark> Marks)> previews, DateTime nowUtc)
+    {
+        lock (_writeGate)
+        {
+            var written = new List<LearnedSong>();
+            HashSet<string> keys;
+            int room, next;
+            lock (_gate)
+            {
+                if (_unreadable)
+                    return 0;
+                keys = _songs.Select(s => s.Key).ToHashSet(StringComparer.Ordinal);
+                room = CatalogLimit - _songs.Count(IsFromCatalog);
+                next = NextId();
+            }
+            Directory.CreateDirectory(_folder);
+            try
+            {
+                foreach (var (info, seconds, marks) in previews)
+                {
+                    if (room <= 0 || marks.Count == 0 || marks.Count > MostLandmarks || !keys.Add(info.Key))
+                        continue;
+                    while (File.Exists(FileOf(next)))
+                        next++;
+                    WriteLandmarks(FileOf(next), marks);
+                    written.Add(new LearnedSong(next, info.Key, info.Title, info.Artist, info.Site, nowUtc, Math.Round(seconds, 1)));
+                    next++;
+                    room--;
+                }
+                if (written.Count == 0)
+                    return 0;
+                string json;
+                lock (_gate)
+                {
+                    _songs.AddRange(written);
+                    json = JsonSerializer.Serialize(_songs, JsonOptions);
+                }
+                try
+                {
+                    Settings.WriteAtomically(ListPath, json);
+                }
+                catch
+                {
+                    lock (_gate)
+                        _songs.RemoveAll(written.Contains);
+                    throw;
+                }
+                return written.Count;
+            }
+            catch
+            {
+                foreach (var song in written)
+                    TryDelete(FileOf(song.Id));
+                throw;
+            }
+        }
     }
 
     public IReadOnlyList<LearnedSong> Songs
@@ -166,9 +277,9 @@ internal sealed partial class SongLibrary
                     _songs[at] = song;
                 else
                     _songs.Add(song);
-                while (_songs.Count > _maxSongs)
+                while (_songs.Count(s => !IsFromCatalog(s)) > _maxSongs)
                 {
-                    var oldest = _songs.MinBy(s => s.LearnedUtc)!;
+                    var oldest = _songs.Where(s => !IsFromCatalog(s)).MinBy(s => s.LearnedUtc)!;
                     _songs.Remove(oldest);
                     gone.Add(oldest);
                 }
@@ -213,16 +324,38 @@ internal sealed partial class SongLibrary
 
     /// <summary>
     /// Which song a clip is: the best match when it clears <see cref="MinScore"/> and leads the
-    /// next best by <see cref="MinLead"/> times, otherwise none.
+    /// next best song by <see cref="MinLead"/> times, otherwise none. "Next best song": the same
+    /// song is often here several times (Deezer's preview, Apple's, the whole of it learned by
+    /// playing it), and those agreeing is no doubt about it. Measured: counted as rivals, they
+    /// took right answers from 34% of clips down to 22%.
     /// </summary>
     public Identification Identify(ReadOnlySpan<float> clip, DateTime nowUtc)
     {
         var marks = AudioFingerprint.Landmarks(clip);
         var (index, songs) = IndexFor(nowUtc);
-        var (id, score, second, _) = index.Best(marks);
-        var song = songs.FirstOrDefault(s => s.Id == id);
+        var ranked = index.Ranked(marks, RanksLooked);
+        if (ranked.Count == 0)
+            return new Identification(null, 0, 0, songs.Length);
+        var byId = songs.ToDictionary(s => s.Id);
+        var song = byId.GetValueOrDefault(ranked[0].Song);
+        int score = ranked[0].Score;
+        int second = RunnerUp(song, ranked.Skip(1).Select(r => (byId.GetValueOrDefault(r.Song), r.Score)));
         bool sure = song is not null && Matches(score, second);
         return new Identification(sure ? song : null, score, second, songs.Length);
+    }
+
+    /// <summary>How far down the ranking a rival is looked for: past the same song's other entries.</summary>
+    private const int RanksLooked = 8;
+
+    /// <summary>The score of the best entry below <paramref name="best"/> that is another song, 0 for none.</summary>
+    internal static int RunnerUp(LearnedSong? best, IEnumerable<(LearnedSong? Song, int Score)> below)
+    {
+        foreach (var (song, score) in below)
+        {
+            if (best is null || song is null || !SongCatalog.SameSong(best.Title, best.Artist, song.Title, song.Artist))
+                return score;
+        }
+        return 0;
     }
 
     /// <summary>The rule a match must clear.</summary>

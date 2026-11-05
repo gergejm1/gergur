@@ -181,6 +181,8 @@ would look:
   somebody else's server.
 - `RelaxedSites` - sites where requests are not blocked and ads are not taken out. An agent
   adding one would weaken the blocker at every later launch with nothing to show for it.
+- `BuildSongLibrary` - whether Gergur downloads song previews and sends artist names to Deezer,
+  for hours, in the background.
 
 Those are changed from the settings page (`gergur://settings`), where somebody is looking at what they typed.
 The refusal names the setting rather than dropping it quietly. It refuses in both
@@ -1237,8 +1239,8 @@ and API callers with the same `X-Gergur-Agent` name are one agent).
 
 While a tab in any of the person's windows plays sound, a note shows on the toolbar nearest
 the address bar (lit while heard, its tooltip "Now playing: ..." or "Paused: ..."), and a
-click drops a panel with the song, previous, play or pause, next, and below them Go to tab and
-Hide tab (`UI/NowPlayingFlyout.cs`). It drives that tab from whichever tab or window is in front.
+click drops a panel with the song, previous, play or pause, next, a volume slider with a mute
+button, and below them Go to tab and Hide tab (`UI/NowPlayingFlyout.cs`). It drives that tab from whichever tab or window is in front.
 Which tab (`App/NowPlaying.cs`, checked once a second by each window): the one making sound,
 of two the one that began last; once nothing is heard, the last one chosen stays chosen for
 30 minutes while it is on the site it played on, so a paused song can be played again from
@@ -1295,6 +1297,47 @@ the window ends a hidden tab like its other tabs, without asking.
   comes forward. It is hidden first and then put up, because hiding is what takes the keyboard
   off a page, and it is off the Tab key's round (`TabStop`). The cost is a background video being drawn as if it were in front, while heard.
   A page up behind cannot be suspended (`TrySuspendAsync` refuses a visible view).
+
+#### The volume
+
+WebView2 has no volume per tab, only mute, so the slider sets the page's own: on YouTube sites
+the player's (`#movie_player`: `setVolume`, `unMute`, the same number YouTube's own slider and
+its memory of it use, so it holds for the next song), elsewhere every media element in the page
+(`MediaControl.VolumeScript`). The panel shows what the page reads back (`MediaState.Volume`),
+except for 1.5 s after a change (`LevelHeld`), so the thumb does not jump under a hand. A click
+sets it, a drag follows (a drag past the panel's edge keeps going rather than dismissing it,
+`OverOwnedPopup`), the wheel moves it 5%. Values go through `MainForm.SetMediaVolumeAsync`, one at
+a time with the latest winning, so a drag does not queue up calls on a busy page. A level above
+nothing also takes off the tab's mute, since a slider moved on a muted tab that stays silent reads
+as broken. The button beside it is the tab's own mute (`Tab.IsMuted`, the same as Ctrl+M).
+
+The panel never takes the keyboard, so the slider has no keys and no accessible role; Ctrl+M mutes.
+It cannot reach sound made only through Web Audio (an `AudioContext` with no media element), and
+a site may set its own volume back. Tab mute still works on those. A hidden tab is moved the same
+way, which is the point of the slider.
+
+Verified on 2026-11-04 in a test instance on a hidden desktop (`scratchpad/volumelive`), on a real
+signed-out Mix: a click at the middle sets the player to 50, a press and drag to 75 and 25, past
+the left end to 0 with the panel staying up, the wheel up 5, the next song keeps the level, the
+panel follows a level the page sets itself, the mute button, a level taking the tab's mute off, a
+level set while the tab is hidden, and a plain `<audio>` page. The panels were photographed and looked at.
+The hide-tab and now-playing harnesses were run again with the panel 38 px taller: all of the now-playing
+checks but its own stale height, and all of the hide-tab checks but the pause described below.
+The video element itself reads less than the player's level, since YouTube scales it for
+loudness: 0.259 with the player at 50 and 0.130 at 25, on that song. Not verified: a real mouse
+(window messages only), a screen at another scale, and the person's own use.
+
+Testing this needs the tab unmuted, which is why `--mute-audio` will not do: with it the engine
+reports no sound, so the note never shows. `ExtraBrowserArguments: "--disable-audio-output"` in the
+test instance works: the note shows, the page's clock runs, and no audio session opens at all.
+Measured with a Windows peak meter on that instance's engine processes through the whole run, which
+would have ended the run on any peak: 0 sessions, peak 0.
+
+Pressing pause sometimes does nothing, and that is not this slider. In `scratchpad/hidelive` the
+press reaches the site's handler (the log says "the page did pause") and the video goes on playing:
+seen in 2 of 2 runs of this build and 1 of 2 of the commit before it, at a different step each time.
+Not reproduced in isolation: 24 of 24 in front on both builds, and 10 of 10 behind another tab and 10
+of 10 hidden on this one. Cause not known.
 
 #### A playlist skipping songs
 
@@ -1370,10 +1413,97 @@ with "Listen again" below. It listens to whatever plays in the person's windows,
 site (TikTok, YouTube, anything with `<audio>` or `<video>`): of the tabs making sound, the
 one that began last (`MainForm.PlayingTab`), never an agent's window. Nothing playing says
 so at once. It names the song under talking too ("a song in the background of a video").
-There is no outside service: Gergur keeps its own library, learned from the songs the person
-plays (`Settings.LearnSongs`, on by default, Privacy), so it can only name a song it has
-heard here, and it only learns from YouTube and YouTube Music. A song heard only on TikTok
-is never known.
+Identifying stays on the machine: no audio or question leaves it. The library it searches has
+two sources, the songs the person plays on YouTube and YouTube Music (`Settings.LearnSongs`,
+below) and a catalog it fills by itself in the background (`Settings.BuildSongLibrary`, below), so
+it knows songs it has never heard here. A YouTube page that is itself a song answers at once from
+its own name, without listening (`SongPage.Judge`, `SongListener.Ask.Named`); YouTube Music's
+likewise. Anything else is listened to.
+
+#### The song catalog
+
+`Music/SongCatalog.cs` fills the library from the free 30 s previews of Deezer's and Apple's
+public APIs, with no account: the same files those sites play on their own pages. The preview is
+decoded in memory (`Music/PreviewAudio.cs`, NAudio over Windows' decoders, resampled to 11025 Hz
+mono), fingerprinted, and thrown away: only the landmarks are kept, under `deezer:{id}` and
+`apple:{id}`. A song gets both where Apple has it (`AppleMatch`, same `NameKey`), because the two
+often preview different parts of a song, and sometimes different recordings: Deezer's gave nothing
+on two of the 12 test songs and Apple's on another.
+
+- Order: the artists the person has played first (`SongLibrary.LearnedArtists`, their top 50 and
+  related artists), then every genre's chart, then the artists found so far (top 15 and 10
+  related), at most 5000 waiting. A song every 4 s (`BetweenSongs`), first 2 minutes after start,
+  charts again every 7 days, 5 minutes between looks once there is nothing to do, and backing off
+  from 1 minute doubling to 60 on any failure (`Backoff`). It stops at 10,000 previews
+  (`SongLibrary.MaxCatalog`), so about 5,000 songs, since most have two; they do not count against
+  the 500 learned ones and never push them out. Progress is `songs\catalog.json`.
+- Something counts as done only once every song it led to has been taken (`FeedingDone`). The songs
+  waiting are in memory only, since a preview's address expires, so a restart reads what led to them
+  again, a few requests, and passes over the songs it already has. An artist goes to the back of
+  the list until then, and a played artist or chart that fails is left for an hour, so no one of them
+  holds up the rest. A song lost to the network goes round again, three tries at most in a run, since one that
+  never answers would otherwise keep the list from ever finishing. Fingerprints are written every 10
+  songs and as the app closes (`AppSession.StopSongCatalog`, which waits at most 2 s).
+- Backing off means a refusal: 429 or a server error, or 403 from an API (Apple's way of saying too
+  often), or an error object from Deezer other than its 800, which is only "no data". A preview's 403
+  is an address that has expired and a preview over 4 MB is passed over. One request may take a minute
+  with its body.
+- Requests go direct, not through the vpn, like the blocklist download, with their own client: no
+  redirects followed, 1 MB of text, 4 MB of preview, and a preview only from https on the default
+  port of `*.dzcdn.net` or `*.itunes.apple.com` (`IsPreviewAddress`), since the address comes from
+  an answer. What leaves the machine: the names of artists the person has played, sent to Deezer
+  and Apple as searches. That is why it is a setting on the settings page and refused over the API.
+- `PutCatalog` adds without touching `_version`, so a held search index stays: it is built by a
+  question and let go three minutes later, and the catalog adds a song every 4 s.
+- A song under two ids and sources is one song: `Identify` takes the runner-up as the best match
+  that is not `SongCatalog.SameSong` (title and first artist, with brackets, guests and versions
+  taken out, so a live cut and the studio one count as one; `AppleMatch` pairs them by the same rule).
+  Without that, Deezer's and Apple's copies of one song count as rivals and only 22% of clips
+  came out, against 34%. That 34% was measured on title alone; the artist was added after review,
+  and the pairs always share it.
+- A question keeps listening (`SongListener.KeepListening`, 2 minutes): a preview is 30 s of the
+  song, so a clip can only match while the song is on that part. First clip at 10 s, then every 5 s
+  over the last 10 s. A match of 20 or more stands (`SureAtOnce`); a weaker one must come up for
+  the same song again in that question, not necessarily the next clip, since talk over a song comes
+  and goes. With nothing found it says how many songs it checked, or that the library is still
+  filling or is off (`SongAnswer.Of`, `growing`).
+
+Measured on 2026-11-04 with a throwaway program over the real fingerprint code: 12 well known songs
+downloaded whole, clips of 10 s every 5 s, every clip asked against 400 decoys plus the previews.
+Deezer's alone found 34% of clips, Apple's 33%, wrong 0. So a song is found when the listening
+reaches its previewed part: mean 11 to 33 s where it was found, and from 5% to 68% of starting
+points, depending on the song, never within the 2 minutes because the part was already past. With
+1118 previews (and 1313 decoy files, one sixth held out): no wrong song in about 580 clips of real
+songs or 879 held out clips. Every "sure and wrong" was the same recording under another Deezer id,
+looked up by hand (a remaster, a remix, a reissue), which is what same-title grouping answers.
+Noise, held out songs: median 4, p90 11. The right song: median 32, p90 215. Searching 19 ms per
+clip; building the index 204 ms for 2.57M landmarks (19 MB); about 2300 landmarks (18 KB) a preview.
+Not measured: the full 10,000 size. Extrapolated from those numbers: about 180 MB on disk and about
+as much in memory while held, and the build around a second. A larger library gives chance more to
+work with, and that has not been measured either; the 3x and confirm rules are what stand against it.
+In the last run the per-song percentages are depressed by the program grouping by file name, not by
+name: use the 400 decoy figures for how often a song is found.
+
+Deezer's developer FAQ says commercial use needs an agreement. Whether its terms allow keeping
+fingerprints was not confirmed, and Apple's terms were not read. This is one person's own browser
+and nothing but landmarks is kept, which is why it was built this way; publishing it to many users
+would need that looked at first.
+
+Verified live the same day, in the same test instance, signed out, nothing audible: after the
+2 minutes the catalog filled by itself against the real Deezer and Apple sites (the first songs
+135 s after asking, both sources), real MP3 and AAC previews decoded in the app at 17 to 18 KB each,
+and only `.fp`, `songs.json` and `catalog.json` on disk. A song it had fetched, played from a local file on a
+page of no known site from its start: named in 18 s in each of two runs (scores 25 and 32, next best 2 and 1, 20 songs in
+the library), through the real button and panel; nothing learned from that page. A made-up tune: "Could
+not find this song" after 121 s (score 1, of 60 songs). A YouTube song page: named from itself in
+1 s. All photographed. Not verified: a real start part way through a song, talk over one, a library
+past about 70 songs inside the app (the numbers above are from the throwaway program), the 10,000
+limit being reached, or the person's own use.
+
+#### Songs it learns as they play
+
+`Settings.LearnSongs`, on by default, Privacy. It only learns from YouTube and YouTube Music. A song
+heard only on TikTok is never learned, though the catalog may know it.
 
 - Fingerprints are Shazam's published method (Wang, 2003; `Music/AudioFingerprint.cs`):
   spectrogram peaks at 11025 Hz, chosen per band so a voice cannot take them all, paired
@@ -1412,15 +1542,15 @@ is never known.
   is about 75 MB while held. No file work happens under the lock the UI thread reads the list
   with. Forgetting is deleting that folder; there is no button for it yet.
 - Asked while the tab's audio is already being heard (the song being learned), the answer
-  is at once; otherwise it listens for 10 s, up to 25. Audio heard on the tab's previous page,
-  or by a listener since replaced, never answers for the page now (measured live: it did,
-  before `_recentUrl` and the listener's name were checked).
+  can come at once; otherwise it listens for 10 s, and on as above. Audio heard on the tab's
+  previous page, or by a listener since replaced, never answers for the page now (measured
+  live: it did, before `_recentUrl` and the listener's name were checked).
 - The page's script runs in the page's own world, so a page can feed it what it likes; that
   costs a wrong song learned under that page's own video id, nothing more.
 - One question at a time, app wide: two windows asking about the same tab share it, but a
   second window asking about another tab while the first listens replaces it, and the first
   says "Could not hear that tab" (`SongListener.IdentifyAsync`). Both pick the tab by the same
-  rule, so it needs two tabs playing and two windows asking within seconds; accepted.
+  rule, so it needs two tabs playing and two windows asking within the same 2 minutes; accepted.
 - Not done: a player in a frame from another site is not listened to (the page itself only),
   and a site whose media is cross-origin without CORS gives silence to `captureStream`.
 
@@ -1443,4 +1573,5 @@ nothing else was learned. Unit tests (`SongRecognizerTests`) cover names,
 which pages are songs, reading the page's answer, the library on disk, matching made-up songs
 under noise, and the listener learning and answering with stand-in tabs; `SongScriptTests`
 runs the page script under node. Not yet used by the person in their own Gergur, and not
-tried with a library of hundreds of real songs.
+tried with a library of hundreds of real songs. (That paragraph and the button's above are from
+before the catalog: their answers now also wait for up to 2 minutes, see "The song catalog".)
